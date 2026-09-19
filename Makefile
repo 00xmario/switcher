@@ -1,7 +1,7 @@
 BINARY := switcher
 VERSION ?= $(shell date +%Y%m%d-%H%M%S)
 
-.PHONY: build test vet install run clean
+.PHONY: build test vet install run dev clean
 
 build:
 	go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BINARY) .
@@ -17,6 +17,10 @@ install: build
 
 run: build
 	./$(BINARY)
+
+# Dev mode serves web/ from disk: UI changes need only a browser refresh.
+dev:
+	SWITCHER_DEV=1 go run .
 
 clean:
 	rm -f $(BINARY)

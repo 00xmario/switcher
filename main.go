@@ -19,6 +19,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 
 	"switcher/internal/codexcfg"
 	"switcher/internal/config"
@@ -94,9 +95,19 @@ func run(port int) {
 	mux := http.NewServeMux()
 	api.Register(mux)
 	mux.Handle("/v1/", proxyManager) // the actual proxy: codex traffic
-	static, err := fs.Sub(webFS, "web")
-	if err != nil {
-		log.Fatalf("embed web assets: %v", err)
+
+	// Dev mode serves the frontend straight from disk: edit web/, refresh
+	// the browser, done. No rebuild, no restart.
+	var static fs.FS
+	if os.Getenv("SWITCHER_DEV") != "" {
+		static = os.DirFS("web")
+		log.Println("dev mode: serving ./web from disk; refresh the browser after edits")
+	} else {
+		var err error
+		static, err = fs.Sub(webFS, "web")
+		if err != nil {
+			log.Fatalf("embed web assets: %v", err)
+		}
 	}
 	mux.Handle("/", http.FileServerFS(static))
 

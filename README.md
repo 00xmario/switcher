@@ -130,6 +130,22 @@ internal/codexcfg/       codex config.toml installer (idempotent)
 web/                     dependency-free frontend (served from the binary)
 ```
 
+## Development
+
+```sh
+make dev      # run with the frontend served from web/ (SWITCHER_DEV=1)
+```
+
+In dev mode the UI is served straight from disk: edit a file in `web/`,
+refresh the browser, and the change is live. No rebuild, no restart.
+
+Go changes still need a rebuild and restart. That is a deliberate trade:
+all routing state (active account, exhaustion windows) lives in
+`state.json`, so a restart is instant and lossless, and building a custom
+in-process hot reloader would add real complexity for near-zero benefit.
+If you want watch-and-restart for Go code anyway, the standard
+[air](https://github.com/air-verse/air) tool works fine with Switcher.
+
 ## Disclaimer
 
 Switcher is an unofficial tool and is not affiliated with OpenAI. It proxies
