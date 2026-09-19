@@ -33,11 +33,14 @@ type Account struct {
 	LastRefresh int64  `json:"last_refresh,omitempty"`
 }
 
-// State is the persisted routing state: the active account per provider
-// and which accounts are known to be exhausted (until a unix timestamp).
+// State is the persisted routing state: the active account per provider,
+// which accounts are exhausted (until a unix timestamp), plus the user's
+// provider display order and hidden providers.
 type State struct {
-	Active    map[string]string `json:"active,omitempty"`
-	Exhausted map[string]int64  `json:"exhausted,omitempty"`
+	Active          map[string]string `json:"active,omitempty"`
+	Exhausted       map[string]int64  `json:"exhausted,omitempty"`
+	ProviderOrder   []string          `json:"provider_order,omitempty"`
+	HiddenProviders []string          `json:"hidden_providers,omitempty"`
 }
 
 // ErrNotFound is returned when an account ID does not exist.

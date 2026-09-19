@@ -1,7 +1,7 @@
 const providersEl = document.getElementById('providers');
 const themeButtons = document.querySelectorAll('[data-theme-choice]');
 
-let data = { active: '', accounts: [] };
+let data = { accounts: [], order: [], hidden: [] };
 
 /* ---------- theme ---------- */
 
@@ -28,15 +28,13 @@ const OPENAI_PATH = 'm297.06 130.97c7.26-21.79 4.76-45.66-6.85-65.48-17.46-30.4-
 
 const LOGOS = {
   codex: `<svg viewBox="0 0 320 320" fill="currentColor" aria-hidden="true"><path d="${OPENAI_PATH}"/></svg>`,
-  claude: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13.7 3.2h-3l6.2 17.8h3.1L13.7 3.2h-.6zM4.9 21h3l1.5-4.6L7 10.2 4.7 21H4.9z" opacity="0"/><path d="M10.3 3.2h-3L1 21h3.1l6.2-13.8L10.5 3.2z" opacity="0"/><path d="M12.9 3.2L5.9 21h2.9l6.9-17.8h-2.6zM16.2 3.2L9.2 21h2.9l6.9-17.8h-2.9z" opacity="0"/><path d="M12.9 3.2L5.9 21h2.9l6.9-17.8h-2.8z"/></svg>`,
-  grok: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3.8 4.5l6.1 7.2-6.3 7.8h3.2l4.6-7.7-4.4-7.3H3.8zm7.9 0l4.5 7.4-4.8 7.5h3.1l3.3-5.2 2.7 5.2h2.9l-4.5-7.4 4.4-7.3h-3.2l-4.3 7.2-4.4-7.2h-2.3z" opacity="0"/><path d="M2.6 3.5l11.9 14.9-3.4 5.1h2.9l2.3-4 2.5 4h2.7L4.2 4.5l-1.6-1z"/><path d="M21.4 3l-9.7 14.6 1.7 2.6L21.7 3.4h-.3z"/></svg>`,
-  opencode: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4 4h16v4H4zM4 10h10v4H4zM4 16h16v4H4z" fill-rule="evenodd" clip-rule="evenodd"/><path d="M16 10h4v4h-4z"/></svg>`,
+  // PNG marks the user provided; dark theme inverts the monochrome ones.
+  claude: `<img src="logos/claude.png" alt="">`,
+  grok: `<span class="monochrome"><img src="logos/grok.png" alt=""></span>`,
+  opencode: `<span class="monochrome"><img src="logos/opencode.png" alt=""></span>`,
 };
 
 const PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', grok: 'Grok', opencode: 'OpenCode' };
-
-// How each provider adds an account: browser popup, device code, or key.
-const ADD_METHOD = { codex: 'browser', claude: 'browser', grok: 'device', opencode: 'key' };
 
 // ChatGPT plan tiers as OpenAI markets them.
 const PLAN_NAMES = {
@@ -45,6 +43,9 @@ const PLAN_NAMES = {
   plus: 'Plus',
   free: 'Free',
 };
+
+// How each provider adds an account: browser popup, device code, or key.
+const ADD_METHOD = { codex: 'browser', claude: 'browser', grok: 'device', opencode: 'key' };
 
 /* ---------- helpers ---------- */
 
@@ -95,6 +96,7 @@ async function refreshState() {
     if (JSON.stringify(next) !== JSON.stringify(data)) {
       data = next;
       render();
+      renderAddProviderMenu();
     }
   } catch (err) {
     toast('Could not reach Switcher: ' + err.message);
@@ -105,7 +107,7 @@ function statusOf(account) {
   if (account.exhausted_until * 1000 > Date.now()) {
     return { cls: 'exhausted', label: 'Out of usage' };
   }
-  if (account.id === data.active) return { cls: 'active', label: 'Active' };
+  if (account.id === data.active[account.provider]) return { cls: 'active', label: 'Active' };
   return { cls: '', label: 'Idle' };
 }
 
@@ -137,7 +139,7 @@ function windowHTML(win, providerID) {
 }
 
 function accountHTML(account) {
-  const isActive = account.id === data.active;
+  const isActive = account.id === data.active?.[account.provider];
   const status = statusOf(account);
   const plan = PLAN_NAMES[account.plan] || account.plan || '';
   let windows;
@@ -152,7 +154,7 @@ function accountHTML(account) {
     <div class="account ${isActive ? 'active' : ''}" data-id="${escapeHTML(account.id)}">
       <div class="account-head">
         <div class="who">
-          <div class="email" tabindex="0" title="">${escapeHTML(account.email)}</div>
+          <div class="email" tabindex="0">${escapeHTML(account.email)}</div>
           <div class="meta">
             <span class="dot ${status.cls}"></span>${status.label}
             ${plan ? ` · ${escapeHTML(plan)}` : ''}
@@ -175,29 +177,29 @@ function render() {
     if (!byProvider.has(a.provider)) byProvider.set(a.provider, []);
     byProvider.get(a.provider).push(a);
   }
-  if (!byProvider.size) {
-    providersEl.innerHTML = `
-      <div class="empty">
-        No accounts yet.<br>Add your first Codex account to start switching.
-      </div>`;
-    return;
-  }
-  const order = ['codex', 'claude', 'grok', 'opencode'];
-  const has = new Set(byProvider.keys());
-  for (const id of order) if (!has.has(id)) byProvider.set(id, []);
+  const order = (data.order || Object.keys(PROVIDER_NAMES))
+    .filter(id => !(data.hidden || []).includes(id));
   let html = '';
-  for (const [providerID, accounts] of byProvider) {
+  order.forEach((providerID, index) => {
+    const accounts = byProvider.get(providerID) || [];
+    const canUp = index > 0;
+    const canDown = index < order.length - 1;
     html += `
-      <section class="provider">
+      <section class="provider" data-provider="${providerID}" id="provider-${providerID}">
         <div class="provider-head">
           <span class="logo">${LOGOS[providerID] || ''}</span>
           <h2>${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</h2>
           <span class="count">${accounts.length}</span>
           <button class="add-provider" data-add="${providerID}">Add account</button>
+          <span class="provider-tools">
+            <button data-move="up" ${canUp ? '' : 'disabled'} title="Move up">↑</button>
+            <button data-move="down" ${canDown ? '' : 'disabled'} title="Move down">↓</button>
+            <button data-menu="${providerID}" title="Provider options">⋯</button>
+          </span>
         </div>
         ${accounts.length ? accounts.map(accountHTML).join('') : `<div class="unknown">No accounts yet.</div>`}
       </section>`;
-  }
+  });
   providersEl.innerHTML = html;
 }
 
@@ -219,6 +221,50 @@ function scheduleUsage() {
   }, 60000);
 }
 
+/* ---------- provider menus ---------- */
+
+// openProviderMenu shows a small dropdown with per-provider actions.
+function openProviderMenu(anchor, providerID) {
+  document.querySelector('.prov-menu')?.remove();
+  const name = PROVIDER_NAMES[providerID] || providerID;
+  const menu = document.createElement('div');
+  menu.className = 'prov-menu';
+  menu.innerHTML = `
+    <button data-remove-provider="${escapeHTML(providerID)}">
+      <span class="menu-logo">${LOGOS[providerID] || ''}</span>Remove ${escapeHTML(name)}
+    </button>`;
+  const rect = anchor.getBoundingClientRect();
+  menu.style.top = `${rect.bottom + 6}px`;
+  menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 240))}px`;
+  document.body.appendChild(menu);
+  setTimeout(() => {
+    const close = (e) => {
+      if (menu.contains(e.target) || e.target === anchor) return;
+      menu.remove();
+      document.removeEventListener('click', close);
+    };
+    document.addEventListener('click', close);
+  }, 0);
+}
+
+// "Add provider" button in the header: lists removed providers.
+function renderAddProviderMenu() {
+  const host = document.getElementById('add-provider-slot');
+  if (!host) return;
+  if (!(data.hidden || []).length) {
+    host.innerHTML = '';
+    return;
+  }
+  host.innerHTML = `
+    <button id="add-provider">Add provider ⌄</button>
+    <div class="hidden-list">
+      ${data.hidden.map(id => `
+        <button data-show-provider="${escapeHTML(id)}">
+          <span class="menu-logo">${LOGOS[id] || ''}</span>${escapeHTML(PROVIDER_NAMES[id] || id)}
+        </button>`).join('')}
+    </div>`;
+}
+
 /* ---------- actions ---------- */
 
 providersEl.addEventListener('click', async (event) => {
@@ -227,6 +273,26 @@ providersEl.addEventListener('click', async (event) => {
   const email = event.target.closest('.email');
   if (email) {
     email.classList.toggle('revealed');
+    return;
+  }
+  const move = event.target.closest('button[data-move]');
+  if (move && !move.disabled) {
+    const providerID = move.closest('.provider').dataset.provider;
+    const order = [...data.order];
+    const i = order.indexOf(providerID);
+    const j = move.dataset.move === 'up' ? i - 1 : i + 1;
+    [order[i], order[j]] = [order[j], order[i]];
+    await api('/api/providers/order', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order }),
+    });
+    await refreshState();
+    return;
+  }
+  const menuBtn = event.target.closest('button[data-menu]');
+  if (menuBtn) {
+    openProviderMenu(menuBtn, menuBtn.dataset.menu);
     return;
   }
   const button = event.target.closest('button[data-act]');
@@ -254,7 +320,7 @@ providersEl.addEventListener('click', async (event) => {
   const providerID = add.dataset.add;
   try {
     if (ADD_METHOD[providerID] === 'key') {
-      const key = await promptKeyModal(PROVIDER_NAMES[providerID]);
+      const key = await promptKey(PROVIDER_NAMES[providerID]);
       if (!key) { add.disabled = false; return; }
       const res = await api('/api/accounts', {
         method: 'POST',
@@ -289,6 +355,52 @@ providersEl.addEventListener('click', async (event) => {
   }
 });
 
+// Header: add back a removed provider, with its logo.
+document.addEventListener('click', (event) => {
+  const trigger = event.target.closest('#add-provider');
+  if (trigger) {
+    document.querySelector('#add-provider-slot .hidden-list')?.classList.toggle('open');
+    return;
+  }
+  const show = event.target.closest('[data-show-provider]');
+  if (show) {
+    api(`/api/providers/${show.dataset.showProvider}/show`, { method: 'POST' })
+      .then(async () => {
+        await refreshState();
+        document.getElementById(`provider-${show.dataset.showProvider}`)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    return;
+  }
+  document.querySelector('#add-provider-slot .hidden-list')?.classList.remove('open');
+});
+
+// Login polling runs detached so closing the popup never locks the button:
+// the user can always click "Add account" again immediately.
+async function pollLogin(state) {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await api(`/api/login/${state}`);
+      if (res.status === 'done') {
+        toast(`Account added: ${res.account.email}`);
+        await refreshState();
+        await refreshAllUsage();
+        return;
+      }
+      if (res.status === 'failed') {
+        toast('Login failed: ' + (res.error || 'did not complete'));
+        return;
+      }
+      if (res.status === 'finished') return;
+    } catch {
+      // Transient network hiccup while polling: keep trying.
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  toast('Login timed out');
+}
+
 // showDeviceModal presents the grok device code and a link to the
 // verification page; keep it on screen until the login resolves.
 function showDeviceModal(verifyURL, userCode) {
@@ -297,7 +409,7 @@ function showDeviceModal(verifyURL, userCode) {
   overlay.innerHTML = `
     <div class="device-modal">
       <h3>Sign in to Grok</h3>
-      <p>Open <a href="${escapeHTML(verifyURL)}" target="_blank" rel="noopener">x.ai/device</a> and enter this code:</p>
+      <p>Open <a href="${escapeHTML(verifyURL)}" target="_blank" rel="noopener">the verification page</a> and enter this code:</p>
       <div class="device-code">${escapeHTML(userCode)}</div>
       <div class="device-copy"><button type="button">Copy code</button></div>
       <p class="device-wait">Waiting for you to finish in the browser...</p>
@@ -335,34 +447,6 @@ function promptKey(name) {
     });
     overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
   });
-}
-
-const promptKeyModal = promptKey;
-
-// Login polling runs detached so closing the popup never locks the button:
-// the user can always click "Add Codex account" again immediately.
-async function pollLogin(state) {
-  const deadline = Date.now() + 5 * 60 * 1000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await api(`/api/login/${state}`);
-      if (res.status === 'done') {
-        toast(`Account added: ${res.account.email}`);
-        await refreshState();
-        await refreshAllUsage();
-        return;
-      }
-      if (res.status === 'failed') {
-        toast('Login failed: ' + (res.error || 'did not complete'));
-        return;
-      }
-      if (res.status === 'finished') return;
-    } catch {
-      // Transient network hiccup while polling: keep trying.
-    }
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  toast('Login timed out');
 }
 
 /* ---------- boot ---------- */

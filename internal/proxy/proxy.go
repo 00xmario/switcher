@@ -46,6 +46,8 @@ type Manager struct {
 	active    map[string]string // provider -> active account id
 	exhausted map[string]time.Time
 	lastUsage map[string]provider.Usage
+	order     []string // display order of provider sections
+	hidden    []string // providers dismissed from the UI
 }
 
 // New loads persisted state and returns the proxy manager.
@@ -64,13 +66,102 @@ func New(st *store.Store, providers map[string]provider.Provider) (*Manager, err
 	if active == nil {
 		active = map[string]string{}
 	}
+	order := []string{}
+	hidden := []string{}
+	for _, id := range state.ProviderOrder {
+		if _, known := providers[id]; known {
+			order = append(order, id)
+		}
+	}
+	// Providers registered but never ordered land at the end, stable.
+	for id := range providers {
+		if !containsID(order, id) {
+			order = append(order, id)
+		}
+	}
+	for _, id := range state.HiddenProviders {
+		if _, known := providers[id]; known && !containsID(hidden, id) {
+			hidden = append(hidden, id)
+		}
+	}
 	return &Manager{
 		store:     st,
 		providers: providers,
 		active:    active,
 		exhausted: exhausted,
 		lastUsage: map[string]provider.Usage{},
+		order:     order,
+		hidden:    hidden,
 	}, nil
+}
+
+func containsID(list []string, id string) bool {
+	for _, v := range list {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
+// Providers returns the display order and hidden provider ids.
+func (m *Manager) Providers() (order []string, hidden []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.order...), append([]string(nil), m.hidden...)
+}
+
+// ReorderProviders sets the display order. Unknown ids are ignored;
+// registered providers missing from the list are appended, stable.
+func (m *Manager) ReorderProviders(order []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := make([]string, 0, len(m.providers))
+	seen := map[string]bool{}
+	for _, id := range order {
+		if _, ok := m.providers[id]; ok && !seen[id] {
+			next = append(next, id)
+			seen[id] = true
+		}
+	}
+	for id := range m.providers {
+		if !seen[id] {
+			next = append(next, id)
+			seen[id] = true
+		}
+	}
+	m.order = next
+	_ = m.persistLocked()
+}
+
+// HideProvider removes a provider from the display. Its accounts keep
+// serving traffic through its prefix; re-adding is a UI action.
+func (m *Manager) HideProvider(providerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, known := m.providers[providerID]; !known || containsID(m.hidden, providerID) {
+		return
+	}
+	m.hidden = append(m.hidden, providerID)
+	_ = m.persistLocked()
+}
+
+// ShowProvider brings a hidden provider back into the display.
+func (m *Manager) ShowProvider(providerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hidden = removeID(m.hidden, providerID)
+	_ = m.persistLocked()
+}
+
+func removeID(list []string, id string) []string {
+	out := list[:0]
+	for _, v := range list {
+		if v != id {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // ActiveID returns the active account of one provider ("" when none).
@@ -209,7 +300,12 @@ func (m *Manager) persistLocked() error {
 	for providerID, id := range m.active {
 		active[providerID] = id
 	}
-	return m.store.SaveState(store.State{Active: active, Exhausted: exhausted})
+	order := append([]string(nil), m.order...)
+	hidden := append([]string(nil), m.hidden...)
+	return m.store.SaveState(store.State{
+		Active: active, Exhausted: exhausted,
+		ProviderOrder: order, HiddenProviders: hidden,
+	})
 }
 
 // ServeHTTP forwards an API request to the active upstream account of the

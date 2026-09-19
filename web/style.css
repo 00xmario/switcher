@@ -152,6 +152,56 @@ button:disabled { opacity: .45; cursor: default; }
 .provider-head h2 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
 .provider-head .count { color: var(--faint); font-size: 13px; }
 .provider-head .add-provider { margin-left: auto; padding: 6px 12px; font-size: 13px; border-radius: 8px; background: transparent; }
+.provider-tools { display: flex; gap: 4px; opacity: 0; transition: opacity .15s ease; }
+.provider-head:hover .provider-tools { opacity: 1; }
+.provider-tools button { padding: 6px 9px; font-size: 12px; border-radius: 8px; background: transparent; color: var(--dim); }
+.provider-tools button:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.provider-logo-img { width: 20px; height: 20px; display: block; }
+.logo img { width: 20px; height: 20px; display: block; }
+html[data-theme="dark"] .monochrome img,
+html[data-theme="system"] .monochrome img { filter: invert(1); }
+@media (prefers-color-scheme: dark) {
+  html[data-theme="system"] .monochrome img { filter: invert(1); }
+}
+
+/* provider menus */
+.prov-menu, .hidden-list {
+  position: fixed;
+  min-width: 220px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / .25);
+  padding: 6px;
+  z-index: 30;
+}
+.prov-menu button, .hidden-list button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  border-radius: 8px;
+  padding: 9px 12px;
+  text-align: left;
+  font-size: 14px;
+  color: var(--text);
+}
+.prov-menu button:hover, .hidden-list button:hover { background: var(--surface-2); }
+.menu-logo { display: grid; place-items: center; width: 20px; height: 20px; }
+.menu-logo img { width: 18px; height: 18px; display: block; }
+html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
+#add-provider-slot { position: relative; }
+#add-provider-slot .hidden-list {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 220px;
+  display: none;
+  box-shadow: 0 12px 40px rgb(0 0 0 / .25);
+}
+#add-provider-slot .hidden-list.open { display: block; }
 
 .account {
   background: var(--surface);

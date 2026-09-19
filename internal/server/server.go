@@ -32,6 +32,9 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
 	mux.HandleFunc("POST /api/accounts", a.handleAddKey)
+	mux.HandleFunc("PATCH /api/providers/order", a.handleProviderOrder)
+	mux.HandleFunc("POST /api/providers/{id}/hide", a.handleProviderHide)
+	mux.HandleFunc("POST /api/providers/{id}/show", a.handleProviderShow)
 	mux.HandleFunc("DELETE /api/accounts/{id}", a.handleDelete)
 }
 
@@ -116,7 +119,12 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 	for _, acc := range accounts {
 		views = append(views, a.viewOf(acc))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": views})
+	order, hidden := a.Proxy.Providers()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts": views,
+		"order":    order,
+		"hidden":   hidden,
+	})
 }
 
 func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
@@ -248,6 +256,41 @@ func (a *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Proxy.Remove(id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *API) handleProviderOrder(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Order []string `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	a.Proxy.ReorderProviders(body.Order)
+	order, _ := a.Proxy.Providers()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "order": order})
+}
+
+func (a *API) handleProviderHide(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		http.Error(w, "invalid provider id", http.StatusBadRequest)
+		return
+	}
+	a.Proxy.HideProvider(id)
+	_, hidden := a.Proxy.Providers()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "hidden": hidden})
+}
+
+func (a *API) handleProviderShow(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		http.Error(w, "invalid provider id", http.StatusBadRequest)
+		return
+	}
+	a.Proxy.ShowProvider(id)
+	order, hidden := a.Proxy.Providers()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "order": order, "hidden": hidden})
 }
 
 // validID accepts only the identifiers Switcher itself generates
