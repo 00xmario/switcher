@@ -408,3 +408,9 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
 .device-copy { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 .device-copy .primary { border-color: var(--accent); color: var(--accent); background: transparent; }
 .device-wait { text-align: center; margin-top: 14px; color: var(--faint); font-size: 13px; }
+
+
+/* ---------- drag ordering ---------- */
+.provider-head { cursor: grab; }
+.provider-head:active { cursor: grabbing; }
+.provider.dragging { opacity: .35; }

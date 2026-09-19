@@ -187,20 +187,16 @@ function render() {
   const order = (data.order || Object.keys(PROVIDER_NAMES))
     .filter(id => !(data.hidden || []).includes(id));
   let html = '';
-  order.forEach((providerID, index) => {
+  order.forEach((providerID) => {
     const accounts = byProvider.get(providerID) || [];
-    const canUp = index > 0;
-    const canDown = index < order.length - 1;
     html += `
       <section class="provider" data-provider="${providerID}" id="provider-${providerID}">
-        <div class="provider-head">
+        <div class="provider-head" draggable="true">
           <span class="logo logo-${providerID}">${LOGOS[providerID] || ''}</span>
           <h2>${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</h2>
           <span class="count">${accounts.length}</span>
           <button class="add-provider" data-add="${providerID}">Add account</button>
           <span class="provider-tools">
-            <button data-move="up" ${canUp ? '' : 'disabled'} title="Move up">↑</button>
-            <button data-move="down" ${canDown ? '' : 'disabled'} title="Move down">↓</button>
             <button data-menu="${providerID}" title="Provider options">⋯</button>
           </span>
         </div>
@@ -244,14 +240,23 @@ function openProviderMenu(anchor, providerID) {
   menu.style.top = `${rect.bottom + 6}px`;
   menu.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 240))}px`;
   document.body.appendChild(menu);
-  setTimeout(() => {
-    const close = (e) => {
-      if (menu.contains(e.target) || e.target === anchor) return;
-      menu.remove();
-      document.removeEventListener('click', close);
-    };
-    document.addEventListener('click', close);
-  }, 0);
+
+  const close = (e) => {
+    if (menu.contains(e.target) || e.target === anchor) return;
+    menu.remove();
+    document.removeEventListener('click', close);
+  };
+  setTimeout(() => document.addEventListener('click', close), 0);
+
+  menu.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-remove-provider]');
+    if (!btn) return;
+    menu.remove();
+    document.removeEventListener('click', close);
+    if (!confirm(`Remove ${name} from the page?\nIts accounts stay on disk and keep serving traffic; "Add provider" brings it back.`)) return;
+    await api(`/api/providers/${providerID}/hide`, { method: 'POST' });
+    await refreshState();
+  });
 }
 
 // "Add provider" button in the header: lists removed providers.
@@ -282,21 +287,6 @@ providersEl.addEventListener('click', async (event) => {
     email.classList.toggle('revealed');
     return;
   }
-  const move = event.target.closest('button[data-move]');
-  if (move && !move.disabled) {
-    const providerID = move.closest('.provider').dataset.provider;
-    const order = [...data.order];
-    const i = order.indexOf(providerID);
-    const j = move.dataset.move === 'up' ? i - 1 : i + 1;
-    [order[i], order[j]] = [order[j], order[i]];
-    await api('/api/providers/order', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ order }),
-    });
-    await refreshState();
-    return;
-  }
   const menuBtn = event.target.closest('button[data-menu]');
   if (menuBtn) {
     openProviderMenu(menuBtn, menuBtn.dataset.menu);
@@ -318,6 +308,45 @@ providersEl.addEventListener('click', async (event) => {
   } catch (err) {
     toast(err.message);
   }
+});
+
+/* ---------- drag-and-drop provider ordering ---------- */
+
+// The section header is the drag handle: grab it anywhere and slide the
+// section up or down; the order is persisted when the drag ends.
+providersEl.addEventListener('dragstart', (event) => {
+  const head = event.target.closest('.provider-head');
+  if (!head) { event.preventDefault(); return; }
+  const section = head.closest('.provider');
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', section.dataset.provider);
+  section.classList.add('dragging');
+});
+
+providersEl.addEventListener('dragend', async () => {
+  const dragged = providersEl.querySelector('.provider.dragging');
+  if (!dragged) return;
+  dragged.classList.remove('dragging');
+  const order = [...providersEl.querySelectorAll('.provider')]
+    .map((el) => el.dataset.provider);
+  await api('/api/providers/order', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order }),
+  });
+  await refreshState();
+});
+
+providersEl.addEventListener('dragover', (event) => {
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  const dragged = providersEl.querySelector('.provider.dragging');
+  if (!dragged) return;
+  const target = event.target.closest('.provider');
+  if (!target || target === dragged) return;
+  const box = target.getBoundingClientRect();
+  const before = event.clientY < box.top + box.height / 2;
+  target.parentNode.insertBefore(dragged, before ? target : target.nextSibling);
 });
 
 providersEl.addEventListener('click', async (event) => {
