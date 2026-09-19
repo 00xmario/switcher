@@ -157,11 +157,12 @@ button:disabled { opacity: .45; cursor: default; }
 .provider-tools button { padding: 6px 9px; font-size: 12px; border-radius: 8px; background: transparent; color: var(--dim); }
 .provider-tools button:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
 .provider-logo-img { width: 20px; height: 20px; display: block; }
-.logo img { width: 20px; height: 20px; display: block; }
-html[data-theme="dark"] .monochrome img,
-html[data-theme="system"] .monochrome img { filter: invert(1); }
+.logo svg { width: 20px; height: 20px; display: block; }
+html[data-theme="dark"] .logo.opencode,
+html[data-theme="dark"] .menu-logo.opencode { filter: invert(1); }
 @media (prefers-color-scheme: dark) {
-  html[data-theme="system"] .monochrome img { filter: invert(1); }
+  html[data-theme="system"] .logo.opencode,
+  html[data-theme="system"] .menu-logo.opencode { filter: invert(1); }
 }
 
 /* provider menus */
