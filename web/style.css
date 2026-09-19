@@ -151,6 +151,7 @@ button:disabled { opacity: .45; cursor: default; }
 .provider-head .logo svg { width: 20px; height: 20px; }
 .provider-head h2 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
 .provider-head .count { color: var(--faint); font-size: 13px; }
+.provider-head .add-provider { margin-left: auto; padding: 6px 12px; font-size: 13px; border-radius: 8px; background: transparent; }
 
 .account {
   background: var(--surface);
@@ -309,3 +310,50 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
   box-shadow: 0 6px 24px rgb(0 0 0 / .12);
   z-index: 10;
 }
+
+
+/* ---------- device-code and key dialogs ---------- */
+
+.device-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgb(4 6 9 / .55);
+  display: grid;
+  place-items: center;
+  z-index: 20;
+}
+.device-modal {
+  width: min(420px, 92vw);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  padding: 26px 28px;
+  box-shadow: 0 20px 60px rgb(0 0 0 / .35);
+}
+.device-modal h3 { margin: 0 0 10px; font-size: 17px; }
+.device-modal p { margin: 8px 0; color: var(--dim); font-size: 14px; }
+.device-code {
+  font: 600 26px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .12em;
+  text-align: center;
+  padding: 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  margin: 14px 0;
+  user-select: all;
+}
+.device-modal input {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 12px 0;
+  outline: none;
+}
+.device-modal input:focus { border-color: var(--accent); }
+.device-copy { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.device-copy .primary { border-color: var(--accent); color: var(--accent); background: transparent; }
+.device-wait { text-align: center; margin-top: 14px; color: var(--faint); font-size: 13px; }

@@ -1,5 +1,4 @@
 const providersEl = document.getElementById('providers');
-const addBtn = document.getElementById('add-account');
 const themeButtons = document.querySelectorAll('[data-theme-choice]');
 
 let data = { active: '', accounts: [] };
@@ -29,11 +28,15 @@ const OPENAI_PATH = 'm297.06 130.97c7.26-21.79 4.76-45.66-6.85-65.48-17.46-30.4-
 
 const LOGOS = {
   codex: `<svg viewBox="0 0 320 320" fill="currentColor" aria-hidden="true"><path d="${OPENAI_PATH}"/></svg>`,
-  grok: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M5 4l10 16"/><path d="M19 4c-2 3.5-5.5 3.5-7 6.5S9.5 17 5 20"/><circle cx="16.5" cy="6.5" r="2.6" fill="currentColor" stroke="none"/></svg>`,
-  claude: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.5 19.2L11.9 4h2.2l5.4 15.2h-2.8l-1.3-3.9h-5l-1.3 3.2H6.5zm3.9-5.6h3.4l-1.7-4.8-1.9 4.8z"/></svg>`,
+  claude: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13.7 3.2h-3l6.2 17.8h3.1L13.7 3.2h-.6zM4.9 21h3l1.5-4.6L7 10.2 4.7 21H4.9z" opacity="0"/><path d="M10.3 3.2h-3L1 21h3.1l6.2-13.8L10.5 3.2z" opacity="0"/><path d="M12.9 3.2L5.9 21h2.9l6.9-17.8h-2.6zM16.2 3.2L9.2 21h2.9l6.9-17.8h-2.9z" opacity="0"/><path d="M12.9 3.2L5.9 21h2.9l6.9-17.8h-2.8z"/></svg>`,
+  grok: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3.8 4.5l6.1 7.2-6.3 7.8h3.2l4.6-7.7-4.4-7.3H3.8zm7.9 0l4.5 7.4-4.8 7.5h3.1l3.3-5.2 2.7 5.2h2.9l-4.5-7.4 4.4-7.3h-3.2l-4.3 7.2-4.4-7.2h-2.3z" opacity="0"/><path d="M2.6 3.5l11.9 14.9-3.4 5.1h2.9l2.3-4 2.5 4h2.7L4.2 4.5l-1.6-1z"/><path d="M21.4 3l-9.7 14.6 1.7 2.6L21.7 3.4h-.3z"/></svg>`,
+  opencode: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4 4h16v4H4zM4 10h10v4H4zM4 16h16v4H4z" fill-rule="evenodd" clip-rule="evenodd"/><path d="M16 10h4v4h-4z"/></svg>`,
 };
 
-const PROVIDER_NAMES = { codex: 'Codex', grok: 'Grok', claude: 'Claude' };
+const PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', grok: 'Grok', opencode: 'OpenCode' };
+
+// How each provider adds an account: browser popup, device code, or key.
+const ADD_METHOD = { codex: 'browser', claude: 'browser', grok: 'device', opencode: 'key' };
 
 // ChatGPT plan tiers as OpenAI markets them.
 const PLAN_NAMES = {
@@ -179,6 +182,9 @@ function render() {
       </div>`;
     return;
   }
+  const order = ['codex', 'claude', 'grok', 'opencode'];
+  const has = new Set(byProvider.keys());
+  for (const id of order) if (!has.has(id)) byProvider.set(id, []);
   let html = '';
   for (const [providerID, accounts] of byProvider) {
     html += `
@@ -187,8 +193,9 @@ function render() {
           <span class="logo">${LOGOS[providerID] || ''}</span>
           <h2>${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</h2>
           <span class="count">${accounts.length}</span>
+          <button class="add-provider" data-add="${providerID}">Add account</button>
         </div>
-        ${accounts.map(accountHTML).join('')}
+        ${accounts.length ? accounts.map(accountHTML).join('') : `<div class="unknown">No accounts yet.</div>`}
       </section>`;
   }
   providersEl.innerHTML = html;
@@ -198,7 +205,7 @@ function render() {
 
 let usageTimer = null;
 async function refreshAllUsage() {
-  for (const account of data.accounts.filter(a => a.provider === 'codex')) {
+  for (const account of data.accounts) {
     try { await api(`/api/accounts/${account.id}/refresh`, { method: 'POST' }); } catch { /* keep old data */ }
   }
   await refreshState();
@@ -240,27 +247,97 @@ providersEl.addEventListener('click', async (event) => {
   }
 });
 
-addBtn.addEventListener('click', async () => {
-  addBtn.disabled = true;
+providersEl.addEventListener('click', async (event) => {
+  const add = event.target.closest('button[data-add]');
+  if (!add || add.disabled) return;
+  add.disabled = true;
+  const providerID = add.dataset.add;
   try {
-    const { url, state } = await api('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: 'codex' }),
-    });
-    const popup = window.open(url, 'switcher-login', 'width=520,height=720');
-    if (!popup) {
-      // Popup blocked: navigate this tab; the callback page says how to get back.
-      location.href = url;
-      return;
+    if (ADD_METHOD[providerID] === 'key') {
+      const key = await promptKeyModal(PROVIDER_NAMES[providerID]);
+      if (!key) { add.disabled = false; return; }
+      const res = await api('/api/accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: providerID, key }),
+      });
+      toast(`Account added: ${res.account.email}`);
+      await refreshState();
+      await refreshAllUsage();
+    } else {
+      const login = await api('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: providerID }),
+      });
+      if (login.kind === 'device') {
+        showDeviceModal(login.verification_url, login.user_code);
+      } else {
+        const popup = window.open(login.url, 'switcher-login', 'width=520,height=720');
+        if (!popup) {
+          // Popup blocked: navigate this tab; the callback page says how to get back.
+          location.href = login.url;
+          return;
+        }
+      }
+      pollLogin(login.state); // detached: the button stays usable for another attempt
     }
-    pollLogin(state); // detached: the button stays usable for another attempt
   } catch (err) {
     toast(err.message);
   } finally {
-    addBtn.disabled = false;
+    add.disabled = false;
   }
 });
+
+// showDeviceModal presents the grok device code and a link to the
+// verification page; keep it on screen until the login resolves.
+function showDeviceModal(verifyURL, userCode) {
+  const overlay = document.createElement('div');
+  overlay.className = 'device-overlay';
+  overlay.innerHTML = `
+    <div class="device-modal">
+      <h3>Sign in to Grok</h3>
+      <p>Open <a href="${escapeHTML(verifyURL)}" target="_blank" rel="noopener">x.ai/device</a> and enter this code:</p>
+      <div class="device-code">${escapeHTML(userCode)}</div>
+      <div class="device-copy"><button type="button">Copy code</button></div>
+      <p class="device-wait">Waiting for you to finish in the browser...</p>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('.device-copy button').addEventListener('click', () => {
+    navigator.clipboard?.writeText(userCode).then(() => toast('Code copied'), () => {});
+  });
+}
+
+// promptKey asks for an API key inline (a real dialog beats prompt()).
+function promptKey(name) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'device-overlay';
+    overlay.innerHTML = `
+      <div class="device-modal">
+        <h3>Add an ${escapeHTML(name)} account</h3>
+        <p>Paste the API key from your ${escapeHTML(name)} account.</p>
+        <input type="password" spellcheck="false" autocomplete="off" placeholder="sk-...">
+        <div class="device-copy">
+          <button type="button" data-cancel>Cancel</button>
+          <button type="button" class="primary" data-ok>Add account</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector('input');
+    input.focus();
+    const close = (value) => { overlay.remove(); resolve(value); };
+    overlay.querySelector('[data-ok]').addEventListener('click', () => close(input.value.trim()));
+    overlay.querySelector('[data-cancel]').addEventListener('click', () => close(null));
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter') close(input.value.trim());
+      if (e.key === 'Escape') close(null);
+    });
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
+  });
+}
+
+const promptKeyModal = promptKey;
 
 // Login polling runs detached so closing the popup never locks the button:
 // the user can always click "Add Codex account" again immediately.

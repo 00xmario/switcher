@@ -1,8 +1,9 @@
-// Package login orchestrates browser OAuth flows: start a login, let the
-// OAuth callback complete it in the background, and let the UI poll for
-// the outcome. Results are kept briefly so a completed login is never lost
-// to a poll race, and every successful exchange is persisted through the
-// configured hook the moment it completes.
+// Package login orchestrates OAuth logins: browser (PKCE callback) flows
+// and device-code flows, where the provider polls upstream itself and the
+// outcome simply takes longer to land. Results are kept briefly so a
+// completed login is never lost to a poll race, and every successful
+// exchange is persisted through the configured hook the moment it
+// completes.
 package login
 
 import (
@@ -20,15 +21,18 @@ const (
 	// pendingTTL bounds how long a started-but-unfinished login stays alive.
 	pendingTTL = 10 * time.Minute
 	// resultTTL bounds how long a finished outcome stays pollable.
-	resultTTL = 5 * time.Minute
-	// defaultWait is how long a single poll may block.
-	defaultWait = time.Second
+	resultTTL = 15 * time.Minute
+	// pollWait is how long a single UI poll may block.
+	pollWait = time.Second
 )
 
 // Handle identifies one started login attempt.
 type Handle struct {
-	State string `json:"state"`
-	URL   string `json:"url"`
+	State           string `json:"state"`
+	URL             string `json:"url,omitempty"`
+	Kind            string `json:"kind"`
+	VerificationURL string `json:"verification_url,omitempty"`
+	UserCode        string `json:"user_code,omitempty"`
 }
 
 // ErrUnknown is returned for unknown or expired logins.
@@ -58,7 +62,7 @@ type Manager struct {
 }
 
 // New creates a login manager. persist is called exactly once per
-// successful login exchange, from the callback goroutine.
+// successful login, from the goroutine that completes it.
 func New(persist func(store.Account) error) *Manager {
 	return &Manager{
 		persist: persist,
@@ -67,24 +71,41 @@ func New(persist func(store.Account) error) *Manager {
 	}
 }
 
-// Start begins an OAuth flow for the given provider and returns the URL
-// the user must open plus the handle to poll.
+// Start begins a browser (PKCE) login for the given provider.
 func (m *Manager) Start(ctx context.Context, prov provider.Provider) (Handle, error) {
-	url, state, err := prov.LoginStart(ctx)
+	info, err := prov.LoginStart(ctx)
 	if err != nil {
 		return Handle{}, fmt.Errorf("start login: %w", err)
 	}
-	p := &pending{provider: prov, done: make(chan struct{}), started: time.Now()}
-	m.mu.Lock()
-	m.gcLocked()
-	m.pending[state] = p
-	m.mu.Unlock()
-	return Handle{State: state, URL: url}, nil
+	m.track(info.State)
+	return Handle{State: info.State, URL: info.URL, Kind: info.Kind}, nil
 }
 
-// Complete finishes the flow identified by state. It is called by the OAuth
-// callback endpoint. The exchanged account is persisted immediately (via
-// the persist hook) so completion never depends on anyone polling.
+// StartDevice begins a device-code login and spawns the background poller:
+// when the user authorizes, the flow completes itself and persists.
+func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider) (Handle, error) {
+	info, poll, err := prov.DeviceStart(ctx)
+	if err != nil {
+		return Handle{}, fmt.Errorf("start device login: %w", err)
+	}
+	m.track(info.State)
+	go func() {
+		account, err := poll(ctx)
+		if err == nil && m.persist != nil {
+			err = m.persist(account)
+		}
+		m.mu.Lock()
+		m.gcResultsLocked()
+		m.results[info.State] = result{account: account, err: err, at: time.Now()}
+		delete(m.pending, info.State)
+		m.mu.Unlock()
+	}()
+	return Handle{State: info.State, Kind: info.Kind, VerificationURL: info.VerificationURL, UserCode: info.UserCode}, nil
+}
+
+// Complete finishes a browser flow identified by state. It is called by the
+// OAuth callback endpoint. The exchanged account is persisted immediately
+// so completion never depends on anyone polling.
 func (m *Manager) Complete(ctx context.Context, state, code string) error {
 	m.mu.Lock()
 	p, ok := m.pending[state]
@@ -99,8 +120,6 @@ func (m *Manager) Complete(ctx context.Context, state, code string) error {
 		err = m.persist(account)
 	}
 	if err != nil {
-		// Record the failure so the UI learns why, then surface it to the
-		// callback page as well.
 		err = fmt.Errorf("login exchange: %w", err)
 	}
 	m.mu.Lock()
@@ -118,7 +137,6 @@ func (m *Manager) Outcome(state string, wait time.Duration) (account store.Accou
 	for {
 		m.mu.Lock()
 		if res, ok := m.results[state]; ok {
-			delete(m.results, state)
 			m.mu.Unlock()
 			return res.account, res.err, true
 		}
@@ -139,6 +157,14 @@ func (m *Manager) Outcome(state string, wait time.Duration) (account store.Accou
 			return store.Account{}, nil, false
 		}
 	}
+}
+
+// track records a new pending flow.
+func (m *Manager) track(state string) {
+	m.mu.Lock()
+	m.gcLocked()
+	m.pending[state] = &pending{done: make(chan struct{}), started: time.Now()}
+	m.mu.Unlock()
 }
 
 // gcLocked drops pending logins older than the TTL.

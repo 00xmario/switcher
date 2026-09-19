@@ -28,10 +28,41 @@ type fakeProvider struct {
 func (f *fakeProvider) ID() string          { return f.id }
 func (f *fakeProvider) DisplayName() string { return f.id }
 
-func (f *fakeProvider) LoginStart(context.Context) (string, string, error) { return "", "", nil }
+func (f *fakeProvider) LoginStart(context.Context) (provider.LoginInfo, error) {
+	return provider.LoginInfo{}, nil
+}
 
 func (f *fakeProvider) LoginExchange(context.Context, string, string) (store.Account, error) {
 	return store.Account{}, nil
+}
+
+func (f *fakeProvider) DeviceStart(ctx context.Context) (provider.LoginInfo, func(ctx context.Context) (store.Account, error), error) {
+	return provider.LoginInfo{}, nil, provider.ErrUnsupported
+}
+
+func (f *fakeProvider) AddByKey(ctx context.Context, key string) (store.Account, error) {
+	return store.Account{}, provider.ErrUnsupported
+}
+
+// ParseRateLimit stamps exhaustion onto any 429 from the fake upstream,
+// unless the test disabled switching (plain rate limit case).
+func (f *fakeProvider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
+	var parsed struct {
+		Error struct {
+			Type     string `json:"type"`
+			ResetsAt int64  `json:"resets_at"`
+		} `json:"error"`
+	}
+	if status != http.StatusTooManyRequests || json.Unmarshal(body, &parsed) != nil {
+		return time.Time{}, false
+	}
+	if parsed.Error.Type != "usage_limit_reached" {
+		return time.Time{}, false
+	}
+	if parsed.Error.ResetsAt > 0 {
+		return time.Unix(parsed.Error.ResetsAt, 0), true
+	}
+	return time.Now().Add(time.Hour), true
 }
 
 func (f *fakeProvider) Refresh(_ context.Context, a *store.Account) error {
@@ -83,7 +114,7 @@ func newManager(t *testing.T, upstream *httptest.Server, accounts ...store.Accou
 
 func doRequest(t *testing.T, m *Manager, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"x":1}`))
+	req := httptest.NewRequest(http.MethodPost, "/fake"+path, strings.NewReader(`{"x":1}`))
 	rec := httptest.NewRecorder()
 	m.ServeHTTP(rec, req)
 	return rec
@@ -119,7 +150,7 @@ func TestSwitchesAccountOnUsageLimitAndRetries(t *testing.T) {
 	if got, want := strings.Join(served, ","), "a,b"; got != want {
 		t.Fatalf("requests served by %q, want %q", got, want)
 	}
-	if active := m.ActiveID(); active != "b" {
+	if active := m.ActiveID("fake"); active != "b" {
 		t.Fatalf("active account = %q, want b", active)
 	}
 	if until, ok := m.Exhausted("a"); !ok || until.Before(time.Now()) {
@@ -172,7 +203,7 @@ func TestPlainRateLimitDoesNotSwitch(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 passthrough", rec.Code)
 	}
-	if active := m.ActiveID(); active != "a" {
+	if active := m.ActiveID("fake"); active != "a" {
 		t.Fatalf("active = %q, want unchanged \"a\"", active)
 	}
 }
@@ -218,12 +249,12 @@ func TestFirstAccountBecomesActiveWithoutExplicitPick(t *testing.T) {
 	defer upstream.Close()
 
 	m := newManager(t, upstream, account("b"), account("a"))
-	if m.ActiveID() != "" {
-		t.Fatalf("expected no active account before first request, got %q", m.ActiveID())
+	if m.ActiveID("fake") != "" {
+		t.Fatalf("expected no active account before first request, got %q", m.ActiveID("fake"))
 	}
 	_ = doRequest(t, m, "/v1/responses")
 	// List() sorts accounts by email, so "a" is the first usable account.
-	if m.ActiveID() != "a" {
-		t.Fatalf("active = %q, want first usable account \"a\"", m.ActiveID())
+	if m.ActiveID("fake") != "a" {
+		t.Fatalf("active = %q, want first usable account \"a\"", m.ActiveID("fake"))
 	}
 }

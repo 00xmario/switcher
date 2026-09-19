@@ -33,11 +33,11 @@ type Account struct {
 	LastRefresh int64  `json:"last_refresh,omitempty"`
 }
 
-// State is the persisted routing state: which account is active and which
-// are known to be exhausted (until a unix timestamp).
+// State is the persisted routing state: the active account per provider
+// and which accounts are known to be exhausted (until a unix timestamp).
 type State struct {
-	Active    string           `json:"active,omitempty"`
-	Exhausted map[string]int64 `json:"exhausted,omitempty"`
+	Active    map[string]string `json:"active,omitempty"`
+	Exhausted map[string]int64  `json:"exhausted,omitempty"`
 }
 
 // ErrNotFound is returned when an account ID does not exist.
@@ -119,17 +119,36 @@ func (s *Store) Delete(id string) error {
 
 // LoadState reads the routing state; a missing file yields the zero state.
 func (s *Store) LoadState() (State, error) {
-	var st State
-	if err := readJSON(s.statePath, &st); err != nil {
+	var legacy struct {
+		// Active was a single string before multi-provider support; accept
+		// both shapes so old state files migrate without a fuss.
+		Active    json.RawMessage  `json:"active"`
+		Exhausted map[string]int64 `json:"exhausted"`
+	}
+	if err := readJSON(s.statePath, &legacy); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return State{Exhausted: map[string]int64{}}, nil
+			return State{Active: map[string]string{}, Exhausted: map[string]int64{}}, nil
 		}
 		return State{}, err
 	}
-	if st.Exhausted == nil {
-		st.Exhausted = map[string]int64{}
+
+	state := State{Exhausted: legacy.Exhausted, Active: map[string]string{}}
+	if len(legacy.Active) > 0 {
+		if err := json.Unmarshal(legacy.Active, &state.Active); err != nil {
+			// Legacy single-provider format: the string belonged to codex.
+			var old string
+			if json.Unmarshal(legacy.Active, &old) == nil && old != "" {
+				state.Active["codex"] = old
+			}
+		}
 	}
-	return st, nil
+	if state.Exhausted == nil {
+		state.Exhausted = map[string]int64{}
+	}
+	if state.Active == nil {
+		state.Active = map[string]string{}
+	}
+	return state, nil
 }
 
 // SaveState writes the routing state atomically.

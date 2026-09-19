@@ -31,6 +31,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/login/{state}", a.handleLoginPoll)
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
+	mux.HandleFunc("POST /api/accounts", a.handleAddKey)
 	mux.HandleFunc("DELETE /api/accounts/{id}", a.handleDelete)
 }
 
@@ -92,7 +93,7 @@ func (a *API) viewOf(acc store.Account) accountView {
 		Provider:    acc.Provider,
 		Email:       acc.Email,
 		Plan:        acc.Plan,
-		Active:      acc.ID == a.Proxy.ActiveID(),
+		Active:      acc.ID == a.Proxy.ActiveID(acc.Provider),
 		LastRefresh: acc.LastRefresh,
 	}
 	if until, ok := a.Proxy.Exhausted(acc.ID); ok {
@@ -115,7 +116,7 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 	for _, acc := range accounts {
 		views = append(views, a.viewOf(acc))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": a.Proxy.ActiveID(), "accounts": views})
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": views})
 }
 
 func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
@@ -137,10 +138,44 @@ func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	}
 	handle, err := a.Logins.Start(r.Context(), prov)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start login"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this provider does not support browser login; use an API key"})
 		return
 	}
 	writeJSON(w, http.StatusOK, handle)
+}
+
+// handleAddKey registers an API-key account (e.g. OpenCode).
+func (a *API) handleAddKey(w http.ResponseWriter, r *http.Request) {
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		http.Error(w, "expected application/json body", http.StatusUnsupportedMediaType)
+		return
+	}
+	var body struct {
+		Provider string `json:"provider"`
+		Key      string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	prov, ok := a.Providers[body.Provider]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown provider"})
+		return
+	}
+	account, err := prov.AddByKey(r.Context(), body.Key)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that key did not work: " + err.Error()})
+		return
+	}
+	if err := a.Store.Save(account); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not store account"})
+		return
+	}
+	if a.Proxy.ActiveID(account.Provider) == "" {
+		_ = a.Proxy.Activate(account.ID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": a.viewOf(account)})
 }
 
 func (a *API) handleLoginPoll(w http.ResponseWriter, r *http.Request) {

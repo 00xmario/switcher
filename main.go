@@ -25,7 +25,10 @@ import (
 	"switcher/internal/config"
 	"switcher/internal/login"
 	"switcher/internal/provider"
+	"switcher/internal/provider/claude"
 	"switcher/internal/provider/codex"
+	"switcher/internal/provider/grok"
+	"switcher/internal/provider/opencode"
 	"switcher/internal/proxy"
 	"switcher/internal/server"
 	"switcher/internal/store"
@@ -66,8 +69,15 @@ func main() {
 // run starts the OAuth callback listener and the main server, then blocks.
 func run(port int) {
 	st := store.New(config.Dir())
-	providers := map[string]provider.Provider{
-		codex.New().ID(): codex.New(),
+	registered := []provider.Provider{
+		codex.New(),
+		claude.New(),
+		grok.New(),
+		opencode.New(),
+	}
+	providers := make(map[string]provider.Provider, len(registered))
+	for _, p := range registered {
+		providers[p.ID()] = p
 	}
 	proxyManager, err := proxy.New(st, providers)
 	if err != nil {
@@ -75,12 +85,12 @@ func run(port int) {
 	}
 
 	// Successful logins persist immediately from the callback goroutine;
-	// the first account automatically becomes active.
+	// the first account of a provider automatically becomes active.
 	logins := login.New(func(a store.Account) error {
 		if err := st.Save(a); err != nil {
 			return err
 		}
-		if proxyManager.ActiveID() == "" {
+		if proxyManager.ActiveID(a.Provider) == "" {
 			return proxyManager.Activate(a.ID)
 		}
 		return nil
@@ -88,13 +98,20 @@ func run(port int) {
 
 	api := &server.API{Store: st, Logins: logins, Proxy: proxyManager, Providers: providers}
 
+	// Each provider with a browser redirect has its own callback listener;
+	// the ports are fixed by the OAuth clients' registered redirect URIs.
 	callbackMux := http.NewServeMux()
 	callbackMux.HandleFunc("GET /auth/callback", callbackHandler(logins))
-	go serveCallback(callbackMux)
+	for _, port := range []int{config.CallbackPort, config.ClaudeCallbackPort} {
+		go serveCallback(callbackMux, port)
+	}
 
 	mux := http.NewServeMux()
 	api.Register(mux)
-	mux.Handle("/v1/", proxyManager) // the actual proxy: codex traffic
+	mux.Handle("/codex/", proxyManager)
+	mux.Handle("/claude/", proxyManager)
+	mux.Handle("/grok/", proxyManager)
+	mux.Handle("/opencode/", proxyManager)
 
 	// Dev mode serves the frontend straight from disk: edit web/, refresh
 	// the browser, done. No rebuild, no restart.
@@ -124,10 +141,10 @@ func run(port int) {
 	}
 }
 
-// serveCallback starts the localhost OAuth callback listener. A failure to
+// serveCallback starts a localhost OAuth callback listener. A failure to
 // bind (e.g. the port is taken) only disables logins, not the server.
-func serveCallback(mux *http.ServeMux) {
-	addr := fmt.Sprintf("127.0.0.1:%d", config.CallbackPort)
+func serveCallback(mux *http.ServeMux, port int) {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Printf("oauth callback listener on %s unavailable: %v", addr, err)
 	}

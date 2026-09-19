@@ -63,14 +63,14 @@ func (p *Provider) ID() string { return "codex" }
 func (p *Provider) DisplayName() string { return "Codex (ChatGPT)" }
 
 // LoginStart builds the OAuth authorization URL the user must open.
-func (p *Provider) LoginStart(_ context.Context) (string, string, error) {
+func (p *Provider) LoginStart(_ context.Context) (provider.LoginInfo, error) {
 	verifierBytes := make([]byte, 32)
 	if _, err := rand.Read(verifierBytes); err != nil {
-		return "", "", fmt.Errorf("generate pkce verifier: %w", err)
+		return provider.LoginInfo{}, fmt.Errorf("generate pkce verifier: %w", err)
 	}
 	stateBytes := make([]byte, 16)
 	if _, err := rand.Read(stateBytes); err != nil {
-		return "", "", fmt.Errorf("generate state: %w", err)
+		return provider.LoginInfo{}, fmt.Errorf("generate state: %w", err)
 	}
 	verifier := base64.RawURLEncoding.EncodeToString(verifierBytes)
 	state := base64.RawURLEncoding.EncodeToString(stateBytes)
@@ -92,7 +92,17 @@ func (p *Provider) LoginStart(_ context.Context) (string, string, error) {
 	q.Set("codex_cli_simplified_flow", "true")
 	q.Set("id_token_add_organizations", "true")
 	q.Set("prompt", "login")
-	return authorizeURL + "?" + q.Encode(), state, nil
+	return provider.LoginInfo{Kind: "browser", URL: authorizeURL + "?" + q.Encode(), State: state}, nil
+}
+
+// DeviceStart implements provider.Provider: codex has no device flow.
+func (p *Provider) DeviceStart(ctx context.Context) (provider.LoginInfo, func(ctx context.Context) (store.Account, error), error) {
+	return provider.LoginInfo{}, nil, provider.ErrUnsupported
+}
+
+// AddByKey implements provider.Provider: codex accounts come from OAuth.
+func (p *Provider) AddByKey(ctx context.Context, key string) (store.Account, error) {
+	return store.Account{}, provider.ErrUnsupported
 }
 
 // LoginExchange swaps the authorization code for tokens and derives the
@@ -232,6 +242,28 @@ func windowLabel(seconds int64) string {
 // codexUserAgent mirrors the CLI's User-Agent so usage queries pass the
 // upstream's client checks the same way proxied traffic does.
 const codexUserAgent = "codex_cli_rs/0.154.0 (Mac OS 26.0.0; arm64)"
+
+// ParseRateLimit implements provider.Provider. Codex reports subscription
+// exhaustion as a 429 whose body carries error.type "usage_limit_reached"
+// and an upstream reset timestamp.
+func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
+	var parsed struct {
+		Error struct {
+			Type     string `json:"type"`
+			ResetsAt int64  `json:"resets_at"`
+		} `json:"error"`
+	}
+	if status != http.StatusTooManyRequests || json.Unmarshal(body, &parsed) != nil {
+		return time.Time{}, false
+	}
+	if parsed.Error.Type != "usage_limit_reached" {
+		return time.Time{}, false
+	}
+	if parsed.Error.ResetsAt > 0 {
+		return time.Unix(parsed.Error.ResetsAt, 0), true
+	}
+	return time.Now().Add(time.Hour), true
+}
 
 // IsExpired implements provider.Provider.
 func (p *Provider) IsExpired(a store.Account) bool {

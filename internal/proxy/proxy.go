@@ -43,7 +43,7 @@ type Manager struct {
 	mu        sync.Mutex
 	store     *store.Store
 	providers map[string]provider.Provider
-	active    string
+	active    map[string]string // provider -> active account id
 	exhausted map[string]time.Time
 	lastUsage map[string]provider.Usage
 }
@@ -60,32 +60,37 @@ func New(st *store.Store, providers map[string]provider.Provider) (*Manager, err
 			exhausted[id] = time.Unix(until, 0)
 		}
 	}
+	active := state.Active
+	if active == nil {
+		active = map[string]string{}
+	}
 	return &Manager{
 		store:     st,
 		providers: providers,
-		active:    state.Active,
+		active:    active,
 		exhausted: exhausted,
 		lastUsage: map[string]provider.Usage{},
 	}, nil
 }
 
-// ActiveID returns the currently selected account ("" when none).
-func (m *Manager) ActiveID() string {
+// ActiveID returns the active account of one provider ("" when none).
+func (m *Manager) ActiveID(providerID string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.active
+	return m.active[providerID]
 }
 
-// Activate selects an account explicitly. This is the only manual switch
-// path; it succeeds even when the account is currently marked exhausted
-// (the user is in charge).
+// Activate selects an account explicitly within its provider. This is the
+// only manual switch path; it succeeds even when the account is currently
+// marked exhausted (the user is in charge).
 func (m *Manager) Activate(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, err := m.store.Get(id); err != nil {
+	account, err := m.store.Get(id)
+	if err != nil {
 		return err
 	}
-	m.active = id
+	m.active[account.Provider] = id
 	delete(m.exhausted, id)
 	return m.persistLocked()
 }
@@ -96,9 +101,11 @@ func (m *Manager) Remove(id string) {
 	defer m.mu.Unlock()
 	delete(m.exhausted, id)
 	delete(m.lastUsage, id)
-	if m.active == id {
-		m.active = ""
-		_ = m.persistLocked()
+	for providerID, activeID := range m.active {
+		if activeID == id {
+			delete(m.active, providerID)
+			_ = m.persistLocked()
+		}
 	}
 }
 
@@ -143,9 +150,10 @@ func (m *Manager) RefreshUsage(ctx context.Context, a store.Account) provider.Us
 	return usage
 }
 
-// pick returns the account that should serve the next request: the active
-// one when usable, otherwise the first usable account. nil means none.
-func (m *Manager) pick() (store.Account, error) {
+// pick returns the account that should serve the next request for a
+// provider: the active one when usable, otherwise the first usable account
+// of that provider. An error means none.
+func (m *Manager) pick(providerID string) (store.Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
@@ -160,7 +168,11 @@ func (m *Manager) pick() (store.Account, error) {
 	}
 	var active *store.Account
 	for i := range accounts {
-		if accounts[i].ID == m.active && accounts[i].Token.AccessToken != "" {
+		a := accounts[i]
+		if a.Provider != providerID {
+			continue
+		}
+		if a.ID == m.active[providerID] && a.Token.AccessToken != "" {
 			active = &accounts[i]
 			break
 		}
@@ -168,12 +180,12 @@ func (m *Manager) pick() (store.Account, error) {
 	if active != nil {
 		return *active, nil
 	}
-	// No usable active account: fall back to the first usable one. This is
-	// the only automatic selection Switcher ever performs.
+	// No usable active account: fall back to the first usable one of this
+	// provider. This is the only automatic selection Switcher ever performs.
 	for i := range accounts {
 		a := accounts[i]
-		if a.Token.AccessToken != "" && !m.exhaustedNow(a.ID) {
-			m.active = a.ID
+		if a.Provider == providerID && a.Token.AccessToken != "" && !m.exhaustedNow(a.ID) {
+			m.active[providerID] = a.ID
 			_ = m.persistLocked()
 			return a, nil
 		}
@@ -193,12 +205,28 @@ func (m *Manager) persistLocked() error {
 	for id, until := range m.exhausted {
 		exhausted[id] = until.Unix()
 	}
-	return m.store.SaveState(store.State{Active: m.active, Exhausted: exhausted})
+	active := make(map[string]string, len(m.active))
+	for providerID, id := range m.active {
+		active[providerID] = id
+	}
+	return m.store.SaveState(store.State{Active: active, Exhausted: exhausted})
 }
 
-// ServeHTTP forwards an API request to the active upstream account,
-// switching and retrying per the rules described on the package.
+// ServeHTTP forwards an API request to the active upstream account of the
+// provider addressed by the request prefix (/codex, /claude, /grok,
+// /opencode), switching and retrying per the rules on the package.
 func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	providerID, rest, ok := m.splitPrefix(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown provider prefix")
+		return
+	}
+	prov, ok := m.providers[providerID]
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown provider: "+providerID)
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if closeErr := r.Body.Close(); closeErr != nil {
 		log.Printf("proxy: close request body: %v", closeErr)
@@ -214,14 +242,9 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	refreshed := map[string]bool{}
 	for attempt := 0; attempt < 4; attempt++ {
-		account, pickErr := m.pick()
+		account, pickErr := m.pick(providerID)
 		if pickErr != nil {
 			writeError(w, http.StatusServiceUnavailable, pickErr.Error())
-			return
-		}
-		prov := m.providers[account.Provider]
-		if prov == nil {
-			writeError(w, http.StatusServiceUnavailable, "no provider for account "+account.Provider)
 			return
 		}
 
@@ -237,7 +260,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		resp, err := m.forward(r, prov, account, body)
+		resp, err := m.forward(prov, account, rest, r, body)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err))
 			return
@@ -257,20 +280,21 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			continue // retry the same account with fresh tokens
 
-		case resp.StatusCode == http.StatusTooManyRequests:
-			until, isLimit := classifyUsageLimit(resp)
+		case resp.StatusCode >= 400:
+			body429, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			drain(resp)
-			if !isLimit {
-				copyResponse(w, resp)
+			until, exhausted := prov.ParseRateLimit(r.Context(), account, resp.StatusCode, body429)
+			if !exhausted {
+				copyResponseStatus(w, resp.StatusCode, body429, resp.Header)
 				return
 			}
-			log.Printf("proxy: %s exhausted until %s", account.Email, time.Unix(until, 0).Format(time.RFC3339))
+			log.Printf("proxy: %s exhausted until %s", account.Email, until.Format(time.RFC3339))
 			m.markExhausted(account.ID, until)
-			if next := m.nextAvailable(account.ID); next != "" {
-				m.setActive(next)
+			if next := m.nextAvailable(account.ID, providerID); next != "" {
+				m.setActive(providerID, next)
 				continue // transparent retry on the new account
 			}
-			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			writeJSON(w, resp.StatusCode, map[string]any{
 				"error": map[string]any{
 					"type":    "usage_limit_reached",
 					"message": "every account is out of usage; switch or sign in to another one",
@@ -287,8 +311,8 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // forward performs one upstream request with the account's credentials.
-func (m *Manager) forward(r *http.Request, prov provider.Provider, account store.Account, body []byte) (*http.Response, error) {
-	target := prov.UpstreamURL(r.URL.Path)
+func (m *Manager) forward(prov provider.Provider, account store.Account, path string, r *http.Request, body []byte) (*http.Response, error) {
+	target := prov.UpstreamURL(path)
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -315,19 +339,17 @@ func (m *Manager) forward(r *http.Request, prov provider.Provider, account store
 
 // nextAvailable returns another account that can serve traffic, the given
 // account excluded.
-func (m *Manager) nextAvailable(exclude string) string {
+func (m *Manager) nextAvailable(exclude, providerID string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.nextAvailableLocked(exclude)
-}
-
-// nextAvailableLocked is nextAvailable for callers already holding m.mu.
-func (m *Manager) nextAvailableLocked(exclude string) string {
 	accounts, err := m.store.List()
 	if err != nil {
 		return ""
 	}
 	for _, a := range accounts {
+		if a.Provider != providerID {
+			continue
+		}
 		if a.ID == exclude || a.Token.AccessToken == "" || m.exhaustedNow(a.ID) {
 			continue
 		}
@@ -336,20 +358,20 @@ func (m *Manager) nextAvailableLocked(exclude string) string {
 	return ""
 }
 
-func (m *Manager) setActive(id string) {
+func (m *Manager) setActive(providerID, id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.active = id
+	m.active[providerID] = id
 	if err := m.persistLocked(); err != nil {
 		log.Printf("proxy: persist active account: %v", err)
 	}
-	log.Printf("proxy: switched active account to %s", id)
+	log.Printf("proxy: switched active %s account to %s", providerID, id)
 }
 
-func (m *Manager) markExhausted(id string, until int64) {
+func (m *Manager) markExhausted(id string, until time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.exhausted[id] = time.Unix(until, 0)
+	m.exhausted[id] = until
 	if err := m.persistLocked(); err != nil {
 		log.Printf("proxy: persist exhaustion: %v", err)
 	}
@@ -364,10 +386,44 @@ func (m *Manager) deactivate(id string) {
 	if _, ok := m.exhausted[id]; !ok {
 		m.exhausted[id] = time.Now().Add(time.Hour)
 	}
-	if m.active == id {
-		m.active = m.nextAvailableLocked(id)
+	for providerID, activeID := range m.active {
+		if activeID == id {
+			if next := m.nextAvailable(id, providerID); next != "" {
+				m.active[providerID] = next
+			} else {
+				delete(m.active, providerID)
+			}
+		}
 	}
 	_ = m.persistLocked()
+}
+
+// splitPrefix splits "/codex/v1/x" into ("codex", "/v1/x"). The path must
+// start with a registered provider prefix.
+func (m *Manager) splitPrefix(path string) (providerID, rest string, ok bool) {
+	for id := range m.providers {
+		prefix := "/" + id
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return id, strings.TrimPrefix(path, prefix), true
+		}
+	}
+	return "", "", false
+}
+
+// copyResponseStatus relays an upstream error body we already buffered.
+func copyResponseStatus(w http.ResponseWriter, status int, body []byte, header http.Header) {
+	for key, vals := range header {
+		if isHopByHop(key) || key == "Set-Cookie" {
+			continue
+		}
+		for _, v := range vals {
+			w.Header().Add(key, v)
+		}
+	}
+	w.WriteHeader(status)
+	if len(body) > 0 {
+		_, _ = w.Write(body)
+	}
 }
 
 // classifyUsageLimit reads a 429 response body once and reports whether it

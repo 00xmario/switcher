@@ -13,6 +13,9 @@ const (
 	// CallbackPort must match the redirect URI registered for the Codex
 	// OAuth client; changing it breaks the login flow.
 	CallbackPort = 1455
+	// ClaudeCallbackPort must match the redirect URI registered for the
+	// Claude Code OAuth client.
+	ClaudeCallbackPort = 54545
 )
 
 // Dir returns the Switcher data directory, creating it if needed.

@@ -59,14 +59,14 @@ func TestStateRoundTripAndList(t *testing.T) {
 		t.Fatalf("unexpected list: %+v", accounts)
 	}
 
-	if err := s.SaveState(State{Active: "a", Exhausted: map[string]int64{"b": 123}}); err != nil {
+	if err := s.SaveState(State{Active: map[string]string{"codex": "a"}, Exhausted: map[string]int64{"b": 123}}); err != nil {
 		t.Fatal(err)
 	}
 	state, err := s.LoadState()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Active != "a" || state.Exhausted["b"] != 123 {
+	if state.Active["codex"] != "a" || state.Exhausted["b"] != 123 {
 		t.Fatalf("state mismatch: %+v", state)
 	}
 }
