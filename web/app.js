@@ -450,12 +450,14 @@ async function pollLogin(state) {
     try {
       const res = await api(`/api/login/${state}`);
       if (res.status === 'done') {
+        document.querySelector('.device-overlay')?.remove();
         toast(`Account added: ${res.account.email}`);
         await refreshState();
         await refreshAllUsage();
         return;
       }
       if (res.status === 'failed') {
+        document.querySelector('.device-overlay')?.remove();
         toast('Login failed: ' + (res.error || 'did not complete'));
         return;
       }
@@ -465,6 +467,7 @@ async function pollLogin(state) {
     }
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
+  document.querySelector('.device-overlay')?.remove();
   toast('Login timed out');
 }
 
@@ -474,7 +477,8 @@ function showDeviceModal(verifyURL, userCode) {
   const overlay = document.createElement('div');
   overlay.className = 'device-overlay';
   overlay.innerHTML = `
-    <div class="device-modal">
+    <div class="device-modal" role="dialog" aria-modal="true" aria-label="Sign in to Grok">
+      <button class="modal-close" title="Close" aria-label="Close">✕</button>
       <h3>Sign in to Grok</h3>
       <p>Open <a href="${escapeHTML(verifyURL)}" target="_blank" rel="noopener">the verification page</a> and enter this code:</p>
       <div class="device-code">${escapeHTML(userCode)}</div>
@@ -485,6 +489,16 @@ function showDeviceModal(verifyURL, userCode) {
   overlay.querySelector('.device-copy button').addEventListener('click', () => {
     navigator.clipboard?.writeText(userCode).then(() => toast('Code copied'), () => {});
   });
+  // Escaping the dialog never aborts the login: the background poll keeps
+  // running and the account appears when x.ai confirms it.
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  overlay.querySelector('.modal-close').addEventListener('click', close);
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  document.addEventListener('keydown', onKey);
 }
 
 // confirmDialog is the in-app replacement for window.confirm: themed,

@@ -392,6 +392,19 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
   padding: 26px 28px;
   box-shadow: 0 20px 60px rgb(0 0 0 / .35);
 }
+.device-modal { position: relative; }
+.device-modal .modal-close, .confirm-modal .modal-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-size: 15px;
+  padding: 4px 8px;
+  border-radius: 8px;
+}
+.device-modal .modal-close:hover { color: var(--text); }
 .device-modal h3 { margin: 0 0 10px; font-size: 17px; }
 .device-modal p { margin: 8px 0; color: var(--dim); font-size: 14px; }
 .device-code {

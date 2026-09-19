@@ -98,7 +98,9 @@ func (p *Provider) DeviceStart(ctx context.Context) (provider.LoginInfo, func(ct
 }
 
 // pollForToken polls the token endpoint with the device code until the
-// user authorizes, the code expires, or the context ends.
+// user authorizes, the code expires, or the context ends. While waiting,
+// xAI answers with HTTP 400 carrying error "authorization_pending": that
+// is the protocol working, not a failure.
 func (p *Provider) pollForToken(ctx context.Context, tokenEndpoint, deviceCode string, interval int64) (store.Account, error) {
 	intervalDur := time.Duration(interval) * time.Second
 	if intervalDur < 5*time.Second {
@@ -118,17 +120,17 @@ func (p *Provider) pollForToken(ctx context.Context, tokenEndpoint, deviceCode s
 			"device_code": {deviceCode},
 			"client_id":   {clientID},
 		}
-		body, err := postForm(ctx, tokenEndpoint, form)
+		status, body, err := postFormLenient(ctx, tokenEndpoint, form)
 		if err != nil {
 			return store.Account{}, err
 		}
 		var payload struct {
 			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
 			AccessToken      string `json:"access_token"`
 			RefreshToken     string `json:"refresh_token"`
 			IDToken          string `json:"id_token"`
 			ExpiresIn        int64  `json:"expires_in"`
-			ErrorDescription string `json:"error_description"`
 		}
 		if err := json.Unmarshal(body, &payload); err != nil {
 			return store.Account{}, fmt.Errorf("device token response: %w", err)
@@ -143,13 +145,34 @@ func (p *Provider) pollForToken(ctx context.Context, tokenEndpoint, deviceCode s
 			})
 		case payload.Error == "authorization_pending" || payload.Error == "slow_down":
 			continue // keep polling
+		case payload.Error != "":
+			return store.Account{}, fmt.Errorf("device flow failed: %s", payload.Error)
 		default:
-			if payload.Error != "" {
-				return store.Account{}, fmt.Errorf("device flow failed: %s", payload.Error)
-			}
+			return store.Account{}, fmt.Errorf("device token poll: unexpected http %d", status)
 		}
 	}
 	return store.Account{}, errors.New("device flow timed out")
+}
+
+// postFormLenient posts a form and returns the body for ANY status: the
+// device-grant protocol signals "still waiting" through 400 responses.
+func postFormLenient(ctx context.Context, target string, form url.Values) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, nil, fmt.Errorf("grok token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("grok token request: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("grok token response: %w", err)
+	}
+	return resp.StatusCode, raw, nil
 }
 
 // AddByKey implements provider.Provider: grok accounts come from OAuth.
