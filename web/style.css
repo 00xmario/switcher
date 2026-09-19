@@ -184,7 +184,7 @@ button:disabled { opacity: .45; cursor: default; }
 .who .email:hover,
 .who .email:focus-visible,
 .who .email.revealed { filter: none; user-select: text; }
-.who .meta { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+.who .meta { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; margin-top: 3px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .dot.active { background: var(--accent); }
 .dot.exhausted { background: var(--warn); }
