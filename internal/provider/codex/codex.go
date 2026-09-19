@@ -5,6 +5,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -263,6 +265,127 @@ func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status i
 		return time.Unix(parsed.Error.ResetsAt, 0), true
 	}
 	return time.Now().Add(time.Hour), true
+}
+
+// codexCreditBase is the OpenAI control-plane endpoint that lists and
+// consumes banked rate-limit reset credits for a Codex subscription.
+const codexCreditBase = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+
+// ListResetCredits implements provider.ResetCreditProvider. It returns the
+// account's unexpired, unused banked resets, earliest expiry first.
+func (p *Provider) ListResetCredits(ctx context.Context, a store.Account) ([]provider.ResetCredit, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexCreditBase, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list reset credits: %w", err)
+	}
+	if err := p.ApplyAuth(req, a); err != nil {
+		return nil, fmt.Errorf("list reset credits: %w", err)
+	}
+	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("originator", "codex_cli_rs")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list reset credits: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("list reset credits: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list reset credits: http %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Credits []struct {
+			ID        string `json:"id"`
+			Status    string `json:"status"`
+			ResetType string `json:"reset_type"`
+			ExpiresAt string `json:"expires_at"`
+		} `json:"credits"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("list reset credits: %w", err)
+	}
+	now := time.Now()
+	var out []provider.ResetCredit
+	for _, c := range parsed.Credits {
+		if c.ResetType != "codex_rate_limits" || c.Status != "available" {
+			continue
+		}
+		exp, err := time.Parse(time.RFC3339, c.ExpiresAt)
+		if err != nil || !exp.After(now) {
+			continue
+		}
+		out = append(out, provider.ResetCredit{ID: c.ID, ExpiresAt: exp.Unix()})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ExpiresAt < out[j].ExpiresAt })
+	return out, nil
+}
+
+// ConsumeResetCredit spends one banked reset and reports the upstream
+// outcome ("reset", "nothing_to_reset", "no_credit", "already_redeemed").
+// The redeem request id is deterministic per account and credit so retries
+// cannot double-spend a credit.
+// ConsumeResetCredit implements provider.ResetCreditProvider.
+func (p *Provider) ConsumeResetCredit(ctx context.Context, a store.Account, creditID string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	reqBody, err := json.Marshal(map[string]any{
+		"redeem_request_id": redeemRequestID(a.Token.AccountID, creditID),
+		"credit_id":         creditID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, codexCreditBase+"/consume", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	if err := p.ApplyAuth(req, a); err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", codexUserAgent)
+	req.Header.Set("originator", "codex_cli_rs")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("consume reset credit: http %d", resp.StatusCode)
+	}
+	var out struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	if out.Code == "" {
+		return "", errors.New("consume reset credit: missing code")
+	}
+	return out.Code, nil
+}
+
+// redeemRequestIDSalt reproduces the per-account redemption identity used
+// across the Codex ecosystem; the value must stay stable.
+const redeemRequestIDSalt = "6f1c2a9e2d4b4c1e9a7f3b8d5e0c1a42"
+
+func redeemRequestID(accountID, creditID string) string {
+	digest := sha256.New()
+	digest.Write([]byte(redeemRequestIDSalt))
+	digest.Write([]byte(accountID + ":" + creditID))
+	raw := digest.Sum(nil)[:16]
+	// Format as a UUID so the server accepts it.
+	raw[6] = (raw[6] & 0x0f) | 0x50
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
 }
 
 // IsExpired implements provider.Provider.

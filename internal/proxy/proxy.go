@@ -211,6 +211,15 @@ func (m *Manager) Remove(id string) {
 	}
 }
 
+// ClearExhausted lifts a parked/exhausted mark on an account (e.g. after
+// a banked reset was redeemed for it).
+func (m *Manager) ClearExhausted(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.exhausted, id)
+	_ = m.persistLocked()
+}
+
 // ExhaustedUntil reports when the account re-enters rotation, if at all.
 func (m *Manager) Exhausted(id string) (time.Time, bool) {
 	m.mu.Lock()

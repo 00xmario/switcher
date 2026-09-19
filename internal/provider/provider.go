@@ -49,6 +49,20 @@ type LoginInfo struct {
 	State string `json:"state"`
 }
 
+// ResetCredit is one banked usage-limit reset.
+type ResetCredit struct {
+	ID        string `json:"id"`
+	ExpiresAt int64  `json:"expires_at"` // unix seconds
+}
+
+// ResetCreditProvider is an optional interface for providers that bank
+// usage-limit reset credits (codex). The account view lists how many
+// credits are available so the UI can offer spending one.
+type ResetCreditProvider interface {
+	ListResetCredits(ctx context.Context, a store.Account) ([]ResetCredit, error)
+	ConsumeResetCredit(ctx context.Context, a store.Account, creditID string) (outcome string, err error)
+}
+
 // Provider encapsulates everything Switcher needs to log in, refresh, and
 // forward traffic for one upstream.
 type Provider interface {

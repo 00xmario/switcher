@@ -168,9 +168,11 @@ function accountHTML(account) {
           </div>
         </div>
         <div class="actions">
+          ${account.reset_credits ? `<span class="reset-badge banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
           <button class="use" data-act="activate" ${isActive ? 'disabled' : ''}>
             ${isActive ? 'Active' : 'Use this account'}
           </button>
+          ${account.reset_credits ? `<button data-act="use-reset" title="Spend one banked reset: clears this account's out-of-usage state">Use reset</button>` : ''}
           <button data-act="delete" title="Remove account">Remove</button>
         </div>
       </div>
@@ -301,6 +303,17 @@ providersEl.addEventListener('click', async (event) => {
   try {
     if (button.dataset.act === 'activate') {
       await api(`/api/accounts/${id}/activate`, { method: 'POST' });
+      await refreshState();
+    } else if (button.dataset.act === 'use-reset') {
+      button.disabled = true;
+      const res = await api(`/api/accounts/${id}/use-reset`, { method: 'POST' });
+      const outcomes = {
+        reset: 'Banked reset used; this account is back in rotation',
+        already_redeemed: 'That reset was already spent',
+        nothing_to_reset: 'Nothing to reset right now',
+        no_credit: 'No banked reset available',
+      };
+      toast(outcomes[res.outcome] || 'Done');
       await refreshState();
     } else if (button.dataset.act === 'delete') {
       const mail = button.closest('.account').querySelector('.email').textContent;

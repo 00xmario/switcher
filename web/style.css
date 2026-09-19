@@ -241,6 +241,15 @@ html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
 .dot.exhausted { background: var(--warn); }
 .account-head .actions { display: flex; gap: 8px; flex: none; }
 .account-head .actions .use { border-color: var(--accent); color: var(--accent); background: transparent; }
+.account-head .actions .banked {
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--dim);
+  font-size: 12.5px;
+  padding: 7px 11px;
+  cursor: default;
+}
 
 /* ---------- usage windows (T3 style) ---------- */
 

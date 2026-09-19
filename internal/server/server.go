@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -32,6 +33,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
 	mux.HandleFunc("POST /api/accounts", a.handleAddKey)
+	mux.HandleFunc("POST /api/accounts/{id}/use-reset", a.handleUseReset)
 	mux.HandleFunc("PATCH /api/providers/order", a.handleProviderOrder)
 	mux.HandleFunc("POST /api/providers/{id}/hide", a.handleProviderHide)
 	mux.HandleFunc("POST /api/providers/{id}/show", a.handleProviderShow)
@@ -80,17 +82,41 @@ func isLocalOrigin(origin string, port int) bool {
 // accountView is the API representation of one account, including the
 // routing status the UI renders. It deliberately never contains tokens.
 type accountView struct {
-	ID             string          `json:"id"`
-	Provider       string          `json:"provider"`
-	Email          string          `json:"email"`
-	Plan           string          `json:"plan,omitempty"`
-	Active         bool            `json:"active"`
-	ExhaustedUntil int64           `json:"exhausted_until,omitempty"`
-	LastRefresh    int64           `json:"last_refresh,omitempty"`
-	Usage          *provider.Usage `json:"usage,omitempty"`
+	ID             string            `json:"id"`
+	Provider       string            `json:"provider"`
+	Email          string            `json:"email"`
+	Plan           string            `json:"plan,omitempty"`
+	Active         bool              `json:"active"`
+	ExhaustedUntil int64             `json:"exhausted_until,omitempty"`
+	LastRefresh    int64             `json:"last_refresh,omitempty"`
+	Usage          *provider.Usage   `json:"usage,omitempty"`
+	ResetCredits   *resetCreditsView `json:"reset_credits,omitempty"`
+}
+
+// resetCreditsView surfaces banked usage-limit resets (codex).
+type resetCreditsView struct {
+	Count         int    `json:"count"`
+	NextID        string `json:"next_id,omitempty"`
+	NextExpiresAt int64  `json:"next_expires_at,omitempty"`
 }
 
 func (a *API) viewOf(acc store.Account) accountView {
+	v := viewOfBase(a, acc)
+	// Providers with banked resets report how many are available so the UI
+	// can offer spending one.
+	if rc, ok := a.Providers[acc.Provider].(provider.ResetCreditProvider); ok {
+		if credits, err := rc.ListResetCredits(context.Background(), acc); err == nil && len(credits) > 0 {
+			v.ResetCredits = &resetCreditsView{
+				Count:         len(credits),
+				NextID:        credits[0].ID,
+				NextExpiresAt: credits[0].ExpiresAt,
+			}
+		}
+	}
+	return v
+}
+
+func viewOfBase(a *API, acc store.Account) accountView {
 	v := accountView{
 		ID:          acc.ID,
 		Provider:    acc.Provider,
@@ -295,6 +321,48 @@ func (a *API) handleProviderShow(w http.ResponseWriter, r *http.Request) {
 	a.Proxy.ShowProvider(id)
 	order, hidden := a.Proxy.Providers()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "order": order, "hidden": hidden})
+}
+
+// handleUseReset redeems one banked reset for the account and clears its
+// local exhaustion park so routing resumes immediately.
+func (a *API) handleUseReset(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		http.Error(w, "invalid account id", http.StatusBadRequest)
+		return
+	}
+	account, err := a.Store.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such account"})
+		return
+	}
+	rc, ok := a.Providers[account.Provider].(provider.ResetCreditProvider)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this provider has no banked resets"})
+		return
+	}
+	credits, err := rc.ListResetCredits(r.Context(), account)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not list banked resets"})
+		return
+	}
+	if len(credits) == 0 {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "no banked reset available for this account"})
+		return
+	}
+	outcome, err := rc.ConsumeResetCredit(r.Context(), account, credits[0].ID)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "the reset did not go through"})
+		return
+	}
+	switch outcome {
+	case "reset", "already_redeemed":
+		a.Proxy.ClearExhausted(account.ID)
+		usage := a.Proxy.RefreshUsage(r.Context(), account)
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "outcome": outcome, "usage": usage})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "outcome": outcome})
+	}
 }
 
 // validID accepts only the identifiers Switcher itself generates
