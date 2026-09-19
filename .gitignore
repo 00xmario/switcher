@@ -1,6 +1,3 @@
 switcher
 dist/
 *.test
-
-# generated app logo (not for the repo)
-web/logo.png
