@@ -109,7 +109,13 @@ func run(port int) {
 			log.Fatalf("embed web assets: %v", err)
 		}
 	}
-	mux.Handle("/", http.FileServerFS(static))
+	// Cache-busting: always revalidate the frontend assets so a rebuilt
+	// binary (or a dev-mode edit) shows up on a normal refresh.
+	staticHandler := http.FileServerFS(static)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		staticHandler.ServeHTTP(w, r)
+	}))
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	log.Printf("Switcher v%s running: http://127.0.0.1:%d (codex proxy on the same port under /v1)", version, port)

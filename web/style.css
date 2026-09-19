@@ -90,12 +90,10 @@ body {
   width: 40px;
   height: 40px;
   border-radius: 11px;
-  background: var(--surface);
-  border: 1px solid var(--border);
+  overflow: hidden;
   color: var(--accent);
-  font-size: 20px;
-  box-shadow: var(--shadow);
 }
+.brand-mark svg, .brand-mark img { width: 40px; height: 40px; display: block; border-radius: 11px; }
 h1 { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.02em; }
 
 .top-actions { display: flex; align-items: center; gap: 10px; }
@@ -172,7 +170,20 @@ button:disabled { opacity: .45; cursor: default; }
   flex-wrap: wrap;
 }
 .who { flex: 1; min-width: 0; }
-.who .email { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.who .email {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+  filter: blur(6px);
+  cursor: pointer;
+  user-select: none;
+  transition: filter .18s ease;
+}
+.who .email:hover,
+.who .email:focus-visible,
+.who .email.revealed { filter: none; user-select: text; }
 .who .meta { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
 .dot.active { background: var(--accent); }
