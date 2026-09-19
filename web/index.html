@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Switcher</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">⇄</span>
+        <h1>Switcher</h1>
+      </div>
+      <div class="top-actions">
+        <div class="theme-switch" role="radiogroup" aria-label="Theme">
+          <button data-theme-choice="light" title="Light theme" aria-label="Light theme"></button>
+          <button data-theme-choice="system" title="System theme" aria-label="System theme"></button>
+          <button data-theme-choice="dark" title="Dark theme" aria-label="Dark theme"></button>
+        </div>
+        <button id="add-account" class="btn" type="button">Add Codex account</button>
+      </div>
+    </header>
+
+    <section id="providers" aria-live="polite"></section>
+
+    <footer class="footnote">
+      <p>Switcher forwards your CLI traffic to the account marked <em>Active</em>.
+      Switching happens only when you switch — or when the active account runs out of usage.</p>
+    </footer>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
