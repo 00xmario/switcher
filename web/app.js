@@ -192,6 +192,9 @@ function render() {
     html += `
       <section class="provider" data-provider="${providerID}" id="provider-${providerID}">
         <div class="provider-head" draggable="true">
+          <span class="drag-grip" title="Drag to reorder">
+            <svg viewBox="0 0 10 16" aria-hidden="true"><circle cx="3" cy="2" r="1.4"/><circle cx="7" cy="2" r="1.4"/><circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="3" cy="14" r="1.4"/><circle cx="8" cy="14" r="1.4"/></svg>
+          </span>
           <span class="logo logo-${providerID}">${LOGOS[providerID] || ''}</span>
           <h2>${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</h2>
           <span class="count">${accounts.length}</span>

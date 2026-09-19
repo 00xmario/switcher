@@ -152,8 +152,7 @@ button:disabled { opacity: .45; cursor: default; }
 .provider-head h2 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
 .provider-head .count { color: var(--faint); font-size: 13px; }
 .provider-head .add-provider { margin-left: auto; padding: 6px 12px; font-size: 13px; border-radius: 8px; background: transparent; }
-.provider-tools { display: flex; gap: 4px; opacity: 0; transition: opacity .15s ease; }
-.provider-head:hover .provider-tools { opacity: 1; }
+.provider-tools { display: flex; gap: 4px; }
 .provider-tools button { padding: 6px 9px; font-size: 12px; border-radius: 8px; background: transparent; color: var(--dim); }
 .provider-tools button:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
 .provider-logo-img { width: 20px; height: 20px; display: block; }
@@ -411,6 +410,15 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
 
 
 /* ---------- drag ordering ---------- */
+.drag-grip {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 22px;
+  color: var(--faint);
+  flex: none;
+}
+.drag-grip svg { width: 9px; height: 15px; fill: currentColor; }
 .provider-head { cursor: grab; }
 .provider-head:active { cursor: grabbing; }
 .provider.dragging { opacity: .35; }
