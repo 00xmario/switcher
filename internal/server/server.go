@@ -120,7 +120,11 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		views = append(views, a.viewOf(acc))
 	}
 	order, hidden := a.Proxy.Providers()
+	if hidden == nil {
+		hidden = []string{}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"active":   a.Proxy.ActiveAll(),
 		"accounts": views,
 		"order":    order,
 		"hidden":   hidden,

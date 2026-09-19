@@ -107,7 +107,7 @@ function statusOf(account) {
   if (account.exhausted_until * 1000 > Date.now()) {
     return { cls: 'exhausted', label: 'Out of usage' };
   }
-  if (account.id === data.active[account.provider]) return { cls: 'active', label: 'Active' };
+  if (account.id === data.active?.[account.provider]) return { cls: 'active', label: 'Active' };
   return { cls: '', label: 'Idle' };
 }
 

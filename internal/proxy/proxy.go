@@ -104,6 +104,17 @@ func containsID(list []string, id string) bool {
 	return false
 }
 
+// ActiveAll returns a copy of the per-provider active map.
+func (m *Manager) ActiveAll() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]string, len(m.active))
+	for k, v := range m.active {
+		out[k] = v
+	}
+	return out
+}
+
 // Providers returns the display order and hidden provider ids.
 func (m *Manager) Providers() (order []string, hidden []string) {
 	m.mu.Lock()
