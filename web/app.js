@@ -22,16 +22,26 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 
 applyTheme(localStorage.getItem('switcher-theme') || 'system');
 
-/* ---------- provider marks (simplified official logos) ---------- */
+/* ---------- provider marks ---------- */
+
+// Official OpenAI logomark, inlined so it follows the theme color.
+const OPENAI_PATH = 'm297.06 130.97c7.26-21.79 4.76-45.66-6.85-65.48-17.46-30.4-52.56-46.04-86.84-38.68-15.25-17.18-37.16-26.95-60.13-26.81-35.04-.08-66.13 22.48-76.91 55.82-22.51 4.61-41.94 18.7-53.31 38.67-17.59 30.32-13.58 68.54 9.92 94.54-7.26 21.79-4.76 45.66 6.85 65.48 17.46 30.4 52.56 46.04 86.84 38.68 15.24 17.18 37.16 26.95 60.13 26.8 35.06.09 66.16-22.49 76.94-55.86 22.51-4.61 41.94-18.7 53.31-38.67 17.57-30.32 13.55-68.51-9.94-94.51zm-120.28 168.11c-14.03.02-27.62-4.89-38.39-13.88.49-.26 1.34-.73 1.89-1.07l63.72-36.8c3.26-1.85 5.26-5.32 5.24-9.07v-89.83l26.93 15.55c.29.14.48.42.52.74v74.39c-.04 33.08-26.83 59.9-59.91 59.97zm-128.84-55.03c-7.03-12.14-9.56-26.37-7.15-40.18.47.28 1.3.79 1.89 1.13l63.72 36.8c3.23 1.89 7.23 1.89 10.47 0l77.79-44.92v31.1c.02.32-.13.63-.38.83l-64.41 37.19c-28.69 16.52-65.33 6.7-81.92-21.95zm-16.77-139.09c7-12.16 18.05-21.46 31.21-26.29 0 .55-.03 1.52-.03 2.2v73.61c-.02 3.74 1.98 7.21 5.23 9.06l77.79 44.91-26.93 15.55c-.27.18-.61.21-.91.08l-64.42-37.22c-28.63-16.58-38.45-53.21-21.95-81.89zm221.26 51.49-77.79-44.92 26.93-15.54c.27-.18.61-.21.91-.08l64.42 37.19c28.68 16.57 38.51 53.26 21.94 81.94-7.01 12.14-18.05 21.44-31.2 26.28v-75.81c.03-3.74-1.96-7.2-5.2-9.06zm26.8-40.34c-.47-.29-1.3-.79-1.89-1.13l-63.72-36.8c-3.23-1.89-7.23-1.89-10.47 0l-77.79 44.92v-31.1c-.02-.32.13-.63.38-.83l64.41-37.16c28.69-16.55 65.37-6.7 81.91 22 6.99 12.12 9.52 26.31 7.15 40.1zm-168.51 55.43-26.94-15.55c-.29-.14-.48-.42-.52-.74v-74.39c.02-33.12 26.89-59.96 60.01-59.94 14.01 0 27.57 4.92 38.34 13.88-.49.26-1.33.73-1.89 1.07l-63.72 36.8c-3.26 1.85-5.26 5.31-5.24 9.06l-.04 89.79zm14.63-31.54 34.65-20.01 34.65 20v40.01l-34.65 20-34.65-20z';
 
 const LOGOS = {
-  codex: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><g>
-    <g id="petal"><path d="M12 3.4c1.7-1 3.9-.4 4.9 1.3l.2.4h.5c2 0 3.6 1.6 3.6 3.6 0 .6-.1 1.1-.4 1.6l-.2.4.2.4c.4.5.6 1.2.6 1.9 0 1.7-1.2 3.2-2.9 3.5l-.4.1-.2.4c-1 1.7-3.2 2.3-4.9 2.4v-2c1.3 0 2.5-.2 3.1-1.2l.3-.6-.5-.3a4.6 4.6 0 0 1-2-3.6v-1h3.3c.5 0 .9-.4.9-.9 0-1.3-1-2.3-2.3-2.3l-.7.1-.3-.6a2.6 2.6 0 0 0-3.5-1V3.4z"/><use href="#petal" transform="rotate(60 12 12)"/><use href="#petal" transform="rotate(120 12 12)"/><use href="#petal" transform="rotate(180 12 12)"/><use href="#petal" transform="rotate(240 12 12)"/><use href="#petal" transform="rotate(300 12 12)"/></g></g></svg>`,
-  grok: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M5 4l10 16M19 4c-2 3.5-5.5 3.5-7 6.5S9.5 17 5 20"/><circle cx="16.5" cy="6.5" r="2.6" fill="currentColor" stroke="none"/></svg>`,
-  claude: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.6 4.8l4.8 14.4h-2.9l-1-3.2H7.9l-1 3.2H4L8.6 4.8c.2-.5.7-.8 1.2-.8h1.3c.5 0 1 .3 1.2.8l-.2-.8zM9 13.4h5.4L11.8 6.7 9 13.4zM20 4.8h1.6l.6 1.8-1.4 1z" opacity="0"/><path d="M6.5 19.2L11.9 4h2.2l5.4 15.2h-2.8l-1.3-3.9h-5l-1.3 3.2H6.5zm3.9-5.6h3.4l-1.7-4.8-1.9 4.8z"/></svg>`,
+  codex: `<svg viewBox="0 0 320 320" fill="currentColor" aria-hidden="true"><path d="${OPENAI_PATH}"/></svg>`,
+  grok: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M5 4l10 16"/><path d="M19 4c-2 3.5-5.5 3.5-7 6.5S9.5 17 5 20"/><circle cx="16.5" cy="6.5" r="2.6" fill="currentColor" stroke="none"/></svg>`,
+  claude: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6.5 19.2L11.9 4h2.2l5.4 15.2h-2.8l-1.3-3.9h-5l-1.3 3.2H6.5zm3.9-5.6h3.4l-1.7-4.8-1.9 4.8z"/></svg>`,
 };
 
 const PROVIDER_NAMES = { codex: 'Codex', grok: 'Grok', claude: 'Claude' };
+
+// ChatGPT plan tiers as OpenAI markets them.
+const PLAN_NAMES = {
+  pro: 'Pro 20x',
+  prolite: 'Pro 5x',
+  plus: 'Plus',
+  free: 'Free',
+};
 
 /* ---------- helpers ---------- */
 
@@ -57,7 +67,7 @@ function escapeHTML(s) {
 // fmtRemaining renders a countdown the way T3 does: "6d 23h", "3h 44m".
 function fmtRemaining(untilUnix) {
   let ms = untilUnix * 1000 - Date.now();
-  if (ms < 0) ms = 0;
+  if (ms <= 0) return null; // window already rolled; upstream will refresh soon
   const m = Math.floor(ms / 60000);
   if (m < 60) return `${m}m`;
   const h = Math.floor(m / 60);
@@ -98,19 +108,26 @@ function statusOf(account) {
 
 function windowHTML(win, providerID) {
   const left = Math.max(0, Math.min(100, 100 - win.used_percent));
+  const used = 100 - left;
+  const name = PROVIDER_NAMES[providerID] || providerID;
   const remaining = fmtRemaining(win.resets_at);
+  const resetText = remaining ? `↻ ${remaining}` : '↻ soon';
+  const recovery = left < 100
+    ? `<div class="recover">↻ +${used}% in ${remaining || 'a moment'}</div>`
+    : '';
+  const label = left >= 14 ? escapeHTML(`${name} ${left}%`) : '';
   return `
     <div class="window">
       <div class="win-left">
         <div class="win-label">${escapeHTML(win.label)}</div>
         <div class="win-pct">${left}%<span>left</span></div>
-        ${left < 100 ? `<div class="recover">↻ +${left}% in ${remaining}</div>` : ''}
+        ${recovery}
       </div>
       <div class="win-bar">
         <div class="bar">
-          <div class="fill" style="width:${left}%">${escapeHTML(PROVIDER_NAMES[providerID] || providerID)} ${left}%</div>
+          <div class="fill ${label ? '' : 'no-label'}" style="width:${left}%">${label}</div>
         </div>
-        <span class="reset-badge">↻ ${remaining}</span>
+        <span class="reset-badge">${resetText}</span>
       </div>
     </div>`;
 }
@@ -118,6 +135,7 @@ function windowHTML(win, providerID) {
 function accountHTML(account) {
   const isActive = account.id === data.active;
   const status = statusOf(account);
+  const plan = PLAN_NAMES[account.plan] || account.plan || '';
   let windows;
   if (account.usage && account.usage.windows && account.usage.windows.length) {
     windows = `<div class="windows">${account.usage.windows.map(w => windowHTML(w, account.provider)).join('')}</div>`;
@@ -130,10 +148,10 @@ function accountHTML(account) {
     <div class="account ${isActive ? 'active' : ''}" data-id="${escapeHTML(account.id)}">
       <div class="account-head">
         <div class="who">
-          <div class="email">${escapeHTML(account.email)}</div>
+          <div class="email" tabindex="0" title="">${escapeHTML(account.email)}</div>
           <div class="meta">
             <span class="dot ${status.cls}"></span>${status.label}
-            ${account.plan ? ` · ${escapeHTML(account.plan)}` : ''}
+            ${plan ? ` · ${escapeHTML(plan)}` : ''}
           </div>
         </div>
         <div class="actions">
@@ -196,6 +214,13 @@ function scheduleUsage() {
 /* ---------- actions ---------- */
 
 providersEl.addEventListener('click', async (event) => {
+  // Emails are blurred for shoulder-surfing privacy; clicking one toggles
+  // a sticky reveal.
+  const email = event.target.closest('.email');
+  if (email) {
+    email.classList.toggle('revealed');
+    return;
+  }
   const button = event.target.closest('button[data-act]');
   if (!button || button.disabled) return;
   const id = button.closest('.account').dataset.id;
@@ -204,8 +229,8 @@ providersEl.addEventListener('click', async (event) => {
       await api(`/api/accounts/${id}/activate`, { method: 'POST' });
       await refreshState();
     } else if (button.dataset.act === 'delete') {
-      const email = button.closest('.account').querySelector('.email').textContent;
-      if (!confirm(`Remove ${email}? You can always add it back.`)) return;
+      const mail = button.closest('.account').querySelector('.email').textContent;
+      if (!confirm(`Remove ${mail}? You can always add it back.`)) return;
       await api(`/api/accounts/${id}`, { method: 'DELETE' });
       await refreshState();
     }
