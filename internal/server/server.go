@@ -175,8 +175,13 @@ func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	handle, err := a.Logins.Start(r.Context(), prov)
+	if errors.Is(err, provider.ErrUnsupported) {
+		// Providers without a browser callback (grok) use the device
+		// authorization grant instead: also a web login, just with a code.
+		handle, err = a.Logins.StartDevice(context.WithoutCancel(r.Context()), prov)
+	}
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this provider does not support browser login; use an API key"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start login"})
 		return
 	}
 	writeJSON(w, http.StatusOK, handle)

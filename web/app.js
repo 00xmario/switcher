@@ -275,17 +275,16 @@ function openProviderMenu(anchor, providerID) {
 function renderAddProviderMenu() {
   const host = document.getElementById('add-provider-slot');
   if (!host) return;
-  if (!(data.hidden || []).length) {
-    host.innerHTML = '';
-    return;
-  }
+  if (typeof data.hidden !== 'object' || !Array.isArray(data.hidden)) data.hidden = [];
   host.innerHTML = `
     <button id="add-provider">Add provider ⌄</button>
     <div class="hidden-list">
-      ${data.hidden.map(id => `
-        <button data-show-provider="${escapeHTML(id)}">
-          <span class="menu-logo">${LOGOS[id] || ''}</span>${escapeHTML(PROVIDER_NAMES[id] || id)}
-        </button>`).join('')}
+      ${data.hidden.length
+        ? data.hidden.map(id => `
+            <button data-show-provider="${escapeHTML(id)}">
+              <span class="menu-logo">${LOGOS[id] || ''}</span>${escapeHTML(PROVIDER_NAMES[id] || id)}
+            </button>`).join('')
+        : `<button disabled>All providers are on the page</button>`}
     </div>`;
 }
 
@@ -404,7 +403,10 @@ providersEl.addEventListener('click', async (event) => {
       if (login.kind === 'device') {
         showDeviceModal(login.verification_url, login.user_code);
       } else {
-        const popup = window.open(login.url, 'switcher-login', 'width=520,height=720');
+        const w = 520, h = 720;
+        const left = Math.max(0, Math.round((screen.width - w) / 2));
+        const top = Math.max(0, Math.round((screen.height - h) / 2));
+        const popup = window.open(login.url, 'switcher-login', `width=${w},height=${h},left=${left},top=${top}`);
         if (!popup) {
           // Popup blocked: navigate this tab; the callback page says how to get back.
           location.href = login.url;
