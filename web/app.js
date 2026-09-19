@@ -115,7 +115,10 @@ function windowHTML(win, providerID) {
   const recovery = left < 100
     ? `<div class="recover">↻ +${used}% in ${remaining || 'a moment'}</div>`
     : '';
-  const label = left >= 14 ? escapeHTML(`${name} ${left}%`) : '';
+  const bar = left === 0
+    // Fully hatched track, label sitting on it: nothing to fill yet.
+    ? `<div class="bar"><span class="bar-label">${escapeHTML(`${name} 0%`)}</span></div>`
+    : `<div class="bar"><div class="fill" style="width:${left}%">${left >= 14 ? `<span>${escapeHTML(`${name} ${left}%`)}</span>` : ''}</div></div>`;
   return `
     <div class="window">
       <div class="win-left">
@@ -124,9 +127,7 @@ function windowHTML(win, providerID) {
         ${recovery}
       </div>
       <div class="win-bar">
-        <div class="bar">
-          <div class="fill ${label ? '' : 'no-label'}" style="width:${left}%">${label}</div>
-        </div>
+        ${bar}
         <span class="reset-badge">${resetText}</span>
       </div>
     </div>`;

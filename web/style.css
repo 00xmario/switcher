@@ -234,7 +234,6 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
   border-radius: 10px;
   display: flex;
   align-items: center;
-  padding: 0 14px;
   color: var(--bar-fill-text);
   font-size: 14px;
   font-weight: 550;
@@ -242,7 +241,17 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
   min-width: 0;
   overflow: hidden;
 }
-.fill.no-label { font-size: 0; }
+.fill span { margin-left: 14px; }
+.bar-label {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--dim);
+  font-size: 14px;
+  font-weight: 550;
+  white-space: nowrap;
+}
 .reset-badge {
   position: absolute;
   right: 10px;
