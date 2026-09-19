@@ -3,7 +3,7 @@
 A tiny local tool for switching your AI CLI logins between accounts on demand.
 
 One active account serves all traffic. You switch accounts from the web UI.
-Switching happens **only** when you switch — or when the active account runs
+Switching happens **only** when you switch, or when the active account runs
 out of usage, in which case Switcher moves to another account and retries
 transparently. That is the entire feature list.
 
@@ -15,30 +15,50 @@ codex CLI ──▶ Switcher (127.0.0.1:8787) ──▶ upstream, signed in as t
 
 ## Why
 
-Tools that juggle multiple paid subscriptions usually pull you into rotation
-pools, cooldown schedulers, and protocol translation. Switcher does none of
-that. It exists to answer two questions:
+Tools that juggle multiple paid subscriptions are usually built to serve many
+users from many accounts at the same time. That is a different problem from
+yours, and the features they pile on exist for it:
+
+- **Rotation pools** exist to saturate a set of subscriptions: spread every
+  request across all accounts so the aggregate never trips one account's
+  rate limit. That matters when one account cannot absorb the load, which is
+  a team or reseller problem. For one person coding, it almost never is, and
+  the cost is real: you can no longer tell which subscription is being
+  billed, and the system makes routing decisions you never asked for.
+- **Cooldown schedulers** are circuit breakers for big credential fleets.
+  When one account out of many fails, bench it so the rest keep flowing.
+  With a small fleet this backfires: benching half of your accounts for a
+  minute over a two second network blip turns a hiccup into a lockout.
+
+Switcher answers two questions instead:
 
 - **Which account am I using right now?**
-- **Switch me to another one** (yourself, with one click — or automatically
+- **Switch me to another one** (yourself, with one click, or automatically
   when the active one is out of usage).
+
+One account is chosen, all traffic is billed to it, and that choice never
+changes on its own.
+
+Protocol translation (letting a client speak one wire format to an upstream
+that speaks another) is deliberately left open. It is genuinely useful and
+may be added later.
 
 Everything else is deliberately missing. No API keys, no model aliases, no
 round-robin, no plugins.
 
 ## Features
 
-- **Manual switching, only from the web UI** — switching never happens on its
+- **Manual switching, only from the web UI**: switching never happens on its
   own as long as the active account works.
-- **Automatic failover on exhaustion** — when the active account reports it
+- **Automatic failover on exhaustion**: when the active account reports it
   is out of usage (HTTP 429 `usage_limit_reached`), Switcher marks it with
   the upstream reset time and, if another account is usable, retries your
   in-flight request on it transparently.
-- **No switch when there is nowhere to go** — if every account is out of
+- **No switch when there is nowhere to go**: if every account is out of
   usage, Switcher does not rotate; it passes the upstream error through.
-- **Login in the app** — adding an account runs the provider's real OAuth
+- **Login in the app**: adding an account runs the provider's real OAuth
   flow in your browser; tokens are stored locally, `0600`.
-- **Single Go binary** — the frontend is embedded; there is no Node build.
+- **Single Go binary**: the frontend is embedded; there is no Node build.
 
 ## Providers
 
@@ -49,7 +69,7 @@ round-robin, no plugins.
 | Claude | planned |
 
 The `provider.Provider` interface (login, refresh, forward, usage) is the
-only integration point — a new provider is one package.
+only integration point; a new provider is one package.
 
 ## Install
 
@@ -68,7 +88,7 @@ switcher install         # points the codex CLI at Switcher (idempotent, backs u
 ```
 
 1. Open <http://127.0.0.1:8787>.
-2. **Add Codex account** — a browser window opens for the normal ChatGPT
+2. **Add Codex account**: a browser window opens for the normal ChatGPT
    sign-in; the account lands in Switcher.
 3. Click **Use this account** to make it active.
 4. Run `codex` as usual. That's it.
@@ -93,7 +113,7 @@ switcher install         # points the codex CLI at Switcher (idempotent, backs u
 - Binds to `127.0.0.1` only; there is no authentication because there is no
   network exposure. Do not expose it.
 - Tokens are stored unencrypted under `~/.switcher/` with `0600`
-  permissions — same trust model as the CLIs themselves.
+  permissions, same trust model as the CLIs themselves.
 - Request bodies are forwarded verbatim; Switcher never inspects prompts.
 
 ## Layout
@@ -118,4 +138,4 @@ business and your responsibility.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

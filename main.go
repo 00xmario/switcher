@@ -1,7 +1,7 @@
 // Command switcher is a minimal local tool that switches your AI CLI
 // logins between accounts on demand: one active account serves all
 // traffic, you switch from the web UI, and exhausted accounts fail over
-// automatically. Nothing else — no pooling, no rotation, no protocol
+// automatically. Nothing else: no pooling, no rotation, no protocol
 // translation.
 //
 // Subcommands:

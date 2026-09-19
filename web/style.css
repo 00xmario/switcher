@@ -1,4 +1,4 @@
-/* Switcher — theme variables. The html[data-theme] attribute decides which
+/* Switcher theme variables. The html[data-theme] attribute decides which
    palette is active; "system" defers to the OS preference below. */
 :root {
   color-scheme: light;

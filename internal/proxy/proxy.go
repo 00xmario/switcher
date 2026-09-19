@@ -1,7 +1,7 @@
 // Package proxy implements Switcher's request forwarding and its switching
 // rules. There is exactly one active account; traffic is forwarded to it
 // verbatim. The active account changes only in two cases: the user picks a
-// different one, or the active account reports an exhausted usage limit —
+// different one, or the active account reports an exhausted usage limit,
 // then Switcher moves to another usable account and transparently retries
 // the in-flight request once.
 package proxy
