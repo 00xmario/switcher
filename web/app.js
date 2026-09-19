@@ -258,7 +258,14 @@ function openProviderMenu(anchor, providerID) {
     if (!btn) return;
     menu.remove();
     document.removeEventListener('click', close);
-    if (!confirm(`Remove ${name} from the page?\nIts accounts stay on disk and keep serving traffic; "Add provider" brings it back.`)) return;
+    const yes = await confirmDialog({
+      title: `Remove ${name}?`,
+      message: 'Its accounts stay on disk and keep serving traffic. "Add provider" brings it back.',
+      confirmLabel: 'Remove',
+      danger: true,
+      logoHTML: LOGOS[providerID] || '',
+    });
+    if (!yes) return;
     await api(`/api/providers/${providerID}/hide`, { method: 'POST' });
     await refreshState();
   });
@@ -317,7 +324,13 @@ providersEl.addEventListener('click', async (event) => {
       await refreshState();
     } else if (button.dataset.act === 'delete') {
       const mail = button.closest('.account').querySelector('.email').textContent;
-      if (!confirm(`Remove ${mail}? You can always add it back.`)) return;
+      const yes = await confirmDialog({
+        title: 'Remove account?',
+        message: `${mail} will be removed. You can always add it back.`,
+        confirmLabel: 'Remove',
+        danger: true,
+      });
+      if (!yes) return;
       await api(`/api/accounts/${id}`, { method: 'DELETE' });
       await refreshState();
     }
@@ -469,6 +482,38 @@ function showDeviceModal(verifyURL, userCode) {
   document.body.appendChild(overlay);
   overlay.querySelector('.device-copy button').addEventListener('click', () => {
     navigator.clipboard?.writeText(userCode).then(() => toast('Code copied'), () => {});
+  });
+}
+
+// confirmDialog is the in-app replacement for window.confirm: themed,
+// keyboard-friendly, and destructive actions get their own styling.
+function confirmDialog({ title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, logoHTML = '' }) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'device-overlay confirm-overlay';
+    overlay.innerHTML = `
+      <div class="device-modal confirm-modal" role="alertdialog" aria-modal="true" aria-label="${escapeHTML(title)}">
+        ${logoHTML ? `<span class="confirm-logo">${logoHTML}</span>` : ''}
+        <h3>${escapeHTML(title)}</h3>
+        ${message ? `<p class="confirm-message">${escapeHTML(message)}</p>` : ''}
+        <div class="device-copy confirm-actions">
+          <button type="button" data-cancel>${escapeHTML(cancelLabel)}</button>
+          <button type="button" class="${danger ? 'danger' : 'primary'}" data-ok>${escapeHTML(confirmLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const ok = overlay.querySelector('[data-ok]');
+    const cancel = overlay.querySelector('[data-cancel]');
+    ok.focus();
+    const close = (value) => { overlay.remove(); document.removeEventListener('keydown', onKey); resolve(value); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') close(false);
+      if (e.key === 'Enter') close(true);
+    };
+    ok.addEventListener('click', () => close(true));
+    cancel.addEventListener('click', () => close(false));
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(false); });
+    document.addEventListener('keydown', onKey);
   });
 }
 
