@@ -202,6 +202,15 @@ html[data-theme="dark"] .menu-logo.opencode { filter: invert(1); }
 .menu-logo img { width: 18px; height: 18px; display: block; }
 html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
 #add-provider-slot { position: relative; }
+#add-provider {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+#add-provider svg { width: 13px; height: 13px; display: block; color: var(--faint); }
+.hidden-list { min-width: 250px; }
+.hidden-list button { white-space: nowrap; }
+.hidden-list button:disabled { color: var(--faint); cursor: default; }
 #add-provider-slot .hidden-list {
   position: absolute;
   top: calc(100% + 8px);

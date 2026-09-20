@@ -277,7 +277,9 @@ function renderAddProviderMenu() {
   if (!host) return;
   if (typeof data.hidden !== 'object' || !Array.isArray(data.hidden)) data.hidden = [];
   host.innerHTML = `
-    <button id="add-provider">Add provider ⌄</button>
+    <button id="add-provider">Add provider
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
     <div class="hidden-list">
       ${data.hidden.length
         ? data.hidden.map(id => `
