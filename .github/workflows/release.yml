@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
 
@@ -22,7 +22,7 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Build
+      - name: Build plain binaries
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -38,6 +38,32 @@ jobs:
           for f in switcher_*; do
             shasum -a 256 "$f" | tee "$f.sha256"
           done
+
+      - name: Build macOS app bundle
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="build/Switcher.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp build/macos/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          sed "s/VERSION_TOKEN/${VERSION}/g" build/macos/Info.plist > "$APP/Contents/Info.plist"
+          GOOS=darwin GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "$APP/Contents/MacOS/SwitcherServer" .
+          swiftc -O -o "$APP/Contents/MacOS/Switcher" build/macos/menubar.swift
+
+      - name: Package drag-to-Applications DMG
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="build/dmg"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R "build/Switcher.app" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Switcher $VERSION" -srcfolder "$STAGE" \
+            -ov -format UDZO "dist/Switcher_${VERSION}.dmg"
 
       - name: Publish release
         env:
