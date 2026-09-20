@@ -279,7 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row.addSubview(logo)
 
             let plan = account.plan.flatMap { planNames[$0] }.map { " · " + $0 } ?? ""
-            let title = label(truncate(account.email, 24) + plan,
+            let title = label(truncate(account.email, 30) + plan,
                 font: NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular),
                 color: account.active ? accentColor : inkColor)
             title.frame = NSRect(x: 44, y: rowHeight(for: account) - 18, width: menuWidth - 110, height: 15)
@@ -288,7 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var usageY = rowHeight(for: account) - 32
             for window in account.usage?.windows ?? [] {
                 let left = max(0, min(100, 100 - window.used_percent))
-                let usage = label("   " + window.label + ": \(left)% left",
+                let usage = label(window.label + ": \(left)% left",
                     font: NSFont.systemFont(ofSize: 11), color: dimColor)
                 usage.frame = NSRect(x: 44, y: usageY, width: menuWidth - 110, height: 14)
                 row.addSubview(usage)

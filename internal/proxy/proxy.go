@@ -237,22 +237,36 @@ func (m *Manager) LastUsage(id string) (provider.Usage, bool) {
 }
 
 // RefreshUsage queries upstream usage for one account, best effort, and
-// remembers the result for the UI. An expired token is refreshed first.
+// remembers the result for the UI. The token is refreshed first when the
+// expiry says so, and once more on any usage failure: stored expiry
+// timestamps can go stale after credential rotation, so a failing Usage
+// call must never be trusted as final.
 func (m *Manager) RefreshUsage(ctx context.Context, a store.Account) provider.Usage {
 	prov, ok := m.providers[a.Provider]
 	if !ok {
 		return provider.Usage{}
 	}
-	if prov.IsExpired(a) {
+	refresh := func() bool {
 		if err := prov.Refresh(ctx, &a); err != nil {
-			return provider.Usage{}
+			log.Printf("proxy: usage refresh for %s failed: %v", a.Email, err)
+			return false
 		}
 		if err := m.store.Save(a); err != nil {
 			log.Printf("proxy: save refreshed token: %v", err)
 		}
+		return true
+	}
+	if prov.IsExpired(a) && !refresh() {
+		return provider.Usage{}
 	}
 	usage, err := prov.Usage(ctx, a)
+	if err != nil && refresh() {
+		// Stored expiry timestamps can go stale after credential rotation:
+		// retry once with a fresh token before giving up.
+		usage, err = prov.Usage(ctx, a)
+	}
 	if err != nil {
+		log.Printf("proxy: usage unavailable for %s (%s): %v", a.Email, a.Provider, err)
 		usage = provider.Usage{}
 	}
 	m.mu.Lock()
