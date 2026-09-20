@@ -15,6 +15,7 @@ import (
 	"switcher/internal/provider"
 	"switcher/internal/proxy"
 	"switcher/internal/store"
+	"switcher/internal/update"
 )
 
 // API wraps the JSON API the web UI talks to.
@@ -24,6 +25,8 @@ type API struct {
 	Proxy         *proxy.Manager
 	Providers     map[string]provider.Provider
 	ManagementKey string
+	Version       string
+	Updater       *update.Checker
 }
 
 // Register mounts the API on the given mux.
@@ -35,6 +38,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
 	mux.HandleFunc("POST /api/accounts", a.handleAddKey)
 	mux.HandleFunc("POST /api/accounts/{id}/use-reset", a.handleUseReset)
+	mux.HandleFunc("POST /api/update", a.handleUpdate)
 	mux.HandleFunc("PATCH /api/providers/order", a.handleProviderOrder)
 	mux.HandleFunc("POST /api/providers/{id}/hide", a.handleProviderHide)
 	mux.HandleFunc("POST /api/providers/{id}/show", a.handleProviderShow)
@@ -293,6 +297,26 @@ func (a *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.Proxy.Remove(id)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// UpdateState wraps the updater's cached state.
+func (a *API) UpdateState() update.State {
+	if a.Updater == nil || a.Version == "" {
+		return update.State{}
+	}
+	return a.Updater.State()
+}
+
+// handleUpdate installs the latest release and restarts in place. The
+// exec-restart replaces the process image, so the response may never
+// reach the client; the UI polls /api/state until the new version shows.
+func (a *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if err := a.Updater.InstallAndRestart(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	// Unreachable: InstallAndRestart never returns on success.
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

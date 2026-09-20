@@ -35,6 +35,7 @@ import (
 	"switcher/internal/proxy"
 	"switcher/internal/server"
 	"switcher/internal/store"
+	"switcher/internal/update"
 )
 
 // version is overridable at build time: -ldflags "-X main.version=x.y.z".
@@ -118,7 +119,12 @@ func run(port int) {
 	})
 	mgmtAPI := &mgmtapi.API{Store: st, Proxy: proxyManager, Logins: logins, ManagementKey: managementKey}
 
-	api := &server.API{Store: st, Logins: logins, Proxy: proxyManager, Providers: providers, ManagementKey: managementKey}
+	updater := update.New(version)
+
+	api := &server.API{
+		Store: st, Logins: logins, Proxy: proxyManager, Providers: providers,
+		ManagementKey: managementKey, Version: version, Updater: updater,
+	}
 
 	// Each provider with a browser redirect has its own callback listener;
 	// the ports are fixed by the OAuth clients' registered redirect URIs.

@@ -180,6 +180,21 @@ function accountHTML(account) {
     </div>`;
 }
 
+// Update banner: shown above the provider sections when a release is
+// newer than the running build.
+function updateBannerHTML() {
+  const info = data.update;
+  if (!info || !info.update_available) return '';
+  return `
+    <div class="update-banner">
+      <span class="update-text">
+        <strong>Switcher ${escapeHTML(info.latest)}</strong> is available
+        (you are running ${escapeHTML(data.version)})
+      </span>
+      <button class="update-install" data-act="install-update">Install &amp; restart</button>
+    </div>`;
+}
+
 function render() {
   const byProvider = new Map();
   for (const a of data.accounts) {
@@ -188,7 +203,7 @@ function render() {
   }
   const order = (data.order || Object.keys(PROVIDER_NAMES))
     .filter(id => !(data.hidden || []).includes(id));
-  let html = '';
+  let html = updateBannerHTML();
   order.forEach((providerID) => {
     const accounts = byProvider.get(providerID) || [];
     html += `
