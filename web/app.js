@@ -127,10 +127,7 @@ function windowHTML(win, providerID) {
   const recovery = left < 100
     ? `<div class="recover">↻ +${used}% in ${remaining || 'a moment'}</div>`
     : '';
-  const bar = left === 0
-    // Fully hatched track, label sitting on it: nothing to fill yet.
-    ? `<div class="bar"><span class="bar-label">${escapeHTML(`${name} 0%`)}</span></div>`
-    : `<div class="bar"><div class="fill" style="width:${left}%">${left >= 14 ? `<span>${escapeHTML(`${name} ${left}%`)}</span>` : ''}</div></div>`;
+  const bar = `<div class="bar"><div class="fill" style="width:${left}%"></div><span class="bar-pill ${left === 0 ? 'zero' : ''}">${escapeHTML(`${name} ${left}%`)}</span></div>`;
   return `
     <div class="window">
       <div class="win-left">
@@ -204,6 +201,8 @@ function render() {
   const order = (data.order || Object.keys(PROVIDER_NAMES))
     .filter(id => !(data.hidden || []).includes(id));
   document.getElementById('update-slot').innerHTML = updateBannerHTML();
+  const versionBadge = document.querySelector('.brand-version');
+  if (versionBadge && data.version) versionBadge.textContent = `(v${data.version})`;
   let html = '';
   order.forEach((providerID) => {
     const accounts = byProvider.get(providerID) || [];
@@ -862,7 +861,7 @@ function renderUsage() {
 // with each provider's value and the day total.
 function renderChart(s, isCost) {
   const days = s.days || [];
-  const width = 900, height = 470, padL = 84, padR = 20, padT = 18, padB = 36;
+  const width = 900, height = 520, padL = 92, padR = 20, padT = 18, padB = 38;
   const plotW = width - padL - padR, plotH = height - padT - padB;
   const series = s.providers.map(p => p.provider);
   if (days.length === 0 || series.length === 0) {

@@ -64,8 +64,8 @@ struct Palette {
         surface: NSColor(hex: 0xffffff), border: NSColor(hex: 0xe4e4e8),
         hover: NSColor.black.withAlphaComponent(0.05), dark: false)
     static let dark = Palette(
-        ink: NSColor(hex: 0xe6e8eb), dim: NSColor(hex: 0x9aa3ad), accent: NSColor(hex: 0x3fb96f),
-        surface: NSColor(hex: 0x12151a), border: NSColor(hex: 0x2d3641),
+        ink: NSColor(hex: 0xf5f5f5), dim: NSColor(hex: 0xa3a3a3), accent: NSColor(hex: 0x3fb96f),
+        surface: NSColor(hex: 0x151515), border: NSColor(hex: 0x242424),
         hover: NSColor.white.withAlphaComponent(0.06), dark: true)
 
     static func current() -> Palette {
