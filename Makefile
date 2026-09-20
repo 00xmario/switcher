@@ -1,5 +1,5 @@
 BINARY := switcher
-VERSION ?= $(shell date +%Y%m%d-%H%M%S)
+VERSION ?= $(shell cat VERSION 2>/dev/null || echo dev)
 
 .PHONY: build test vet install run dev clean
 

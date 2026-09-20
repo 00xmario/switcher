@@ -161,6 +161,8 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"hidden":             hidden,
 		"hub_url":            "http://127.0.0.1:8787",
 		"hub_management_key": a.ManagementKey,
+		"version":            a.Version,
+		"update":             a.UpdateState(),
 	})
 }
 
