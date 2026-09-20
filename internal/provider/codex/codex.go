@@ -181,25 +181,25 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamBase+"/usage", nil)
 	if err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: build request: %v", provider.ErrUsageUnavailable, err)
 	}
 	if err := p.ApplyAuth(req, a); err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: auth: %v", provider.ErrUsageUnavailable, err)
 	}
 	req.Header.Set("User-Agent", codexUserAgent)
 	req.Header.Set("originator", "codex_cli_rs")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return provider.Usage{}, provider.ErrUsageUnavailable
-	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: read body: %v", provider.ErrUsageUnavailable, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return provider.Usage{}, fmt.Errorf("%w: upstream status %d: %s", provider.ErrUsageUnavailable, resp.StatusCode, truncate(raw, 200))
 	}
 
 	var parsed struct {
@@ -210,7 +210,7 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 		} `json:"rate_limit"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: decode: %v", provider.ErrUsageUnavailable, err)
 	}
 
 	var windows []provider.UsageWindow
@@ -514,4 +514,12 @@ func decodeJWTClaims(idToken string) (map[string]any, error) {
 func stringClaim(claims map[string]any, key string) string {
 	v, _ := claims[key].(string)
 	return strings.TrimSpace(v)
+}
+
+// truncate shortens upstream bodies for log lines.
+func truncate(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "..."
 }

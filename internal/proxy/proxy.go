@@ -256,7 +256,10 @@ func (m *Manager) RefreshUsageAll(ctx context.Context) {
 		}
 		usage, uerr := prov.Usage(ctx, account)
 		if uerr != nil {
-			usage = provider.Usage{}
+			// Keep the last good snapshot: a single failed poll must not
+			// blank out usage the UI was showing a minute ago.
+			log.Printf("proxy: usage sync for %s (%s) failed, keeping last value: %v", account.Email, account.Provider, uerr)
+			continue
 		}
 		m.mu.Lock()
 		m.lastUsage[account.ID] = usage
@@ -295,6 +298,9 @@ func (m *Manager) RefreshUsage(ctx context.Context, a store.Account) provider.Us
 	}
 	if err != nil {
 		log.Printf("proxy: usage unavailable for %s (%s): %v", a.Email, a.Provider, err)
+		if last, ok := m.LastUsage(a.ID); ok && last.Available {
+			return last
+		}
 		usage = provider.Usage{}
 	}
 	m.mu.Lock()

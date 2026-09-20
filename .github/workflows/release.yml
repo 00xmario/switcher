@@ -47,7 +47,7 @@ jobs:
           rm -rf "$APP"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp build/macos/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-          cp build/macos/logos/*.png "$APP/Contents/Resources/"
+          cp build/macos/logos/*.svg web/logo.svg "$APP/Contents/Resources/"
           sed "s/VERSION_TOKEN/${VERSION}/g" build/macos/Info.plist > "$APP/Contents/Info.plist"
           GOOS=darwin GOARCH=arm64 \
             go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \

@@ -64,7 +64,7 @@ func label(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
 }
 
 func cardView(width: CGFloat, height: CGFloat) -> NSView {
-    let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    let card = HoverCard(frame: NSRect(x: 0, y: 0, width: width, height: height))
     card.wantsLayer = true
     card.layer?.backgroundColor = surfaceColor.cgColor
     card.layer?.borderColor = cardBorderColor.cgColor
@@ -75,64 +75,244 @@ func cardView(width: CGFloat, height: CGFloat) -> NSView {
 }
 
 func sectionHead(_ providerID: String, contentWidth: CGFloat) -> NSView {
-    let head = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 26))
-    let logo = NSImageView(frame: NSRect(x: edgeInset, y: 4, width: 18, height: 18))
-    let image = providerLogoImage(providerID)
-    image?.size = NSSize(width: 18, height: 18)
-    logo.image = image
+    let head = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 32))
+    let logo = NSImageView(frame: NSRect(x: edgeInset, y: 5, width: 22, height: 22))
+    logo.imageScaling = .scaleProportionallyUpOrDown
+    logo.image = providerLogoImage(providerID)
     let name = label(providerNames[providerID] ?? providerID,
         font: NSFont.systemFont(ofSize: 13, weight: .semibold), color: inkColor)
-    name.frame = NSRect(x: edgeInset + 26, y: 5, width: contentWidth - 18 - 10, height: 16)
+    name.frame = NSRect(x: edgeInset + 22 + 10, y: 8, width: contentWidth - 32, height: 16)
     head.addSubview(logo)
     head.addSubview(name)
     return head
 }
 
-// providerLogoImage loads the bundled mark, monochrome ones as templates
-// so they follow dark mode.
+// providerLogoImage loads the same SVG marks the web app uses. Grok's mark
+// is a single-color glyph, so it is a template and follows dark mode.
 func providerLogoImage(_ providerID: String) -> NSImage? {
-    guard let url = Bundle.main.url(forResource: providerID, withExtension: "png") else {
+    guard let url = Bundle.main.url(forResource: providerID, withExtension: "svg") else {
         return nil
     }
     let image = NSImage(contentsOf: url)
-    if providerID == "grok" || providerID == "opencode" { image?.isTemplate = true }
+    image?.isTemplate = providerID == "grok"
     return image
 }
 
-// Hover-highlighting, clickable row. Tapping invokes the handler.
+// textWidth measures the frame width a label needs for a string, using a
+// real NSTextField so the field's own padding is included.
+func textWidth(_ text: String, font: NSFont) -> CGFloat {
+    let probe = NSTextField(labelWithString: text)
+    probe.font = font
+    probe.sizeToFit()
+    return ceil(probe.frame.width) + 2
+}
+
+// ClickableRow is one account line. Hover state is driven by the card
+// that contains it (see HoverCard), so rows can never get out of sync.
 final class ClickableRow: NSView {
     var onClicked: (() -> Void)?
-    private var tracking: NSTrackingArea?
+    var onHover: ((Bool) -> Void)?
+    private(set) var hovered = false
 
-    override func layout() {
-        super.layout()
-        if tracking == nil {
-            wantsLayer = true
-            layer?.cornerRadius = 8
-            layer?.masksToBounds = true
-            addTrackingArea(NSTrackingArea(rect: bounds,
-                options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self))
-            tracking = NSTrackingArea()
-        }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    func setHovered(_ value: Bool) {
+        guard value != hovered else { return }
+        hovered = value
+        layer?.backgroundColor = value ? NSColor.systemGray.withAlphaComponent(0.10).cgColor : NSColor.clear.cgColor
+        onHover?(value)
     }
 
     override func mouseDown(with event: NSEvent) {
         if let handler = onClicked { handler() }
     }
+}
 
-    override func mouseEntered(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.systemGray.withAlphaComponent(0.10).cgColor
+// HoverCard holds account rows. Hover is not driven by AppKit tracking
+// areas (menus drop and reorder enter/exit events); the delegate polls the
+// cursor while the menu is open and calls updateHover.
+final class HoverCard: NSView {
+    private func rows() -> [ClickableRow] { subviews.compactMap { $0 as? ClickableRow } }
+
+    func updateHover(screenPoint: NSPoint) {
+        guard let window = window else { return }
+        let point = convert(window.convertPoint(fromScreen: screenPoint), from: nil)
+        for row in rows() { row.setHovered(row.frame.contains(point)) }
     }
 
-    override func mouseExited(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.clear.cgColor
+    func clearHover() { rows().forEach { $0.setHovered(false) } }
+}
+
+// renderBitmap draws a view into a Retina bitmap so it can be turned into a
+// static image (used for the blurred email and the spinner icon).
+func renderBitmap(_ view: NSView) -> NSBitmapImageRep? {
+    let size = view.bounds.size
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+    rep.size = size
+    view.cacheDisplay(in: view.bounds, to: rep)
+    return rep
+}
+
+// blurredImage renders a label once through CIGaussianBlur. Same privacy
+// pattern as the web app: unreadable until hovered.
+let blurRadius: Double = 5
+
+func blurredImage(of field: NSTextField) -> NSImage? {
+    guard let rep = renderBitmap(field), let cg = rep.cgImage else { return nil }
+    let input = CIImage(cgImage: cg)
+    guard let clamp = CIFilter(name: "CIAffineClamp"), let blur = CIFilter(name: "CIGaussianBlur") else { return nil }
+    clamp.setValue(input, forKey: kCIInputImageKey)
+    clamp.setValue(CGAffineTransform.identity, forKey: kCIInputTransformKey)
+    blur.setValue(clamp.outputImage, forKey: kCIInputImageKey)
+    blur.setValue(blurRadius * 2, forKey: kCIInputRadiusKey) // radius in 2x pixels
+    guard let output = blur.outputImage?.cropped(to: input.extent),
+          let result = CIContext().createCGImage(output, from: input.extent) else { return nil }
+    let image = NSImage(cgImage: result, size: field.bounds.size)
+    return image
+}
+
+// BlurredLabel stacks a blurred snapshot above the real label and
+// cross-fades layer opacity on hover. Layer animations are used on purpose:
+// AppKit's animator() stalls inside the menu tracking run loop.
+final class BlurredLabel: NSView {
+    private let veil = NSImageView()
+    private let field: NSTextField
+
+    init(field: NSTextField) {
+        self.field = field
+        super.init(frame: field.frame)
+        wantsLayer = true
+        field.frame.origin = .zero
+        field.wantsLayer = true
+        addSubview(field)
+        veil.frame = bounds
+        veil.imageScaling = .scaleNone
+        veil.image = blurredImage(of: field)
+        veil.wantsLayer = true
+        addSubview(veil)
+        field.layer?.opacity = 0
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    func reveal(_ show: Bool) {
+        fade(veil.layer, to: show ? 0 : 1)
+        fade(field.layer, to: show ? 1 : 0)
+    }
+
+    private func fade(_ layer: CALayer?, to target: Float) {
+        guard let layer = layer else { return }
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = layer.presentation()?.opacity ?? layer.opacity
+        animation.toValue = target
+        animation.duration = 0.18
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.removeAnimation(forKey: "fade")
+        layer.opacity = target
+        layer.add(animation, forKey: "fade")
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+// ToggleSwitch is a custom on/off control drawn in the app accent. NSSwitch
+// cannot be tinted and renders grey inside menus (inactive window style).
+final class ToggleSwitch: NSView {
+    var isOn: Bool { didSet { render(animated: true) } }
+    var onChanged: ((Bool) -> Void)?
+    private let knob = CALayer()
+
+    init(isOn: Bool) {
+        self.isOn = isOn
+        super.init(frame: NSRect(x: 0, y: 0, width: 40, height: 24))
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        knob.frame = CGRect(x: 2, y: 2, width: 20, height: 20)
+        knob.cornerRadius = 10
+        knob.backgroundColor = NSColor.white.cgColor
+        knob.shadowColor = NSColor.black.cgColor
+        knob.shadowOpacity = 0.18
+        knob.shadowRadius = 1.5
+        knob.shadowOffset = CGSize(width: 0, height: -0.5)
+        layer?.addSublayer(knob)
+        render(animated: false)
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    private func render(animated: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        CATransaction.setAnimationDuration(0.18)
+        layer?.backgroundColor = (isOn ? accentColor : NSColor.systemGray.withAlphaComponent(0.35)).cgColor
+        knob.frame.origin.x = isOn ? bounds.width - 22 : 2
+        CATransaction.commit()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isOn.toggle()
+        onChanged?(isOn)
+    }
+}
+
+// SpinnerButton shows an SF Symbol in a plain CALayer (so AppKit never
+// resets its anchor point) and spins it around its center while an action
+// runs.
+final class SpinnerButton: NSView {
+    var onClicked: (() -> Void)?
+    private let iconLayer = CALayer()
+
+    init(symbol: String, size: CGFloat, color: NSColor) {
+        super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
+        wantsLayer = true
+        let config = NSImage.SymbolConfiguration(pointSize: size * 0.58, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        let symbolView = NSImageView(frame: bounds)
+        symbolView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+        if let rep = renderBitmap(symbolView) {
+            iconLayer.contents = rep.cgImage
+        }
+        iconLayer.contentsScale = 2
+        iconLayer.contentsGravity = .resizeAspect
+        iconLayer.frame = bounds
+        layer?.addSublayer(iconLayer)
+        toolTip = "Refresh usage"
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override func mouseDown(with event: NSEvent) {
+        spin()
+        onClicked?()
+    }
+
+    func spin() {
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = 0
+        rotation.toValue = -2 * Double.pi
+        rotation.duration = 0.8
+        rotation.repeatCount = .infinity
+        iconLayer.add(rotation, forKey: "spin")
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
     var serverProcess: Process?
+    var cachedState: AppState?
+    var cachedRaw: Data?
+    var hoverCards: [HoverCard] = []
+    var hoverTimer: Timer?
+    var menuOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         ensureServerRunning()
@@ -140,14 +320,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "Switcher"
         menu.autoenablesItems = false
         statusItem.menu = menu
+        menu.delegate = self
         rebuildMenu()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.rebuildMenu()
-        }
+        fetchStateAsync()
+        // Keep the cache warm so the menu opens instantly with recent data.
+        let warm = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.fetchStateAsync() }
+        RunLoop.main.add(warm, forMode: .common)
+    }
+
+    // Opening draws from the cache immediately (no network on the main
+    // thread), then refreshes in the background and patches the menu only if
+    // the data changed. A poll drives hover while open.
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        rebuildMenu()
+        fetchStateAsync()
+        hoverTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.pollHover() }
+        RunLoop.main.add(timer, forMode: .common)
+        hoverTimer = timer
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        hoverTimer?.invalidate()
+        hoverTimer = nil
+        hoverCards.forEach { $0.clearHover() }
+    }
+
+    func pollHover() {
+        let point = NSEvent.mouseLocation
+        hoverCards.forEach { $0.updateHover(screenPoint: point) }
+    }
+
+    // fetchStateAsync refreshes the cache off the main thread. The menu is
+    // rebuilt only when the JSON differs from what is currently shown.
+    func fetchStateAsync() {
+        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
+        request.timeoutInterval = 5
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let decoded = try? JSONDecoder().decode(AppState.self, from: data) else { return }
+            DispatchQueue.main.async {
+                let changed = self.cachedRaw != data
+                self.cachedState = decoded
+                self.cachedRaw = data
+                if changed { self.rebuildMenu() }
+            }
+        }.resume()
+    }
+
+    // serverReachable is the one synchronous probe, used once at launch to
+    // decide whether to spawn the bundled server.
+    func serverReachable(timeout: Double) -> Bool {
+        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
+        request.timeoutInterval = timeout
+        let semaphore = DispatchSemaphore(value: 0)
+        var ok = false
+        URLSession.shared.dataTask(with: request) { _, response, _ in
+            ok = (response as? HTTPURLResponse)?.statusCode == 200
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + timeout)
+        return ok
     }
 
     func ensureServerRunning() {
-        if fetchState(timeout: 1.5) != nil { return }
+        if serverReachable(timeout: 1.5) { return }
         let server = URL(fileURLWithPath: Bundle.main.bundlePath + "/Contents/MacOS/SwitcherServer")
         guard FileManager.default.fileExists(atPath: server.path) else { return }
         let logDir = NSHomeDirectory() + "/.switcher"
@@ -171,19 +410,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func fetchState(timeout: Double = 5) -> AppState? {
-        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
-        request.timeoutInterval = timeout
-        let semaphore = DispatchSemaphore(value: 0)
-        var decoded: AppState?
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            if let data = data { decoded = try? JSONDecoder().decode(AppState.self, from: data) }
-            semaphore.signal()
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + timeout)
-        return decoded
-    }
-
     func post(path: String, completion: (() -> Void)? = nil) {
         var request = URLRequest(url: hubURL.appendingPathComponent(path))
         request.httpMethod = "POST"
@@ -196,17 +422,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.removeAllItems()
         let contentWidth = menuWidth - 2 * edgeInset
 
-        // Header: centered logo + version.
-        let state = fetchState()
-        let headerView = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 66))
-        let logo = NSImageView(frame: NSRect(x: (menuWidth - 42) / 2, y: 10, width: 42, height: 42))
-        logo.image = Bundle.main.image(forResource: "AppIcon")
+        // Header: app icon with name and version beside it, block centered.
+        let state = cachedState
+        hoverCards = []
+        let headerView = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 58))
+        let nameFont = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        let versionFont = NSFont.systemFont(ofSize: 11)
+        let versionText = "v" + (state?.version ?? "0.0.0")
+        let textColumn = max(textWidth("Switcher", font: nameFont), textWidth(versionText, font: versionFont))
+        let blockWidth = 36 + 10 + textColumn
+        let blockX = (menuWidth - blockWidth) / 2
+        let logo = NSImageView(frame: NSRect(x: blockX, y: 11, width: 36, height: 36))
+        // Same SVG as the web app header, so the two marks are identical.
+        logo.image = Bundle.main.url(forResource: "logo", withExtension: "svg").flatMap { NSImage(contentsOf: $0) }
+            ?? Bundle.main.image(forResource: "AppIcon")
         headerView.addSubview(logo)
-        let versionField = label("v" + (state?.version ?? "0.0.0"),
-            font: NSFont.systemFont(ofSize: 10.5), color: dimColor)
-        versionField.alignment = .center
-        versionField.frame = NSRect(x: 0, y: 0, width: menuWidth, height: 12)
+        let nameField = label("Switcher", font: nameFont, color: inkColor)
+        nameField.frame = NSRect(x: blockX + 46, y: 30, width: textColumn, height: 17)
+        headerView.addSubview(nameField)
+        let versionField = label(versionText, font: versionFont, color: dimColor)
+        versionField.frame = NSRect(x: blockX + 46, y: 14, width: textColumn, height: 14)
         headerView.addSubview(versionField)
+        // Manual usage refresh, trailing edge of the header.
+        let refresh = SpinnerButton(symbol: "arrow.clockwise", size: 26, color: dimColor)
+        refresh.frame.origin = NSPoint(x: menuWidth - edgeInset - 26, y: 16)
+        refresh.onClicked = { [weak self] in self?.refreshUsage() }
+        headerView.addSubview(refresh)
         menu.addItem(menuItemWithView(headerView))
 
         if state == nil {
@@ -227,7 +468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let accounts = (state?.accounts ?? []).filter { $0.provider == providerID }
                 menu.addItem(menuItemWithView(sectionHead(providerID, contentWidth: contentWidth)))
-                menu.addItem(menuItemWithView(providerCard(providerID: providerID, accounts: accounts, contentWidth: contentWidth)))
+                menu.addItem(menuItemWithView(centered(providerCard(providerID: providerID, accounts: accounts, contentWidth: contentWidth))))
             }
         }
 
@@ -264,68 +505,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let field = label("Start at login", font: NSFont.systemFont(ofSize: 13), color: inkColor)
         field.frame = NSRect(x: cardInset, y: 13, width: 180, height: 16)
         toggleCard.addSubview(field)
-        let toggle = NSSwitch(frame: NSRect(x: contentWidth - cardInset - 48, y: 9, width: 44, height: 26))
-        toggle.state = startAtLoginEnabled() ? .on : .off
-        toggle.target = self
-        toggle.action = #selector(toggleStartAtLogin)
+        let toggle = ToggleSwitch(isOn: startAtLoginEnabled())
+        toggle.frame.origin = NSPoint(x: contentWidth - cardInset - 40, y: 9)
+        toggle.onChanged = { [weak self] _ in self?.toggleStartAtLogin() }
         toggleCard.addSubview(toggle)
-        menu.addItem(menuItemWithView(toggleCard))
+        menu.addItem(menuItemWithView(centered(toggleCard, verticalPadding: 4)))
 
         let quitItem = NSMenuItem(title: "Quit Switcher", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
 
+    // Row metrics: top pad, title, gap, usage lines, bottom pad.
+    let rowTopPad: CGFloat = 9
+    let titleHeight: CGFloat = 15
+    let titleUsageGap: CGFloat = 4
+    let usageLineHeight: CGFloat = 15
+    let rowBottomPad: CGFloat = 8
+
     func providerCard(providerID: String, accounts: [Account], contentWidth: CGFloat) -> NSView {
-        let height = accounts.reduce(CGFloat(4)) { $0 + rowHeight(for: $1) }
+        let height = accounts.reduce(CGFloat(0)) { $0 + rowHeight(for: $1) }
         let card = cardView(width: contentWidth, height: height)
+        if let hover = card as? HoverCard { hoverCards.append(hover) }
         var y = height
         for (index, account) in accounts.enumerated() {
-            y -= rowHeight(for: account)
+            let rowH = rowHeight(for: account)
+            y -= rowH
 
-            let row = ClickableRow(frame: NSRect(x: 0, y: y, width: contentWidth, height: rowHeight(for: account)))
+            let row = ClickableRow(frame: NSRect(x: 0, y: y, width: contentWidth, height: rowH))
             row.onClicked = { [weak self] in
                 self?.post(path: "api/accounts/\(account.id)/activate") { [weak self] in
-                    DispatchQueue.main.async { self?.rebuildMenu() }
+                    DispatchQueue.main.async { self?.fetchStateAsync() }
                 }
             }
 
-            let logo = NSImageView(frame: NSRect(x: cardInset, y: rowHeight(for: account) / 2 - 11, width: 22, height: 22))
-            let logoImage = providerLogoImage(providerID)
-            logoImage?.size = NSSize(width: 22, height: 22)
-            logo.image = logoImage
-            row.addSubview(logo)
+            // Email + plan, left aligned at the card inset. Space for the
+            // trailing checkmark is reserved on the right.
+            let textX = cardInset
+            let planText = account.plan.flatMap { planNames[$0] }.map { " · " + $0 } ?? ""
+            let titleFont = NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular)
+            let titleColor = account.active ? accentColor : inkColor
+            let titleWidth = contentWidth - textX - cardInset - 22
+            let titleY = rowH - rowTopPad - titleHeight
+            let planWidth = planText.isEmpty ? 0 : textWidth(planText, font: titleFont)
+            let emailWidth = min(textWidth(account.email, font: titleFont), titleWidth - planWidth)
+            let emailField = label(account.email, font: titleFont, color: titleColor)
+            emailField.frame = NSRect(x: textX, y: titleY, width: emailWidth, height: titleHeight)
+            let email = BlurredLabel(field: emailField)
+            row.addSubview(email)
+            row.onHover = { hovering in email.reveal(hovering) }
+            if !planText.isEmpty {
+                let plan = label(planText, font: titleFont, color: titleColor)
+                plan.frame = NSRect(x: textX + emailWidth, y: titleY, width: planWidth, height: titleHeight)
+                row.addSubview(plan)
+            }
 
-            // Email + plan, LEFT aligned at the same leading inset as the
-            // logo column: text at logo right + 10.
-            let textX = cardInset + 22 + 10
-            let plan = account.plan.flatMap { planNames[$0] }.map { " · " + $0 } ?? ""
-            let title = label(account.email + plan,
-                font: NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular),
-                color: account.active ? accentColor : inkColor)
-            let textWidth = contentWidth - textX - cardInset - 24
-            title.frame = NSRect(x: textX, y: rowHeight(for: account) - 19, width: textWidth, height: 15)
-            row.addSubview(title)
-
-            var usageY = rowHeight(for: account) - 33
-            for window in account.usage?.windows ?? [] {
+            // Usage lines in two columns so the percentages line up even
+            // when labels differ in length (Weekly vs Session).
+            let usageFont = NSFont.systemFont(ofSize: 11)
+            let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            let windows = account.usage?.windows ?? []
+            let labelColumn = windows.map { textWidth($0.label + ":", font: usageFont) }.max() ?? 0
+            var usageY = titleY - titleUsageGap - usageLineHeight
+            for window in windows {
                 let left = max(0, min(100, 100 - window.used_percent))
-                let usage = label(window.label + ": \(left)% left",
-                    font: NSFont.systemFont(ofSize: 11), color: dimColor)
-                usage.frame = NSRect(x: textX, y: usageY, width: textWidth, height: 14)
-                row.addSubview(usage)
-                usageY -= 15
+                let name = label(window.label + ":", font: usageFont, color: dimColor)
+                name.frame = NSRect(x: textX, y: usageY, width: labelColumn, height: usageLineHeight)
+                row.addSubview(name)
+                let value = label("\(left)% left", font: valueFont, color: dimColor)
+                value.frame = NSRect(x: textX + labelColumn + 5, y: usageY, width: titleWidth - labelColumn - 5, height: usageLineHeight)
+                row.addSubview(value)
+                usageY -= usageLineHeight
             }
 
             if account.active {
-                let check = NSImageView(frame: NSRect(x: contentWidth - cardInset - 14, y: rowHeight(for: account) / 2 - 6, width: 14, height: 14))
+                let check = NSImageView(frame: NSRect(x: contentWidth - cardInset - 14, y: rowH / 2 - 6, width: 14, height: 14))
                 check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
                 check.contentTintColor = accentColor
                 row.addSubview(check)
             } else if let until = account.exhausted_until, Date(timeIntervalSince1970: until) > Date() {
                 let badge = label("Out of usage", font: NSFont.systemFont(ofSize: 10.5), color: warnColor)
                 badge.alignment = .right
-                badge.frame = NSRect(x: contentWidth - cardInset - 90, y: rowHeight(for: account) - 19, width: 90, height: 14)
+                badge.frame = NSRect(x: contentWidth - cardInset - 90, y: titleY, width: 90, height: 14)
                 row.addSubview(badge)
             }
 
@@ -342,10 +603,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func rowHeight(for account: Account) -> CGFloat {
         let windows = CGFloat(account.usage?.windows?.count ?? 0)
-        return 30 + windows * 15
+        let usageBlock = windows > 0 ? titleUsageGap + windows * usageLineHeight : 0
+        return rowTopPad + titleHeight + usageBlock + rowBottomPad
     }
 
     // MARK: actions
+
+    @objc func refreshUsage() {
+        post(path: "api/usage/refresh") { [weak self] in
+            DispatchQueue.main.async { self?.fetchStateAsync() }
+        }
+    }
 
     @objc func openWebApp() {
         NSWorkspace.shared.open(hubURL)
@@ -353,10 +621,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func runUpdate() {
         post(path: "api/update") { [weak self] in
-            DispatchQueue.main.async {
-                Thread.sleep(forTimeInterval: 1.5) // the server exec-restarts
-                self?.rebuildMenu()
-            }
+            // The server exec-restarts; give it a moment before re-reading.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.fetchStateAsync() }
         }
     }
 
@@ -372,11 +638,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ]
             let dir = NSHomeDirectory() + "/Library/LaunchAgents"
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            if let data = try? JSONSerialization.data(withJSONObject: plist, options: [.prettyPrinted]) {
+            if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
                 try? data.write(to: URL(fileURLWithPath: launchAgentPath))
             }
         }
-        rebuildMenu()
     }
 
     @objc func quit() {
@@ -400,7 +665,16 @@ func menuItemWithView(_ view: NSView) -> NSMenuItem {
 
 
 func spacerView(height: CGFloat) -> NSView {
-    NSView(frame: NSRect(x: 0, y: 0, width: 1, height: height))
+    NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: height))
+}
+
+// centered wraps a card in a full menu-width container so NSMenu cannot
+// pin it to the left edge. Equal edgeInset on both sides.
+func centered(_ card: NSView, verticalPadding: CGFloat = 0) -> NSView {
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: card.frame.height + 2 * verticalPadding))
+    card.frame.origin = NSPoint(x: (menuWidth - card.frame.width) / 2, y: verticalPadding)
+    container.addSubview(card)
+    return container
 }
 
 let app = NSApplication.shared

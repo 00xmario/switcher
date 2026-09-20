@@ -36,6 +36,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/login/{state}", a.handleLoginPoll)
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
+	mux.HandleFunc("POST /api/usage/refresh", a.handleRefreshAll)
 	mux.HandleFunc("POST /api/accounts", a.handleAddKey)
 	mux.HandleFunc("POST /api/accounts/{id}/use-reset", a.handleUseReset)
 	mux.HandleFunc("POST /api/update", a.handleUpdate)
@@ -267,6 +268,13 @@ func (a *API) handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "active": id})
+}
+
+// handleRefreshAll re-queries usage for every account (manual refresh from
+// the menu bar or web app) and answers with the full state.
+func (a *API) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
+	a.Proxy.RefreshUsageAll(r.Context())
+	a.handleState(w, r)
 }
 
 func (a *API) handleRefreshUsage(w http.ResponseWriter, r *http.Request) {
