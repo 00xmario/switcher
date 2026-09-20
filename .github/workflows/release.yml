@@ -66,8 +66,12 @@ jobs:
           mkdir -p "$STAGE"
           cp -R "build/Switcher.app" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "Switcher $VERSION" -srcfolder "$STAGE" \
-            -ov -format UDZO "dist/Switcher_${VERSION}.dmg"
+          for attempt in 1 2 3; do
+            hdiutil create -volname "Switcher $VERSION" -srcfolder "$STAGE" \
+              -ov -format UDZO "dist/Switcher_${VERSION}.dmg" && break
+            echo "hdiutil attempt $attempt failed; retrying in 5s"
+            sleep 5
+          done
 
       - name: Publish release
         env:
