@@ -47,12 +47,47 @@ struct AppState: Codable {
 let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode"]
 let planNames = ["pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free"]
 
-let inkColor = NSColor(red: 0.13, green: 0.12, blue: 0.11, alpha: 1)
-let dimColor = NSColor(red: 0.48, green: 0.51, blue: 0.55, alpha: 1)
-let accentColor = NSColor(red: 0.25, green: 0.61, blue: 0.44, alpha: 1)
+// Palette mirrors the web app's light and dark tokens (web/style.css).
+// Layer colours cannot be dynamic NSColors, so the menu picks a palette from
+// the effective appearance every time it is rebuilt.
+struct Palette {
+    let ink: NSColor
+    let dim: NSColor
+    let accent: NSColor
+    let surface: NSColor
+    let border: NSColor
+    let hover: NSColor
+    let dark: Bool
+
+    static let light = Palette(
+        ink: NSColor(hex: 0x17191d), dim: NSColor(hex: 0x7a818c), accent: NSColor(hex: 0x2f9e5f),
+        surface: NSColor(hex: 0xffffff), border: NSColor(hex: 0xe4e4e8),
+        hover: NSColor.black.withAlphaComponent(0.05), dark: false)
+    static let dark = Palette(
+        ink: NSColor(hex: 0xe6e8eb), dim: NSColor(hex: 0x9aa3ad), accent: NSColor(hex: 0x3fb96f),
+        surface: NSColor(hex: 0x12151a), border: NSColor(hex: 0x2d3641),
+        hover: NSColor.white.withAlphaComponent(0.06), dark: true)
+
+    static func current() -> Palette {
+        let appearance = NSApp?.effectiveAppearance ?? NSAppearance.currentDrawing()
+        return appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+    }
+}
+
+extension NSColor {
+    convenience init(hex: Int) {
+        self.init(red: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
+            blue: CGFloat(hex & 0xff) / 255, alpha: 1)
+    }
+}
+
+var palette = Palette.current()
+var inkColor: NSColor { palette.ink }
+var dimColor: NSColor { palette.dim }
+var accentColor: NSColor { palette.accent }
+var surfaceColor: NSColor { palette.surface }
+var cardBorderColor: NSColor { palette.border }
 let warnColor = NSColor(red: 0.85, green: 0.64, blue: 0.31, alpha: 1)
-let surfaceColor = NSColor.controlBackgroundColor
-let cardBorderColor = NSColor.systemGray.withAlphaComponent(0.35)
 
 func label(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
     let field = NSTextField(labelWithString: text)
@@ -62,6 +97,12 @@ func label(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
     field.alignment = .left
     return field
 }
+
+let centeredParagraph: NSParagraphStyle = {
+    let style = NSMutableParagraphStyle()
+    style.alignment = .center
+    return style
+}()
 
 func cardView(width: CGFloat, height: CGFloat) -> NSView {
     let card = HoverCard(frame: NSRect(x: 0, y: 0, width: width, height: height))
@@ -79,6 +120,7 @@ func sectionHead(_ providerID: String, contentWidth: CGFloat) -> NSView {
     let logo = NSImageView(frame: NSRect(x: edgeInset, y: 5, width: 22, height: 22))
     logo.imageScaling = .scaleProportionallyUpOrDown
     logo.image = providerLogoImage(providerID)
+    logo.contentTintColor = inkColor
     let name = label(providerNames[providerID] ?? providerID,
         font: NSFont.systemFont(ofSize: 13, weight: .semibold), color: inkColor)
     name.frame = NSRect(x: edgeInset + 22 + 10, y: 8, width: contentWidth - 32, height: 16)
@@ -93,9 +135,31 @@ func providerLogoImage(_ providerID: String) -> NSImage? {
     guard let url = Bundle.main.url(forResource: providerID, withExtension: "svg") else {
         return nil
     }
-    let image = NSImage(contentsOf: url)
-    image?.isTemplate = providerID == "grok"
+    guard let image = NSImage(contentsOf: url) else { return nil }
+    image.isTemplate = providerID == "grok"
+    if providerID == "opencode" && palette.dark {
+        return invertedImage(image, size: NSSize(width: 22, height: 22)) ?? image
+    }
     return image
+}
+
+// invertedImage renders an image and inverts its colours (dark mode
+// counterpart of the web app's CSS invert on the OpenCode mark).
+func invertedImage(_ image: NSImage, size: NSSize) -> NSImage? {
+    let view = NSImageView(frame: NSRect(origin: .zero, size: size))
+    view.image = image
+    view.imageScaling = .scaleProportionallyUpOrDown
+    guard let rep = renderBitmap(view), let cg = rep.cgImage,
+          let filter = CIFilter(name: "CIColorInvert") else { return nil }
+    let input = CIImage(cgImage: cg)
+    filter.setValue(input, forKey: kCIInputImageKey)
+    // Invert colour only; keep the original alpha so transparent areas stay transparent.
+    guard let inverted = filter.outputImage,
+          let masked = CIFilter(name: "CIBlendWithAlphaMask", parameters: [
+              kCIInputImageKey: inverted, kCIInputBackgroundImageKey: CIImage.empty(), kCIInputMaskImageKey: input,
+          ])?.outputImage,
+          let result = CIContext().createCGImage(masked, from: input.extent) else { return nil }
+    return NSImage(cgImage: result, size: size)
 }
 
 // textWidth measures the frame width a label needs for a string, using a
@@ -126,7 +190,7 @@ final class ClickableRow: NSView {
     func setHovered(_ value: Bool) {
         guard value != hovered else { return }
         hovered = value
-        layer?.backgroundColor = value ? NSColor.systemGray.withAlphaComponent(0.10).cgColor : NSColor.clear.cgColor
+        layer?.backgroundColor = value ? palette.hover.cgColor : NSColor.clear.cgColor
         onHover?(value)
     }
 
@@ -423,6 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let contentWidth = menuWidth - 2 * edgeInset
 
         // Header: app icon with name and version beside it, block centered.
+        palette = Palette.current()
         let state = cachedState
         hoverCards = []
         let headerView = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 58))
@@ -486,6 +551,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         webButton.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         webButton.frame = NSRect(x: 0, y: 9, width: buttonWidth, height: 20)
         webButton.alignment = .center
+        webButton.attributedTitle = NSAttributedString(string: webButton.title, attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium), .foregroundColor: inkColor,
+            .paragraphStyle: centeredParagraph])
         webCard.addSubview(webButton)
         actionRow.addSubview(webCard)
         let updateCard = cardView(width: buttonWidth, height: 38)
@@ -496,6 +564,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateButton.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         updateButton.frame = NSRect(x: 0, y: 9, width: buttonWidth, height: 20)
         updateButton.alignment = .center
+        updateButton.attributedTitle = NSAttributedString(string: updateButton.title, attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium), .foregroundColor: inkColor,
+            .paragraphStyle: centeredParagraph])
         updateCard.addSubview(updateButton)
         actionRow.addSubview(updateCard)
         menu.addItem(menuItemWithView(actionRow))
@@ -527,6 +598,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let height = accounts.reduce(CGFloat(0)) { $0 + rowHeight(for: $1) }
         let card = cardView(width: contentWidth, height: height)
         if let hover = card as? HoverCard { hoverCards.append(hover) }
+        // Column widths shared by every row in this card (measured with the
+        // medium weight, the wider of the two title weights).
+        let measureFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let planColumn = accounts
+            .compactMap { $0.plan.flatMap { planNames[$0] } }
+            .map { textWidth("· " + $0, font: measureFont) }.max() ?? 0
+        let emailColumn = accounts.map { textWidth($0.email, font: measureFont) }.max() ?? 0
         var y = height
         for (index, account) in accounts.enumerated() {
             let rowH = rowHeight(for: account)
@@ -539,16 +617,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
 
-            // Email + plan, left aligned at the card inset. Space for the
-            // trailing checkmark is reserved on the right.
+            // Email + plan. Plans sit in one column per card: the email
+            // column is as wide as the widest email that still leaves room
+            // for the widest plan; longer emails truncate with an ellipsis.
             let textX = cardInset
-            let planText = account.plan.flatMap { planNames[$0] }.map { " · " + $0 } ?? ""
+            let planText = account.plan.flatMap { planNames[$0] }.map { "· " + $0 } ?? ""
             let titleFont = NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular)
             let titleColor = account.active ? accentColor : inkColor
             let titleWidth = contentWidth - textX - cardInset - 22
             let titleY = rowH - rowTopPad - titleHeight
-            let planWidth = planText.isEmpty ? 0 : textWidth(planText, font: titleFont)
-            let emailWidth = min(textWidth(account.email, font: titleFont), titleWidth - planWidth)
+            let emailWidth = planColumn > 0 ? min(emailColumn, titleWidth - planColumn - 6) : min(emailColumn, titleWidth)
             let emailField = label(account.email, font: titleFont, color: titleColor)
             emailField.frame = NSRect(x: textX, y: titleY, width: emailWidth, height: titleHeight)
             let email = BlurredLabel(field: emailField)
@@ -556,7 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             row.onHover = { hovering in email.reveal(hovering) }
             if !planText.isEmpty {
                 let plan = label(planText, font: titleFont, color: titleColor)
-                plan.frame = NSRect(x: textX + emailWidth, y: titleY, width: planWidth, height: titleHeight)
+                plan.frame = NSRect(x: textX + emailWidth + 6, y: titleY, width: planColumn, height: titleHeight)
                 row.addSubview(plan)
             }
 
