@@ -221,15 +221,24 @@ html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
 }
 #add-provider-slot .hidden-list.open { display: block; }
 
-.account {
+/* Accounts live inside one shared container per provider, separated by
+   hairline dividers, so the grouping is impossible to miss. */
+.account-list {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 16px;
-  padding: 20px 22px;
-  margin-bottom: 14px;
   box-shadow: var(--shadow);
+  overflow: hidden;
 }
-.account.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset, var(--shadow); }
+.account {
+  padding: 20px 22px;
+  border-bottom: 1px solid var(--border);
+}
+.account:last-child { border-bottom: 0; }
+.account.active {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 
 .account-head {
   display: flex;

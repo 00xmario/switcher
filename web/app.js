@@ -205,7 +205,9 @@ function render() {
             <button data-menu="${providerID}" title="Provider options">⋯</button>
           </span>
         </div>
-        ${accounts.length ? accounts.map(accountHTML).join('') : `<div class="unknown">No accounts yet.</div>`}
+        <div class="account-list">
+          ${accounts.length ? accounts.map(accountHTML).join('') : `<div class="unknown">No accounts yet.</div>`}
+        </div>
       </section>`;
   });
   providersEl.innerHTML = html;
