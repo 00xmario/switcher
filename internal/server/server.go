@@ -11,12 +11,15 @@ import (
 	"strings"
 	"time"
 
+	"net/url"
+	"strconv"
 	"switcher/internal/login"
 	"switcher/internal/provider"
 	"switcher/internal/proxy"
 	"switcher/internal/store"
 	"switcher/internal/update"
 	"switcher/internal/usage"
+	"sync"
 )
 
 // API wraps the JSON API the web UI talks to.
@@ -29,10 +32,23 @@ type API struct {
 	Version       string
 	Updater       *update.Checker
 	Usage         *usage.Service
+
+	creditsMu    sync.Mutex
+	creditsCache map[string]creditsEntry
 }
 
-// Register mounts the API on the given mux.
+type creditsEntry struct {
+	credits []provider.ResetCredit
+	ok      bool
+	at      time.Time
+}
+
+// Register mounts the API on the given mux, initialising the lazily
+// allocated caches first.
 func (a *API) Register(mux *http.ServeMux) {
+	if a.creditsCache == nil {
+		a.creditsCache = map[string]creditsEntry{}
+	}
 	mux.HandleFunc("GET /api/state", a.handleState)
 	mux.HandleFunc("POST /api/login", a.handleLoginStart)
 	mux.HandleFunc("GET /api/login/{state}", a.handleLoginPoll)
@@ -61,13 +77,17 @@ func LocalOnly(port int, next http.Handler) http.Handler {
 			http.Error(w, "switcher only accepts local connections", http.StatusForbidden)
 			return
 		}
+		// Browser-initiated requests always carry Sec-Fetch-Site. The CLIs
+		// send none, so their traffic stays exempt. A cross-site GET would
+		// be unreadable cross-origin, but it would still spend the user's
+		// subscription on an authenticated upstream call, so it is rejected.
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+			http.Error(w, "cross-site requests are not allowed", http.StatusForbidden)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if origin := r.Header.Get("Origin"); origin != "" && !isLocalOrigin(origin, port) {
 				http.Error(w, "cross-origin requests are not allowed", http.StatusForbidden)
-				return
-			}
-			if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
-				http.Error(w, "cross-site requests are not allowed", http.StatusForbidden)
 				return
 			}
 		}
@@ -83,10 +103,19 @@ func isLocalHost(host string, port int) bool {
 	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
 }
 
+// isLocalOrigin parses the origin and requires a loopback host on the
+// server's own port; any-port localhost origins are rejected.
 func isLocalOrigin(origin string, port int) bool {
-	origin = strings.ToLower(origin)
-	return strings.HasPrefix(origin, "http://127.0.0.1:") ||
-		strings.HasPrefix(origin, "http://localhost:")
+	u, err := url.Parse(strings.ToLower(origin))
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return false
+	}
+	portText := u.Port()
+	return portText == strconv.Itoa(port)
 }
 
 // accountView is the API representation of one account, including the
@@ -113,9 +142,11 @@ type resetCreditsView struct {
 func (a *API) viewOf(acc store.Account) accountView {
 	v := viewOfBase(a, acc)
 	// Providers with banked resets report how many are available so the UI
-	// can offer spending one.
+	// can offer spending one. The upstream call is TTL-cached: /api/state
+	// is polled every few seconds and must never make the request path
+	// wait on chatgpt.com.
 	if rc, ok := a.Providers[acc.Provider].(provider.ResetCreditProvider); ok {
-		if credits, err := rc.ListResetCredits(context.Background(), acc); err == nil && len(credits) > 0 {
+		if credits, ok := a.cachedResetCredits(rc, acc); ok && len(credits) > 0 {
 			v.ResetCredits = &resetCreditsView{
 				Count:         len(credits),
 				NextID:        credits[0].ID,
@@ -124,6 +155,28 @@ func (a *API) viewOf(acc store.Account) accountView {
 		}
 	}
 	return v
+}
+
+// resetCreditsTTL is how long a banked-reset count stays fresh.
+const resetCreditsTTL = 2 * time.Minute
+
+// cachedResetCredits serves reset credits from cache and refreshes them in
+// the background when stale. Errors keep the last known value.
+func (a *API) cachedResetCredits(rc provider.ResetCreditProvider, acc store.Account) ([]provider.ResetCredit, bool) {
+	a.creditsMu.Lock()
+	entry, ok := a.creditsCache[acc.ID]
+	fresh := ok && time.Since(entry.at) < resetCreditsTTL
+	a.creditsMu.Unlock()
+	if fresh {
+		return entry.credits, entry.ok
+	}
+	go func() {
+		credits, err := rc.ListResetCredits(context.Background(), acc)
+		a.creditsMu.Lock()
+		a.creditsCache[acc.ID] = creditsEntry{credits: credits, ok: err == nil, at: time.Now()}
+		a.creditsMu.Unlock()
+	}()
+	return entry.credits, entry.ok
 }
 
 func viewOfBase(a *API, acc store.Account) accountView {
@@ -179,7 +232,7 @@ func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Provider string `json:"provider"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
@@ -211,7 +264,7 @@ func (a *API) handleAddKey(w http.ResponseWriter, r *http.Request) {
 		Provider string `json:"provider"`
 		Key      string `json:"key"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
@@ -381,7 +434,7 @@ func (a *API) handleProviderOrder(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Order []string `json:"order"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}

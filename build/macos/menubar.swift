@@ -463,6 +463,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !FileManager.default.fileExists(atPath: logDir + "/server.log") {
             FileManager.default.createFile(atPath: logDir + "/server.log", contents: nil)
         }
+        // The log contains account emails; keep it user-only.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logDir + "/server.log")
         let process = Process()
         process.executableURL = server
         process.arguments = ["--port", "8787"]

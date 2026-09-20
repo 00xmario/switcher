@@ -157,7 +157,10 @@ func run(port int) {
 	// Each provider with a browser redirect has its own callback listener;
 	// the ports are fixed by the OAuth clients' registered redirect URIs.
 	callbackMux := http.NewServeMux()
+	// Codex registers /auth/callback, Claude /callback; both complete the
+	// same flow, so both paths are served on both listeners.
 	callbackMux.HandleFunc("GET /auth/callback", callbackHandler(logins))
+	callbackMux.HandleFunc("GET /callback", callbackHandler(logins))
 	for _, port := range []int{config.CallbackPort, config.ClaudeCallbackPort} {
 		go serveCallback(callbackMux, port)
 	}
@@ -193,7 +196,16 @@ func run(port int) {
 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	log.Printf("Switcher v%s running: http://127.0.0.1:%d (codex proxy on the same port under /v1)", version, port)
-	if err := http.ListenAndServe(addr, server.LocalOnly(port, mux)); err != nil {
+	// Timeouts: slowloris from any local process should not hold
+	// goroutines and FDs forever. No WriteTimeout: proxied streaming
+	// responses (SSE) may legitimately stay open for minutes.
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           server.LocalOnly(port, mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 )
 
 // Token set returned by an OAuth login or a refresh.
@@ -51,6 +52,11 @@ var ErrNotFound = errors.New("account not found")
 type Store struct {
 	accountsDir string
 	statePath   string
+
+	listMu          sync.Mutex
+	listCache       []Account
+	listMtime       int64
+	listFilesNewest int64
 }
 
 // New creates a Store rooted at the given directory: accounts live in
@@ -63,13 +69,36 @@ func New(root string) *Store {
 
 // List returns every stored account sorted by email.
 func (s *Store) List() ([]Account, error) {
-	entries, err := os.ReadDir(s.accountsDir)
+	info, err := os.Stat(s.accountsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("list accounts: %w", err)
 	}
+	// The proxy hot path and the state poll call List on every request;
+	// re-decoding every account file each time serialises traffic behind
+	// disk reads, so the decoded list is cached until the directory or any
+	// file in it changes.
+	mtime := info.ModTime().UnixNano()
+	entries, _ := os.ReadDir(s.accountsDir)
+	var newest int64
+	for _, e := range entries {
+		if fi, err := e.Info(); err == nil {
+			if t := fi.ModTime().UnixNano(); t > newest {
+				newest = t
+			}
+		}
+	}
+	s.listMu.Lock()
+	if s.listCache != nil && s.listMtime == mtime && s.listFilesNewest == newest {
+		out := make([]Account, len(s.listCache))
+		copy(out, s.listCache)
+		s.listMu.Unlock()
+		return out, nil
+	}
+	s.listMu.Unlock()
+
 	var out []Account
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) != ".json" {
@@ -85,11 +114,35 @@ func (s *Store) List() ([]Account, error) {
 		out = append(out, a)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Email < out[j].Email })
-	return out, nil
+	s.listMu.Lock()
+	s.listCache = out
+	s.listMtime = mtime
+	s.listFilesNewest = newest
+	s.listMu.Unlock()
+	result := make([]Account, len(out))
+	copy(result, out)
+	return result, nil
+}
+
+// validIDCharacter rejects path separators and anything unexpected so
+// account ids straight from any API cannot traverse the accounts dir.
+func validIDCharacter(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // Get returns one account by ID.
 func (s *Store) Get(id string) (Account, error) {
+	if !validIDCharacter(id) {
+		return Account{}, fmt.Errorf("invalid account id %q", id)
+	}
 	var a Account
 	if err := readJSON(s.accountPath(id), &a); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -102,6 +155,7 @@ func (s *Store) Get(id string) (Account, error) {
 
 // Save writes an account atomically.
 func (s *Store) Save(a Account) error {
+	defer s.invalidateList()
 	if a.ID == "" {
 		return errors.New("save account: empty id")
 	}
@@ -115,6 +169,7 @@ func (s *Store) Save(a Account) error {
 // Delete removes an account file. Removing a non-existent account is not an
 // error so callers can treat delete as idempotent.
 func (s *Store) Delete(id string) error {
+	defer s.invalidateList()
 	if err := os.Remove(s.accountPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("delete account: %w", err)
 	}
@@ -207,4 +262,12 @@ func writeAtomic(path string, raw []byte, mode os.FileMode) error {
 		return fmt.Errorf("rename %s: %w", filepath.Base(path), err)
 	}
 	return nil
+}
+
+// invalidateList drops the decoded account cache so the next List re-reads.
+func (s *Store) invalidateList() {
+	s.listMu.Lock()
+	s.listMtime = 0
+	s.listFilesNewest = 0
+	s.listMu.Unlock()
 }

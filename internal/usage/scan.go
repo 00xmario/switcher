@@ -101,8 +101,8 @@ func LoadScanCache(path string) *ScanCache {
 // Save writes the cache when something changed.
 func (c *ScanCache) Save() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.dirty {
+		c.mu.Unlock()
 		return
 	}
 	// Retention: entries whose source file has not been touched in 90 days
@@ -113,25 +113,19 @@ func (c *ScanCache) Save() {
 			delete(c.Files, key)
 		}
 	}
-	data, err := json.Marshal(c)
-	if err != nil {
-		return
-	}
-	tmp := c.path + ".tmp"
-	if os.WriteFile(tmp, data, 0o644) == nil {
-		_ = os.Rename(tmp, c.path)
-	}
 	c.dirty = false
-}
-
-// prune drops entries older than the retention horizon.
-func (c *ScanCache) prune(olderThan time.Time) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for k, v := range c.Files {
-		if time.Unix(0, v.MtimeNs).Before(olderThan) {
-			delete(c.Files, k)
-			c.dirty = true
+	// Marshal a snapshot outside the lock so scans never stall behind the
+	// multi-megabyte encode.
+	snapshot := ScanCache{Version: c.Version, Files: make(map[string]cachedFile, len(c.Files))}
+	for key, entry := range c.Files {
+		snapshot.Files[key] = entry
+	}
+	c.mu.Unlock()
+	data, err := json.Marshal(&snapshot)
+	if err == nil {
+		tmp := c.path + ".tmp"
+		if os.WriteFile(tmp, data, 0o644) == nil {
+			_ = os.Rename(tmp, c.path)
 		}
 	}
 }
@@ -185,6 +179,9 @@ func scanSource(src Source, opt scanOptions, cache *ScanCache, sink recordSink) 
 // guardBytes is how many bytes before the resume offset are hashed to detect
 // files that changed underneath us.
 const guardBytes = 64
+
+// maxLineBytes caps per-line memory during scans.
+const maxLineBytes = 8 << 20
 
 func scanFile(src Source, path string, info os.FileInfo, cache *ScanCache, sink recordSink) {
 	key := path
@@ -268,6 +265,12 @@ func scanFile(src Source, path string, info os.FileInfo, cache *ScanCache, sink 
 	reader := bufio.NewReaderSize(f, 256*1024)
 	for {
 		lineBytes, readErr := reader.ReadBytes('\n')
+		if len(lineBytes) > maxLineBytes {
+			// Absurdly long lines (base64 dumps) can never carry usage;
+			// drop the bytes instead of buffering line-sized allocations
+			// per window.
+			lineBytes = nil
+		}
 		if len(lineBytes) > 0 {
 			complete := lineBytes[len(lineBytes)-1] == '\n'
 			if complete {

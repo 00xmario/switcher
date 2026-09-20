@@ -238,13 +238,9 @@ async function refreshAllUsage() {
   await refreshState();
 }
 
-function scheduleUsage() {
-  clearTimeout(usageTimer);
-  usageTimer = setTimeout(async () => {
-    await refreshAllUsage();
-    scheduleUsage();
-  }, 60000);
-}
+// The server already refreshes every account's usage every 60s in the
+// background; the web app no longer duplicates that polling.
+function scheduleUsage() {}
 
 /* ---------- provider menus ---------- */
 
@@ -980,13 +976,6 @@ function niceCeil(v) {
   const f = v / exp;
   const nice = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
   return nice * exp;
-}
-
-function fmtAxis(v) {
-  if (v >= 1e9) return '$' + sigDigits(v, 3) + 'B';
-  if (v >= 1e6) return '$' + sigDigits(v, 3) + 'M';
-  if (v >= 1e3) return '$' + sigDigits(v, 3) + 'K';
-  return '$' + sigDigits(v, 3);
 }
 
 /* ---------- breakdown table ---------- */

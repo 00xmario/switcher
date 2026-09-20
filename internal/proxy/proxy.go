@@ -21,6 +21,7 @@ import (
 
 	"switcher/internal/provider"
 	"switcher/internal/store"
+	"sync/atomic"
 )
 
 // maxBodyBytes caps how much of a request body is buffered so a retry can
@@ -46,6 +47,8 @@ type Manager struct {
 	active        map[string]string // provider -> active account id
 	exhausted     map[string]time.Time
 	lastUsage     map[string]provider.Usage
+	syncing       atomic.Bool
+	refreshing    map[string]*sync.Mutex
 	order         []string // display order of provider sections
 	hidden        []string // providers dismissed from the UI
 	managementKey string   // hub management key, kept in state.json
@@ -254,31 +257,86 @@ func (m *Manager) LastUsage(id string) (provider.Usage, bool) {
 // background sync so the UI and menu bar always read fresh data without
 // depending on a client to trigger refreshes).
 func (m *Manager) RefreshUsageAll(ctx context.Context) {
+	// In-flight guard: overlapping cycles (slow upstream, overlapping
+	// callers) would duplicate every upstream call.
+	if !m.syncing.CompareAndSwap(false, true) {
+		return
+	}
+	defer m.syncing.Store(false)
 	accounts, err := m.store.List()
 	if err != nil {
 		return
 	}
+	type job struct {
+		prov    provider.Provider
+		account store.Account
+	}
+	jobs := []job{}
 	for _, account := range accounts {
-		prov, ok := m.providers[account.Provider]
-		if !ok {
-			continue
+		if prov, ok := m.providers[account.Provider]; ok {
+			jobs = append(jobs, job{prov: prov, account: account})
 		}
-		if prov.IsExpired(account) {
-			if err := prov.Refresh(ctx, &account); err == nil {
-				_ = m.store.Save(account)
+	}
+	// Parallel with a small pool: each account is one upstream call.
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j job) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			m.refreshAccount(ctx, j.prov, j.account)
+		}(j)
+	}
+	wg.Wait()
+}
+
+// refreshAccount refreshes the token if needed and polls usage for one
+// account. Serialised per account: the 60s background sync, the proxy's
+// 401 path, and a manual refresh can otherwise interleave and persist a
+// stale rotating refresh token, bricking the account.
+func (m *Manager) refreshAccount(ctx context.Context, prov provider.Provider, account store.Account) {
+	perAccount := m.refreshLock(account.ID)
+	perAccount.Lock()
+	defer perAccount.Unlock()
+
+	// Re-read: another path may have refreshed the token meanwhile.
+	if fresh, err := m.store.Get(account.ID); err == nil {
+		account = fresh
+	}
+	if prov.IsExpired(account) {
+		if err := prov.Refresh(ctx, &account); err == nil {
+			if err := m.store.Save(account); err != nil {
+				log.Printf("proxy: save refreshed token for %s: %v", account.Email, err)
 			}
 		}
-		usage, uerr := prov.Usage(ctx, account)
-		if uerr != nil {
-			// Keep the last good snapshot: a single failed poll must not
-			// blank out usage the UI was showing a minute ago.
-			log.Printf("proxy: usage sync for %s (%s) failed, keeping last value: %v", account.Email, account.Provider, uerr)
-			continue
-		}
-		m.mu.Lock()
-		m.lastUsage[account.ID] = usage
-		m.mu.Unlock()
 	}
+	usage, uerr := prov.Usage(ctx, account)
+	if uerr != nil {
+		// Keep the last good snapshot: a single failed poll must not
+		// blank out usage the UI was showing a minute ago.
+		log.Printf("proxy: usage sync for %s (%s) failed, keeping last value: %v", account.Email, account.Provider, uerr)
+		return
+	}
+	m.mu.Lock()
+	m.lastUsage[account.ID] = usage
+	m.mu.Unlock()
+}
+
+// refreshLock returns the per-account refresh mutex.
+func (m *Manager) refreshLock(id string) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.refreshing == nil {
+		m.refreshing = map[string]*sync.Mutex{}
+	}
+	mu, ok := m.refreshing[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		m.refreshing[id] = mu
+	}
+	return mu
 }
 
 // RefreshUsage queries upstream usage for one account, best effort, and
@@ -290,6 +348,14 @@ func (m *Manager) RefreshUsage(ctx context.Context, a store.Account) provider.Us
 	prov, ok := m.providers[a.Provider]
 	if !ok {
 		return provider.Usage{}
+	}
+	// Serialise per account so a manual refresh cannot interleave with the
+	// background sync and persist a stale rotating refresh token.
+	perAccount := m.refreshLock(a.ID)
+	perAccount.Lock()
+	defer perAccount.Unlock()
+	if fresh, err := m.store.Get(a.ID); err == nil {
+		a = fresh
 	}
 	refresh := func() bool {
 		if err := prov.Refresh(ctx, &a); err != nil {
@@ -603,28 +669,6 @@ func copyResponseStatus(w http.ResponseWriter, status int, body []byte, header h
 	if len(body) > 0 {
 		_, _ = w.Write(body)
 	}
-}
-
-// classifyUsageLimit reads a 429 response body once and reports whether it
-// is a usage-limit exhaustion (the switch trigger) and, if so, when the
-// upstream says usage resets.
-func classifyUsageLimit(resp *http.Response) (resetsAt int64, isLimit bool) {
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, false
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(raw))
-	var parsed usageLimitBody
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return 0, false
-	}
-	if parsed.Error.Type != "usage_limit_reached" {
-		return 0, false
-	}
-	if parsed.Error.ResetsAt <= 0 {
-		return time.Now().Add(time.Hour).Unix(), true
-	}
-	return parsed.Error.ResetsAt, true
 }
 
 // drain reads and discards a response we will not forward.

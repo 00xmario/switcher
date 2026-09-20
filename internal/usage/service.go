@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 )
@@ -121,6 +120,3 @@ func (s *Service) RefreshStale(windows []int, olderThan time.Duration) []int {
 	}
 	return refreshed
 }
-
-// Sort helpers used by the API layer.
-func SortStrings(v []string) { sort.Strings(v) }

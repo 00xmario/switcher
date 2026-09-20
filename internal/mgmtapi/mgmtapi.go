@@ -20,6 +20,8 @@ import (
 	"strings"
 	"time"
 
+	"crypto/subtle"
+	"fmt"
 	"switcher/internal/login"
 	"switcher/internal/proxy"
 	"switcher/internal/store"
@@ -58,12 +60,26 @@ func (a *API) authGuard(next http.HandlerFunc) http.HandlerFunc {
 		if got == "" {
 			got = r.Header.Get("X-Management-Key")
 		}
-		if got == "" || got != a.ManagementKey {
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(a.ManagementKey)) != 1 {
 			http.Error(w, "management key required", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
 	}
+}
+
+// validAuthIndex accepts only plain account ids: path traversal in the
+// store file names is impossible through the hub surface.
+func validAuthIndex(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // handleAuthFiles lists every stored account in CLIProxyAPI's shape. T3
@@ -120,7 +136,7 @@ var allowedControlPlaneHosts = map[string]bool{
 
 func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 	var req apiCallRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
 		return
 	}
@@ -138,6 +154,10 @@ func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !validAuthIndex(req.AuthIndex) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid auth_index"})
+		return
+	}
 	account, err := a.Store.Get(req.AuthIndex)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown auth_index"})
@@ -145,6 +165,9 @@ func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	method := req.Method
+	if method == "" {
+		method = http.MethodGet
+	}
 	if method == "" {
 		method = http.MethodGet
 	}
@@ -162,7 +185,27 @@ func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 		httpReq.Header.Set(key, strings.ReplaceAll(value, "$TOKEN$", token))
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	// Redirects re-validate the allowlist, and headers that carried the
+	// account token are stripped on any cross-host hop so the token can
+	// never leak to a host the allowlist did not bless.
+	tokenHeaderNames := []string{}
+	for key, value := range req.Header {
+		if strings.Contains(value, "$TOKEN$") {
+			tokenHeaderNames = append(tokenHeaderNames, key)
+		}
+	}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) > 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		if !allowedControlPlaneHosts[strings.ToLower(req.URL.Hostname())] {
+			return fmt.Errorf("redirect host %s is not allowed", req.URL.Hostname())
+		}
+		for _, name := range tokenHeaderNames {
+			req.Header.Del(name)
+		}
+		return nil
+	}}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream request failed"})
@@ -185,8 +228,8 @@ func (a *API) handleResetQuota(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AuthIndex string `json:"auth_index"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AuthIndex == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "auth_index is required"})
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil || !validAuthIndex(req.AuthIndex) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid auth_index"})
 		return
 	}
 	account, err := a.Store.Get(req.AuthIndex)

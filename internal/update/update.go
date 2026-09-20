@@ -4,17 +4,23 @@
 package update
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -32,21 +38,28 @@ type State struct {
 type Checker struct {
 	Current string
 
-	mu        sync.Mutex
-	latest    string
-	lastCheck time.Time
+	mu         sync.Mutex
+	latest     string
+	lastCheck  time.Time
+	refreshing atomic.Bool
 }
+
+// validTag accepts only release tags of the form vX.Y.Z so a hostile
+// release tag can never be interpreted by gh as a flag.
+var validTag = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+$`)
 
 // New creates a checker for the running version.
 func New(current string) *Checker { return &Checker{Current: current} }
 
-// State reports the cached check, refreshing it if the cache is stale.
+// State reports the cached check. A stale cache never blocks the caller:
+// a background refresh is triggered instead, so the request path stays
+// free of network and subprocess work.
 func (c *Checker) State() State {
 	c.mu.Lock()
 	stale := time.Since(c.lastCheck) > 6*time.Hour
 	c.mu.Unlock()
-	if stale || c.latest == "" {
-		c.Refresh()
+	if stale {
+		go c.RefreshOnce()
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -54,13 +67,27 @@ func (c *Checker) State() State {
 	return State{Latest: latest, Available: latest != "" && compare(latest, c.Current) > 0}
 }
 
+// RefreshOnce coalesces concurrent refreshes into one.
+func (c *Checker) RefreshOnce() {
+	if !c.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.refreshing.Store(false)
+	c.Refresh()
+}
+
 // Refresh re-reads the latest version: the gh CLI first (it already holds
 // GitHub credentials on this machine), then the raw VERSION file, which
 // works once the repository is public.
 func (c *Checker) Refresh() {
 	tag := ""
-	if out, err := exec.Command("gh", "api", "repos/"+Repo+"/releases/latest", "--jq", ".tag_name").Output(); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "gh", "api", "repos/"+Repo+"/releases/latest", "--jq", ".tag_name").Output(); err == nil {
 		tag = strings.TrimSpace(string(out))
+	}
+	if !validTag.MatchString(tag) {
+		tag = ""
 	}
 	if tag == "" {
 		resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(
@@ -131,17 +158,36 @@ func (c *Checker) InstallAndRestart() error {
 	if tag == "" {
 		return errors.New("no update known; check for updates first")
 	}
+	if !validTag.MatchString(tag) {
+		return fmt.Errorf("refusing to install malformed release tag %q", tag)
+	}
 	latest := strings.TrimPrefix(tag, "v")
 	asset := fmt.Sprintf("switcher-server_%s_%s_%s", latest, runtime.GOOS, runtime.GOARCH)
 	dir, err := os.MkdirTemp("", "switcher-update-")
 	if err != nil {
 		return fmt.Errorf("prepare download: %w", err)
 	}
-	if out, err := exec.Command("gh", "release", "download", tag,
-		"--repo", Repo, "--pattern", asset, "--dir", dir).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "gh", "release", "download", tag,
+		"--repo", Repo, "--pattern", asset, "--pattern", asset+".sha256",
+		"--dir", dir).CombinedOutput(); err != nil {
 		return fmt.Errorf("download release: %s (%v)", strings.TrimSpace(string(out)), err)
 	}
 	binaryPath := filepath.Join(dir, asset)
+
+	// Integrity: the release ships a sha256 for the binary; a mismatch
+	// aborts the swap.
+	if expected, err := os.ReadFile(binaryPath + ".sha256"); err == nil {
+		want := strings.Fields(string(expected))
+		if len(want) > 0 {
+			if sum, err := sha256sum(binaryPath); err != nil || sum != want[0] {
+				return fmt.Errorf("checksum mismatch for %s", asset)
+			}
+		}
+	} else {
+		return fmt.Errorf("download incomplete: missing %s.sha256", asset)
+	}
 
 	// The exec bit: downloaded files are not executable.
 	if err := os.Chmod(binaryPath, 0o755); err != nil {
@@ -179,4 +225,18 @@ func (c *Checker) InstallAndRestart() error {
 	log.Printf("update: installed %s, restarting", latest)
 	time.Sleep(300 * time.Millisecond) // let the HTTP response flush
 	return syscall.Exec(current, os.Args, os.Environ())
+}
+
+// sha256sum hex-digests a file.
+func sha256sum(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
