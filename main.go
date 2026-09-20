@@ -12,6 +12,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -22,6 +23,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"switcher/internal/codexcfg"
 	"switcher/internal/config"
@@ -121,6 +123,16 @@ func run(port int) {
 
 	updater := update.New(version)
 
+	// Background usage sync: the server owns freshness, so the web UI and
+	// the menu bar always agree without waiting for a client to poll.
+	go func() {
+		proxyManager.RefreshUsageAll(context.Background())
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			proxyManager.RefreshUsageAll(context.Background())
+		}
+	}()
 	api := &server.API{
 		Store: st, Logins: logins, Proxy: proxyManager, Providers: providers,
 		ManagementKey: managementKey, Version: version, Updater: updater,

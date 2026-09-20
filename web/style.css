@@ -96,13 +96,7 @@ body {
   overflow: hidden;
   color: var(--accent);
 }
-.brand-mark svg, .brand-mark img { width: 40px; height: 40px; display: block; border-radius: 11px; }
-/* The ink logo inverts to ivory in dark theme so it stays chic everywhere. */
-html[data-theme="dark"] .brand-mark img,
-html[data-theme="system"] .brand-mark img { filter: invert(1) brightness(1.15); }
-@media (prefers-color-scheme: dark) {
-  html[data-theme="system"] .brand-mark img { filter: invert(1) brightness(1.15); }
-}
+.brand-mark svg { width: 40px; height: 40px; display: block; border-radius: 11px; background: var(--accent); }
 h1 { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.02em; }
 
 .top-actions { display: flex; align-items: center; gap: 10px; }

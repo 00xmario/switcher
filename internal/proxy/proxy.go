@@ -236,6 +236,34 @@ func (m *Manager) LastUsage(id string) (provider.Usage, bool) {
 	return u, ok
 }
 
+// RefreshUsageAll refreshes usage for every stored account (used by the
+// background sync so the UI and menu bar always read fresh data without
+// depending on a client to trigger refreshes).
+func (m *Manager) RefreshUsageAll(ctx context.Context) {
+	accounts, err := m.store.List()
+	if err != nil {
+		return
+	}
+	for _, account := range accounts {
+		prov, ok := m.providers[account.Provider]
+		if !ok {
+			continue
+		}
+		if prov.IsExpired(account) {
+			if err := prov.Refresh(ctx, &account); err == nil {
+				_ = m.store.Save(account)
+			}
+		}
+		usage, uerr := prov.Usage(ctx, account)
+		if uerr != nil {
+			usage = provider.Usage{}
+		}
+		m.mu.Lock()
+		m.lastUsage[account.ID] = usage
+		m.mu.Unlock()
+	}
+}
+
 // RefreshUsage queries upstream usage for one account, best effort, and
 // remembers the result for the UI. The token is refreshed first when the
 // expiry says so, and once more on any usage failure: stored expiry

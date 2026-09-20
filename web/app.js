@@ -612,14 +612,6 @@ document.addEventListener('click', (event) => {
 
 /* ---------- boot ---------- */
 
-// Prefer the generated PNG logo when it exists (scripts/generate-logo.py);
-// the inline vector badge remains the fallback.
-fetch('/logo.png', { method: 'HEAD' }).then(res => {
-  if (!res.ok) return;
-  const mark = document.querySelector('.brand-mark');
-  if (mark) mark.innerHTML = `<img src="logo.png" alt="">`;
-});
-
 refreshState().then(refreshAllUsage);
 scheduleUsage();
 setInterval(refreshState, 4000);
