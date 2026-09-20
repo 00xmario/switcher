@@ -309,6 +309,11 @@ function renderAddProviderMenu() {
 
 /* ---------- actions ---------- */
 
+document.getElementById('update-slot').addEventListener('click', (event) => {
+  const updateBtn = event.target.closest('button[data-act="install-update"]');
+  if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
+});
+
 providersEl.addEventListener('click', async (event) => {
   // Emails are blurred for shoulder-surfing privacy; clicking one toggles
   // a sticky reveal.
@@ -320,11 +325,6 @@ providersEl.addEventListener('click', async (event) => {
   const menuBtn = event.target.closest('button[data-menu]');
   if (menuBtn) {
     openProviderMenu(menuBtn, menuBtn.dataset.menu);
-    return;
-  }
-  if (event.target.closest('#update-slot')) {
-    const updateBtn = event.target.closest('button[data-act="install-update"]');
-    if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
     return;
   }
   const button = event.target.closest('button[data-act]');
@@ -399,6 +399,11 @@ providersEl.addEventListener('dragover', (event) => {
   const box = target.getBoundingClientRect();
   const before = event.clientY < box.top + box.height / 2;
   target.parentNode.insertBefore(dragged, before ? target : target.nextSibling);
+});
+
+document.getElementById('update-slot').addEventListener('click', (event) => {
+  const updateBtn = event.target.closest('button[data-act="install-update"]');
+  if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
 });
 
 providersEl.addEventListener('click', async (event) => {
@@ -629,10 +634,9 @@ async function runUpdateFlow(button) {
   button.textContent = 'Installing...';
   banner.classList.add('updating');
   try {
-    await fetch('/api/update', { method: 'POST' });
-    // The server downloads, swaps, and exec-restarts: it answers fast, then
-    // becomes briefly unreachable. Poll until the version changes or we
-    // give up.
+    // The server downloads, swaps, and exec-restarts: the response often
+    // never arrives. Fire the request, then poll for the version change.
+    fetch('/api/update', { method: 'POST' }).catch(() => {});
     const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 1500));
@@ -730,6 +734,11 @@ async function loadUsage() {
   usageState.loading = true;
   try {
     const res = await fetch(`/api/tokens?days=${usageState.days}`);
+    if (!res.ok && res.status !== 202) {
+      usageHeadline.textContent = 'Usage unavailable';
+      usageSub.textContent = 'The usage service could not answer this request.';
+      return;
+    }
     const body = await res.json();
     if (body.summary) {
       usageState.summary = body.summary;
@@ -752,7 +761,7 @@ async function loadUsage() {
 function sigRound(n, figs) {
   if (n === 0) return 0;
   const mag = Math.floor(Math.log10(Math.abs(n)));
-  const factor = Math.pow(10, figs - 1 - mag);
+  const factor = Math.pow(10, mag - (figs - 1));
   return Math.round(n / factor) * factor;
 }
 
@@ -908,7 +917,7 @@ function renderChart(s, isCost) {
     const line = smooth(pts);
     if (p === topProvider) {
       const area = `${line} L${xAt(days.length - 1)},${yBase} L${xAt(0)},${yBase} Z`;
-      svg += `<path class="chart-line ${p}" d="${area}" stroke="var(--chart-1)" stroke-width="2.6"/>`;
+      svg += `<path class="chart-area ${p}" d="${area}" stroke="var(--chart-1)" stroke-width="2.6"/>`;
     } else {
       svg += `<path class="chart-line ${p}" d="${line}" fill="none" stroke-width="2.2"/>`;
     }
@@ -991,7 +1000,7 @@ function renderBreakdown(s, isCost) {
       html += `<tr>
         <td><span class="model-name"><span class="logo">${LOGOS[m.provider] || ''}</span>${escapeHTML(m.model)}</span></td>
         <td>${costCell}</td>
-        <td class="${m.unpriced ? 'dim-cell' : ''}">${m.unpriced ? '&mdash;' : fmtPct(m.share)}</td>
+        <td class="${m.unpriced ? 'dim-cell' : ''}">${m.unpriced ? 'n/a' : fmtPct(m.share)}</td>
         <td class="dim-cell">${fmtTokens(m.tokens)}</td>
       </tr>`;
     }

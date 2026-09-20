@@ -266,9 +266,12 @@ func parseGrokLine(line []byte) []*Record {
 		return nil
 	}
 	u := root.Params.Update.Usage
-	tsMs := int64From(root.Params.Meta.AgentTimestampMs)
-	if tsMs <= 0 {
-		tsMs = int64(root.Timestamp) * 1000
+	tsMs := int64(0)
+	if meta := root.Params.Meta; meta != nil {
+		tsMs = int64From(meta.AgentTimestampMs)
+	}
+	if tsMs <= 0 && root.Timestamp > 0 {
+		tsMs = int64(root.Timestamp)
 		if tsMs <= 1_000_000_000_000 { // seconds, not ms
 			tsMs *= 1000
 		}

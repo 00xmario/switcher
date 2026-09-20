@@ -14,6 +14,9 @@
   --accent-soft: rgba(63, 185, 111, .12);
   --chart-1: #3a3d42;
   --chart-fill: rgba(23, 25, 29, .08);
+  --pill-bg: #17191d;
+  --pill-text: #ffffff;
+  --pill-zero-text: #7a818c;
   --warn: #b45309;
   --danger: #d0483a;
   --bar-fill: #565e69;
@@ -35,9 +38,6 @@ html[data-theme="dark"] {
   --faint: #5f5f5f;
   --accent: #3fb96f;
   --accent-soft: rgba(63, 185, 111, .14);
-  --pill-bg: #3f4145;
-  --pill-text: #ffffff;
-  --pill-zero-text: #a3a3a3;
   --chart-1: #e5e5e5;
   --chart-fill: rgba(255, 255, 255, .07);
   --warn: #d9a44f;
@@ -51,14 +51,14 @@ html[data-theme="dark"] {
 @media (prefers-color-scheme: dark) {
   html[data-theme="system"] {
     color-scheme: dark;
-    --bg: #0b0d10;
-    --surface: #12151a;
-    --surface-2: #181d23;
-    --border: #232a33;
-    --border-strong: #2d3641;
-    --text: #e6e8eb;
-    --dim: #9aa3ad;
-    --faint: #5c6672;
+    --bg: #0a0a0a;
+    --surface: #151515;
+    --surface-2: #1d1d1d;
+    --border: #242424;
+    --border-strong: #2f2f2f;
+    --text: #f5f5f5;
+    --dim: #a3a3a3;
+    --faint: #5f5f5f;
     --accent: #3fb96f;
     --accent-soft: rgba(63, 185, 111, .14);
     --warn: #d9a44f;
@@ -67,6 +67,11 @@ html[data-theme="dark"] {
     --bar-fill-text: #ffffff;
     --bar-track: transparent;
     --shadow: 0 1px 2px rgb(0 0 0 / .3);
+    --chart-1: #e5e5e5;
+    --chart-fill: rgba(255, 255, 255, .07);
+    --pill-bg: #3f4145;
+    --pill-text: #ffffff;
+    --pill-zero-text: #a3a3a3;
   }
 }
 
@@ -679,7 +684,7 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
 .provider-dot.claude { background: #d97757; }
 .provider-dot.grok { background: var(--faint); }
 .provider-dot.opencode { background: var(--accent); }
-.chart-line.codex { stroke: var(--chart-1); fill: var(--chart-fill); }
+.chart-area.codex { stroke: var(--chart-1); fill: var(--chart-fill); }
 .chart-line.claude { stroke: #d97757; fill: none; }
 .chart-line.grok { stroke: var(--faint); fill: none; }
 .chart-line.opencode { stroke: var(--accent); fill: none; }

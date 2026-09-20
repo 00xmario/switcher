@@ -105,6 +105,14 @@ func (c *ScanCache) Save() {
 	if !c.dirty {
 		return
 	}
+	// Retention: entries whose source file has not been touched in 90 days
+	// are dropped so the cache cannot grow without bound.
+	horizon := time.Now().AddDate(0, 0, -90)
+	for key, entry := range c.Files {
+		if time.Unix(0, entry.MtimeNs).Before(horizon) {
+			delete(c.Files, key)
+		}
+	}
 	data, err := json.Marshal(c)
 	if err != nil {
 		return

@@ -108,6 +108,7 @@ func run(port int) {
 		if err := st.SaveState(state); err != nil {
 			log.Fatalf("persist management key: %v", err)
 		}
+		proxyManager.SetManagementKey(managementKey)
 	}
 	// Successful logins persist immediately from the callback goroutine;
 	// the first account of a provider automatically becomes active.

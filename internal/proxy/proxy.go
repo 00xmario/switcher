@@ -40,14 +40,15 @@ type usageLimitBody struct {
 
 // Manager owns the routing state and the forwarding handler.
 type Manager struct {
-	mu        sync.Mutex
-	store     *store.Store
-	providers map[string]provider.Provider
-	active    map[string]string // provider -> active account id
-	exhausted map[string]time.Time
-	lastUsage map[string]provider.Usage
-	order     []string // display order of provider sections
-	hidden    []string // providers dismissed from the UI
+	mu            sync.Mutex
+	store         *store.Store
+	providers     map[string]provider.Provider
+	active        map[string]string // provider -> active account id
+	exhausted     map[string]time.Time
+	lastUsage     map[string]provider.Usage
+	order         []string // display order of provider sections
+	hidden        []string // providers dismissed from the UI
+	managementKey string   // hub management key, kept in state.json
 }
 
 // New loads persisted state and returns the proxy manager.
@@ -85,13 +86,14 @@ func New(st *store.Store, providers map[string]provider.Provider) (*Manager, err
 		}
 	}
 	return &Manager{
-		store:     st,
-		providers: providers,
-		active:    active,
-		exhausted: exhausted,
-		lastUsage: map[string]provider.Usage{},
-		order:     order,
-		hidden:    hidden,
+		store:         st,
+		providers:     providers,
+		active:        active,
+		exhausted:     exhausted,
+		lastUsage:     map[string]provider.Usage{},
+		order:         order,
+		hidden:        hidden,
+		managementKey: state.ManagementKey,
 	}, nil
 }
 
@@ -120,6 +122,18 @@ func (m *Manager) Providers() (order []string, hidden []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.order...), append([]string(nil), m.hidden...)
+}
+
+// SetManagementKey stores the hub key (generated at startup when state
+// has none) so every later persist keeps it in state.json.
+func (m *Manager) SetManagementKey(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if key == "" || m.managementKey == key {
+		return
+	}
+	m.managementKey = key
+	_ = m.persistLocked()
 }
 
 // ReorderProviders sets the display order. Unknown ids are ignored;
@@ -373,6 +387,7 @@ func (m *Manager) persistLocked() error {
 	return m.store.SaveState(store.State{
 		Active: active, Exhausted: exhausted,
 		ProviderOrder: order, HiddenProviders: hidden,
+		ManagementKey: m.managementKey,
 	})
 }
 

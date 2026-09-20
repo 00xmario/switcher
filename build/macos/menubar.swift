@@ -355,6 +355,11 @@ final class SpinnerButton: NSView {
 
     override func mouseDown(with event: NSEvent) {
         spin()
+        // The menu rebuilds on fresh data; if it does not, stop after 3s so
+        // the icon cannot spin forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.iconLayer.removeAnimation(forKey: "spin")
+        }
         onClicked?()
     }
 
