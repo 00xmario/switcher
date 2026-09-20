@@ -32,10 +32,10 @@ jobs:
             arch="${target#*/}"
             GOOS="$os" GOARCH="$arch" \
               go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-              -o "dist/switcher_${VERSION}_${os}_${arch}" .
+              -o "dist/switcher-server_${VERSION}_${os}_${arch}" .
           done
           cd dist
-          for f in switcher_*; do
+          for f in switcher-server_*; do
             shasum -a 256 "$f" | tee "$f.sha256"
           done
 

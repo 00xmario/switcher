@@ -132,7 +132,7 @@ func (c *Checker) InstallAndRestart() error {
 		return errors.New("no update known; check for updates first")
 	}
 	latest := strings.TrimPrefix(tag, "v")
-	asset := fmt.Sprintf("switcher_%s_%s_%s", latest, runtime.GOOS, runtime.GOARCH)
+	asset := fmt.Sprintf("switcher-server_%s_%s_%s", latest, runtime.GOOS, runtime.GOARCH)
 	dir, err := os.MkdirTemp("", "switcher-update-")
 	if err != nil {
 		return fmt.Errorf("prepare download: %w", err)
