@@ -1,14 +1,14 @@
 // Switcher menu bar app: supervises the bundled switcher server and shows
 // per-account usage in a custom-drawn dropdown (cards, toggles, logos).
-// Stack-view based so alignment is guaranteed. Single-file Swift, compiled
-// with swiftc (no Xcode project).
+// Single-file Swift, compiled with swiftc (no Xcode project).
 import AppKit
 
 let hubURL = URL(string: "http://127.0.0.1:8787")!
 let launchAgentLabel = "sh.switcher.app"
 let launchAgentPath = NSHomeDirectory() + "/Library/LaunchAgents/" + launchAgentLabel + ".plist"
 let menuWidth: CGFloat = 340
-let edgeInset: CGFloat = 16
+let edgeInset: CGFloat = 16      // menu-level padding (left + right)
+let cardInset: CGFloat = 14      // padding inside cards
 
 struct UsageWindow: Codable {
     let label: String
@@ -47,7 +47,6 @@ struct AppState: Codable {
 let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode"]
 let planNames = ["pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free"]
 
-// palette
 let inkColor = NSColor(red: 0.13, green: 0.12, blue: 0.11, alpha: 1)
 let dimColor = NSColor(red: 0.48, green: 0.51, blue: 0.55, alpha: 1)
 let accentColor = NSColor(red: 0.25, green: 0.61, blue: 0.44, alpha: 1)
@@ -55,12 +54,12 @@ let warnColor = NSColor(red: 0.85, green: 0.64, blue: 0.31, alpha: 1)
 let surfaceColor = NSColor.controlBackgroundColor
 let cardBorderColor = NSColor.systemGray.withAlphaComponent(0.35)
 
-func label(_ text: String, font: NSFont, color: NSColor, alignment: NSTextAlignment = .left) -> NSTextField {
+func label(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
     let field = NSTextField(labelWithString: text)
     field.font = font
     field.textColor = color
-    field.alignment = alignment
     field.lineBreakMode = .byTruncatingTail
+    field.alignment = .left
     return field
 }
 
@@ -75,6 +74,31 @@ func cardView(width: CGFloat, height: CGFloat) -> NSView {
     return card
 }
 
+func sectionHead(_ providerID: String, contentWidth: CGFloat) -> NSView {
+    let head = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 26))
+    let logo = NSImageView(frame: NSRect(x: edgeInset, y: 4, width: 18, height: 18))
+    let image = providerLogoImage(providerID)
+    image?.size = NSSize(width: 18, height: 18)
+    logo.image = image
+    let name = label(providerNames[providerID] ?? providerID,
+        font: NSFont.systemFont(ofSize: 13, weight: .semibold), color: inkColor)
+    name.frame = NSRect(x: edgeInset + 26, y: 5, width: contentWidth - 18 - 10, height: 16)
+    head.addSubview(logo)
+    head.addSubview(name)
+    return head
+}
+
+// providerLogoImage loads the bundled mark, monochrome ones as templates
+// so they follow dark mode.
+func providerLogoImage(_ providerID: String) -> NSImage? {
+    guard let url = Bundle.main.url(forResource: providerID, withExtension: "png") else {
+        return nil
+    }
+    let image = NSImage(contentsOf: url)
+    if providerID == "grok" || providerID == "opencode" { image?.isTemplate = true }
+    return image
+}
+
 // Hover-highlighting, clickable row. Tapping invokes the handler.
 final class ClickableRow: NSView {
     var onClicked: (() -> Void)?
@@ -83,13 +107,12 @@ final class ClickableRow: NSView {
     override func layout() {
         super.layout()
         if tracking == nil {
-            let area = NSTrackingArea(rect: bounds,
-                options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
-            addTrackingArea(area)
-            tracking = area
             wantsLayer = true
             layer?.cornerRadius = 8
             layer?.masksToBounds = true
+            addTrackingArea(NSTrackingArea(rect: bounds,
+                options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self))
+            tracking = NSTrackingArea()
         }
     }
 
@@ -98,7 +121,7 @@ final class ClickableRow: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.systemGray.withAlphaComponent(0.12).cgColor
+        layer?.backgroundColor = NSColor.systemGray.withAlphaComponent(0.10).cgColor
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -123,14 +146,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: server supervision
-
     func ensureServerRunning() {
         if fetchState(timeout: 1.5) != nil { return }
         let server = URL(fileURLWithPath: Bundle.main.bundlePath + "/Contents/MacOS/SwitcherServer")
         guard FileManager.default.fileExists(atPath: server.path) else { return }
         let logDir = NSHomeDirectory() + "/.switcher"
         try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: logDir + "/server.log") {
+            FileManager.default.createFile(atPath: logDir + "/server.log", contents: nil)
+        }
         let process = Process()
         process.executableURL = server
         process.arguments = ["--port", "8787"]
@@ -146,8 +170,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("switcher: could not start server: \(error)")
         }
     }
-
-    // MARK: data
 
     func fetchState(timeout: Double = 5) -> AppState? {
         var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
@@ -172,96 +194,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func rebuildMenu() {
         menu.removeAllItems()
+        let contentWidth = menuWidth - 2 * edgeInset
 
-        // Header: centered logo mark, like the inspiration shot.
-        let headerView = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 74))
-        let logo = NSImageView(frame: NSRect(x: (menuWidth - 44) / 2, y: 12, width: 44, height: 44))
+        // Header: centered logo + version.
+        let state = fetchState()
+        let headerView = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 66))
+        let logo = NSImageView(frame: NSRect(x: (menuWidth - 42) / 2, y: 10, width: 42, height: 42))
         logo.image = Bundle.main.image(forResource: "AppIcon")
         headerView.addSubview(logo)
-        let versionField = label(
-            "v" + (fetchState(timeout: 3)?.version ?? "0.0.0"),
+        let versionField = label("v" + (state?.version ?? "0.0.0"),
             font: NSFont.systemFont(ofSize: 10.5), color: dimColor)
         versionField.alignment = .center
         versionField.frame = NSRect(x: 0, y: 0, width: menuWidth, height: 12)
         headerView.addSubview(versionField)
         menu.addItem(menuItemWithView(headerView))
 
-        let state = fetchState()
         if state == nil {
             let row = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 36))
             let field = label("Server unreachable", font: NSFont.systemFont(ofSize: 12.5), color: dimColor)
-            field.frame = NSRect(x: edgeInset, y: 10, width: menuWidth - 2 * edgeInset, height: 16)
+            field.frame = NSRect(x: edgeInset, y: 10, width: contentWidth, height: 16)
             row.addSubview(field)
             menu.addItem(menuItemWithView(row))
         } else {
-            let visible = visibleOrder(state).filter { providerID in
-                !(state?.accounts ?? []).filter { $0.provider == providerID }.isEmpty
-            }
+            let visible = (state?.order ?? ["codex", "claude", "grok", "opencode"])
+                .filter { !(state?.hidden ?? []).contains($0) }
+                .filter { providerID in
+                    !(state?.accounts ?? []).filter { $0.provider == providerID }.isEmpty
+                }
             for (position, providerID) in visible.enumerated() {
                 if position > 0 {
-                    // breathing room between providers
-                    let spacer = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 12))
-                    menu.addItem(menuItemWithView(spacer))
+                    menu.addItem(menuItemWithView(spacerView(height: 12)))
                 }
                 let accounts = (state?.accounts ?? []).filter { $0.provider == providerID }
-                let head = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 24))
-                let logoStack = NSStackView(frame: NSRect(x: 0, y: 0, width: menuWidth - 2 * edgeInset, height: 24))
-                logoStack.orientation = .horizontal
-                logoStack.spacing = 8
-                logoStack.alignment = .centerY
-                logoStack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-                let logo = NSImageView(frame: NSRect(x: 0, y: 0, width: 18, height: 18))
-                let image = NSImage(named: NSImage.Name("logo-" + providerID))
-                image?.size = NSSize(width: 18, height: 18)
-                if providerID == "grok" || providerID == "opencode" { image?.isTemplate = true }
-                logo.image = image
-                let nameField = label(providerNames[providerID] ?? providerID,
-                    font: NSFont.systemFont(ofSize: 13, weight: .semibold), color: inkColor)
-                logoStack.addArrangedSubview(logo)
-                logoStack.addArrangedSubview(nameField)
-                head.addSubview(logoStack)
-                menu.addItem(menuItemWithView(head))
-                menu.addItem(menuItemWithView(providerCard(providerID: providerID, accounts: accounts)))
+                menu.addItem(menuItemWithView(sectionHead(providerID, contentWidth: contentWidth)))
+                menu.addItem(menuItemWithView(providerCard(providerID: providerID, accounts: accounts, contentWidth: contentWidth)))
             }
         }
 
         menu.addItem(.separator())
 
-        // Bottom action buttons.
+        // Bottom actions: equal-width buttons, text vertically centered.
         let installAvailable = state?.update?.update_available == true
         let updateTitle = installAvailable ? "Install update" : "Check for updates"
-        let actionRow = NSStackView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 46))
-        actionRow.orientation = .horizontal
-        actionRow.distribution = .fillEqually
-        actionRow.spacing = 10
-        actionRow.edgeInsets = NSEdgeInsets(top: 6, left: edgeInset, bottom: 10, right: edgeInset)
-        actionRow.addArrangedSubview(roundButton(width: (menuWidth - 2 * edgeInset - 10) / 2,
-            title: "Open web app", target: self, action: #selector(openWebApp)))
-        actionRow.addArrangedSubview(roundButton(width: (menuWidth - 2 * edgeInset - 10) / 2,
-            title: updateTitle, target: self, action: #selector(runUpdate)))
+        let buttonWidth = (menuWidth - 2 * edgeInset - 10) / 2
+        let actionRow = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 46))
+        let webCard = cardView(width: buttonWidth, height: 38)
+        webCard.frame.origin = NSPoint(x: edgeInset, y: 4)
+        let webButton = NSButton(title: "Open web app", target: self, action: #selector(openWebApp))
+        webButton.isBordered = false
+        webButton.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        webButton.frame = NSRect(x: 0, y: 9, width: buttonWidth, height: 20)
+        webButton.alignment = .center
+        webCard.addSubview(webButton)
+        actionRow.addSubview(webCard)
+        let updateCard = cardView(width: buttonWidth, height: 38)
+        updateCard.frame.origin = NSPoint(x: edgeInset + buttonWidth + 10, y: 4)
+        let updateButton = NSButton(title: updateTitle,
+            target: self, action: #selector(runUpdate))
+        updateButton.isBordered = false
+        updateButton.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        updateButton.frame = NSRect(x: 0, y: 9, width: buttonWidth, height: 20)
+        updateButton.alignment = .center
+        updateCard.addSubview(updateButton)
+        actionRow.addSubview(updateCard)
         menu.addItem(menuItemWithView(actionRow))
 
-        // Start at login with a real toggle.
-        let toggleCard = cardView(width: menuWidth - 2 * edgeInset, height: 44)
+        // Start at login: symmetric card, label left, toggle right.
+        let toggleCard = cardView(width: contentWidth, height: 42)
         let field = label("Start at login", font: NSFont.systemFont(ofSize: 13), color: inkColor)
-        field.frame = NSRect(x: 12, y: 14, width: 180, height: 16)
+        field.frame = NSRect(x: cardInset, y: 13, width: 180, height: 16)
         toggleCard.addSubview(field)
-        let toggle = NSSwitch(frame: NSRect(x: menuWidth - 2 * edgeInset - 58, y: 9, width: 44, height: 26))
+        let toggle = NSSwitch(frame: NSRect(x: contentWidth - cardInset - 48, y: 9, width: 44, height: 26))
         toggle.state = startAtLoginEnabled() ? .on : .off
         toggle.target = self
         toggle.action = #selector(toggleStartAtLogin)
         toggleCard.addSubview(toggle)
-        let toggleItem = NSMenuItem()
-        toggleItem.view = toggleCard
-        menu.addItem(toggleItem)
+        menu.addItem(menuItemWithView(toggleCard))
 
         let quitItem = NSMenuItem(title: "Quit Switcher", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
 
-    func providerCard(providerID: String, accounts: [Account]) -> NSView {
-        let contentWidth = menuWidth - 2 * edgeInset
+    func providerCard(providerID: String, accounts: [Account], contentWidth: CGFloat) -> NSView {
         let height = accounts.reduce(CGFloat(4)) { $0 + rowHeight(for: $1) }
         let card = cardView(width: contentWidth, height: height)
         var y = height
@@ -275,18 +290,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            let logo = NSImageView(frame: NSRect(x: 12, y: rowHeight(for: account) / 2 - 11, width: 22, height: 22))
-            let logoImage = NSImage(named: NSImage.Name("logo-" + providerID))
+            let logo = NSImageView(frame: NSRect(x: cardInset, y: rowHeight(for: account) / 2 - 11, width: 22, height: 22))
+            let logoImage = providerLogoImage(providerID)
             logoImage?.size = NSSize(width: 22, height: 22)
             logo.image = logoImage
-            if providerID == "grok" || providerID == "opencode" { logoImage?.isTemplate = true }
             row.addSubview(logo)
 
+            // Email + plan, LEFT aligned at the same leading inset as the
+            // logo column: text at logo right + 10.
+            let textX = cardInset + 22 + 10
             let plan = account.plan.flatMap { planNames[$0] }.map { " · " + $0 } ?? ""
-            let title = label(truncate(account.email, 26) + plan,
+            let title = label(account.email + plan,
                 font: NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular),
                 color: account.active ? accentColor : inkColor)
-            title.frame = NSRect(x: 46, y: rowHeight(for: account) - 19, width: contentWidth - 130, height: 15)
+            let textWidth = contentWidth - textX - cardInset - 24
+            title.frame = NSRect(x: textX, y: rowHeight(for: account) - 19, width: textWidth, height: 15)
             row.addSubview(title)
 
             var usageY = rowHeight(for: account) - 33
@@ -294,25 +312,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let left = max(0, min(100, 100 - window.used_percent))
                 let usage = label(window.label + ": \(left)% left",
                     font: NSFont.systemFont(ofSize: 11), color: dimColor)
-                usage.frame = NSRect(x: 46, y: usageY, width: contentWidth - 130, height: 14)
+                usage.frame = NSRect(x: textX, y: usageY, width: textWidth, height: 14)
                 row.addSubview(usage)
                 usageY -= 15
             }
 
             if account.active {
-                let check = NSImageView(frame: NSRect(x: contentWidth - 26, y: rowHeight(for: account) / 2 - 6, width: 13, height: 13))
+                let check = NSImageView(frame: NSRect(x: contentWidth - cardInset - 14, y: rowHeight(for: account) / 2 - 6, width: 14, height: 14))
                 check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
                 check.contentTintColor = accentColor
                 row.addSubview(check)
             } else if let until = account.exhausted_until, Date(timeIntervalSince1970: until) > Date() {
                 let badge = label("Out of usage", font: NSFont.systemFont(ofSize: 10.5), color: warnColor)
                 badge.alignment = .right
-                badge.frame = NSRect(x: contentWidth - 100, y: rowHeight(for: account) - 19, width: 88, height: 14)
+                badge.frame = NSRect(x: contentWidth - cardInset - 90, y: rowHeight(for: account) - 19, width: 90, height: 14)
                 row.addSubview(badge)
             }
 
             if index < accounts.count - 1 {
-                let divider = NSView(frame: NSRect(x: 12, y: y, width: contentWidth - 24, height: 1))
+                let divider = NSView(frame: NSRect(x: cardInset, y: y, width: contentWidth - 2 * cardInset, height: 1))
                 divider.wantsLayer = true
                 divider.layer?.backgroundColor = cardBorderColor.cgColor
                 card.addSubview(divider)
@@ -380,29 +398,13 @@ func menuItemWithView(_ view: NSView) -> NSMenuItem {
     return item
 }
 
+
+func spacerView(height: CGFloat) -> NSView {
+    NSView(frame: NSRect(x: 0, y: 0, width: 1, height: height))
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory) // menu bar app: no Dock icon
 app.run()
-
-func visibleOrder(_ state: AppState?) -> [String] {
-    let order = state?.order ?? ["codex", "claude", "grok", "opencode"]
-    let hidden = Set(state?.hidden ?? [])
-    return order.filter { !hidden.contains($0) }
-}
-
-func roundButton(width: CGFloat, title: String, target: AnyObject?, action: Selector) -> NSView {
-    let card = cardView(width: width, height: 36)
-    let button = NSButton(title: title, target: target, action: action)
-    button.isBordered = false
-    button.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-    button.frame = NSRect(x: 0, y: 9, width: width, height: 20)
-    button.alignment = .center
-    card.addSubview(button)
-    return card
-}
-
-func truncate(_ s: String, _ n: Int) -> String {
-    s.count > n ? String(s.prefix(n)) + "…" : s
-}
