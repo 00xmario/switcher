@@ -53,6 +53,9 @@ jobs:
             go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o "$APP/Contents/MacOS/SwitcherServer" .
           swiftc -O -o "$APP/Contents/MacOS/Switcher" build/macos/menubar.swift
+          # Ad-hoc signing: without it Apple Silicon reports quarantined
+          # builds as "damaged".
+          codesign --force --deep -s - "$APP"
 
       - name: Package drag-to-Applications DMG
         run: |
