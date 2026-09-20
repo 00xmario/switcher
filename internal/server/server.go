@@ -16,6 +16,7 @@ import (
 	"switcher/internal/proxy"
 	"switcher/internal/store"
 	"switcher/internal/update"
+	"switcher/internal/usage"
 )
 
 // API wraps the JSON API the web UI talks to.
@@ -27,6 +28,7 @@ type API struct {
 	ManagementKey string
 	Version       string
 	Updater       *update.Checker
+	Usage         *usage.Service
 }
 
 // Register mounts the API on the given mux.
@@ -37,6 +39,8 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
 	mux.HandleFunc("POST /api/usage/refresh", a.handleRefreshAll)
+	mux.HandleFunc("GET /api/tokens", a.handleUsage)
+	mux.HandleFunc("POST /api/tokens/refresh", a.handleUsageRefresh)
 	mux.HandleFunc("POST /api/accounts", a.handleAddKey)
 	mux.HandleFunc("POST /api/accounts/{id}/use-reset", a.handleUseReset)
 	mux.HandleFunc("POST /api/update", a.handleUpdate)
@@ -268,6 +272,49 @@ func (a *API) handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "active": id})
+}
+
+// handleUsage answers with the cost/token summary for a window
+// (?days=1|7|30|90). It never scans inline: the latest summary is served
+// even when stale, and rescans happen in the background.
+func (a *API) handleUsage(w http.ResponseWriter, r *http.Request) {
+	days := 30
+	switch r.URL.Query().Get("days") {
+	case "1", "24h":
+		days = 1
+	case "7":
+		days = 7
+	case "90":
+		days = 90
+	}
+	if a.Usage == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "usage not configured"})
+		return
+	}
+	summary := a.Usage.Get(days)
+	if summary == nil {
+		go a.Usage.Scan(days)
+		writeJSON(w, http.StatusAccepted, map[string]any{"scanning": true, "days": days})
+		return
+	}
+	stale := a.Usage.Age(days) > 10*time.Minute
+	if stale {
+		go a.Usage.Scan(days)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"scanning": false, "stale": stale, "days": days, "summary": summary})
+}
+
+// handleUsageRefresh forces a rescan of every window.
+func (a *API) handleUsageRefresh(w http.ResponseWriter, r *http.Request) {
+	if a.Usage == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "usage not configured"})
+		return
+	}
+	go a.Usage.Scan(30)
+	go a.Usage.Scan(90)
+	go a.Usage.Scan(7)
+	go a.Usage.Scan(1)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 // handleRefreshAll re-queries usage for every account (manual refresh from

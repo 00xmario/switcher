@@ -41,7 +41,60 @@
       </div>
     </header>
 
+    <div id="update-slot"></div>
+
+    <nav class="page-tabs" aria-label="Pages">
+      <button id="tab-accounts" class="page-tab active" type="button">Accounts</button>
+      <button id="tab-usage" class="page-tab" type="button">Usage</button>
+    </nav>
+
     <section id="providers" aria-live="polite"></section>
+
+    <section id="usage-page" hidden>
+      <div class="usage-head">
+        <p class="usage-crumb">Usage <span class="crumb-sep">/</span> All providers</p>
+        <div class="usage-controls">
+          <div class="usage-metric" role="radiogroup" aria-label="Metric">
+            <button data-usage-metric="cost" class="active" type="button">Cost</button>
+            <button data-usage-metric="tokens" type="button">Tokens</button>
+          </div>
+          <div class="usage-window" role="radiogroup" aria-label="Window">
+            <button data-usage-days="1" type="button">Today</button>
+            <button data-usage-days="7" type="button">7 days</button>
+            <button data-usage-days="30" class="active" type="button">30 days</button>
+            <button data-usage-days="90" type="button">90 days</button>
+          </div>
+          <button id="usage-refresh" type="button" title="Refresh" aria-label="Refresh">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="usage-grid">
+        <div class="usage-summary">
+          <p class="usage-headline" id="usage-headline">$0.00</p>
+          <p class="usage-sub" id="usage-sub"></p>
+          <div class="usage-providers" id="usage-providers"></div>
+        </div>
+        <div class="usage-chart">
+          <p class="usage-chart-title" id="usage-chart-title">Daily cost</p>
+          <div class="usage-chart-box" id="usage-chart"></div>
+        </div>
+      </div>
+
+      <div class="usage-totals usage-totals-wide" id="usage-totals"></div>
+
+      <div class="usage-breakdown">
+        <div class="usage-breakdown-head">
+          <h2>Breakdown</h2>
+          <div class="usage-mode" role="radiogroup" aria-label="Group by">
+            <button data-usage-mode="model" class="active" type="button">Model</button>
+            <button data-usage-mode="day" type="button">Day</button>
+          </div>
+        </div>
+        <div id="usage-breakdown-table"></div>
+      </div>
+    </section>
 
     <footer class="footnote">
       <p>Switcher forwards your CLI traffic to the account marked <em>Active</em>.

@@ -203,7 +203,8 @@ function render() {
   }
   const order = (data.order || Object.keys(PROVIDER_NAMES))
     .filter(id => !(data.hidden || []).includes(id));
-  let html = updateBannerHTML();
+  document.getElementById('update-slot').innerHTML = updateBannerHTML();
+  let html = '';
   order.forEach((providerID) => {
     const accounts = byProvider.get(providerID) || [];
     html += `
@@ -320,6 +321,11 @@ providersEl.addEventListener('click', async (event) => {
   const menuBtn = event.target.closest('button[data-menu]');
   if (menuBtn) {
     openProviderMenu(menuBtn, menuBtn.dataset.menu);
+    return;
+  }
+  if (event.target.closest('#update-slot')) {
+    const updateBtn = event.target.closest('button[data-act="install-update"]');
+    if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
     return;
   }
   const button = event.target.closest('button[data-act]');
@@ -610,8 +616,400 @@ document.addEventListener('click', (event) => {
   }));
 });
 
+/* ---------- update flow ---------- */
+
+let updateRunning = false;
+
+async function runUpdateFlow(button) {
+  if (updateRunning) return;
+  updateRunning = true;
+  const oldVersion = data.version;
+  const banner = button.closest('.update-banner');
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Installing...';
+  banner.classList.add('updating');
+  try {
+    await fetch('/api/update', { method: 'POST' });
+    // The server downloads, swaps, and exec-restarts: it answers fast, then
+    // becomes briefly unreachable. Poll until the version changes or we
+    // give up.
+    const deadline = Date.now() + 45000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      try {
+        const res = await fetch('/api/state');
+        const next = await res.json();
+        if (next.version && next.version !== oldVersion) {
+          data = next;
+          render();
+          renderAddProviderMenu();
+          toast(`Updated to Switcher v${next.version}`);
+          return;
+        }
+      } catch { /* mid-restart, keep polling */ }
+    }
+    toast('Update is still downloading; check again in a minute');
+    await refreshState();
+  } catch (err) {
+    toast('Update failed: ' + err.message);
+    button.disabled = false;
+    button.textContent = original;
+    banner.classList.remove('updating');
+  } finally {
+    updateRunning = false;
+  }
+}
+
 /* ---------- boot ---------- */
 
 refreshState().then(refreshAllUsage);
 scheduleUsage();
 setInterval(refreshState, 4000);
+
+
+/* ================= Usage page (cost + tokens) ================= */
+
+const usageState = { metric: 'cost', days: 30, mode: 'model', summary: null, loading: false };
+
+const usagePage = document.getElementById('usage-page');
+const usageHeadline = document.getElementById('usage-headline');
+const usageSub = document.getElementById('usage-sub');
+const usageProviders = document.getElementById('usage-providers');
+const usageTotals = document.getElementById('usage-totals');
+const usageChartBox = document.getElementById('usage-chart');
+const usageChartTitle = document.getElementById('usage-chart-title');
+const usageBreakdownTable = document.getElementById('usage-breakdown-table');
+const USAGE_PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude Code', grok: 'Grok Build', opencode: 'OpenCode' };
+
+document.getElementById('tab-accounts').addEventListener('click', () => setPage('accounts'));
+document.getElementById('tab-usage').addEventListener('click', () => setPage('usage'));
+
+function setPage(page) {
+  document.querySelectorAll('.page-tab').forEach(b => b.classList.toggle('active', b.id === `tab-${page}`));
+  document.getElementById('providers').hidden = page !== 'accounts';
+  document.querySelector('footer.footnote').hidden = page !== 'accounts';
+  usagePage.hidden = page !== 'usage';
+  if (page === 'usage') loadUsage();
+}
+
+document.querySelectorAll('[data-usage-metric]').forEach(btn =>
+  btn.addEventListener('click', () => {
+    usageState.metric = btn.dataset.usageMetric;
+    document.querySelectorAll('[data-usage-metric]').forEach(b => b.classList.toggle('active', b === btn));
+    renderUsage();
+  }));
+
+document.querySelectorAll('[data-usage-days]').forEach(btn =>
+  btn.addEventListener('click', () => {
+    usageState.days = Number(btn.dataset.usageDays);
+    document.querySelectorAll('[data-usage-days]').forEach(b => b.classList.toggle('active', b === btn));
+    loadUsage();
+  }));
+
+document.querySelectorAll('[data-usage-mode]').forEach(btn =>
+  btn.addEventListener('click', () => {
+    usageState.mode = btn.dataset.usageMode;
+    document.querySelectorAll('[data-usage-mode]').forEach(b => b.classList.toggle('active', b === btn));
+    renderUsage();
+  }));
+
+document.getElementById('usage-refresh').addEventListener('click', async () => {
+  const btn = document.getElementById('usage-refresh');
+  btn.classList.add('spinning');
+  const minSpin = new Promise(resolve => setTimeout(resolve, 700));
+  try {
+    await Promise.all([fetch('/api/tokens/refresh', { method: 'POST' }), minSpin]);
+    await loadUsage();
+  } finally {
+    btn.classList.remove('spinning');
+  }
+});
+
+async function loadUsage() {
+  if (usageState.loading) return;
+  usageState.loading = true;
+  try {
+    const res = await fetch(`/api/tokens?days=${usageState.days}`);
+    const body = await res.json();
+    if (body.summary) {
+      usageState.summary = body.summary;
+      renderUsage();
+    } else if (body.scanning) {
+      usageHeadline.textContent = 'Scanning sessions...';
+      usageSub.textContent = "Reading the provider CLIs' own logs on disk.";
+      usageProviders.innerHTML = '';
+      usageTotals.innerHTML = '';
+      usageChartBox.innerHTML = '';
+      usageBreakdownTable.innerHTML = '';
+      setTimeout(loadUsage, 2500);
+    }
+  } finally {
+    usageState.loading = false;
+  }
+}
+
+// sigRound rounds n to `figs` significant digits (numeric result).
+function sigRound(n, figs) {
+  if (n === 0) return 0;
+  const mag = Math.floor(Math.log10(Math.abs(n)));
+  const factor = Math.pow(10, figs - 1 - mag);
+  return Math.round(n / factor) * factor;
+}
+
+// fmtTokens: 3 significant digits inside the unit, like 12.9B, 580M, 62.9K.
+function fmtTokens(n) {
+  const rounded = sigRound(n, 3);
+  const unit = tokensUnit(rounded);
+  if (unit === '') return String(Math.round(rounded));
+  const size = unit === 'B' ? 1e9 : unit === 'M' ? 1e6 : 1e3;
+  const mantissa = rounded / size;
+  const decimals = mantissa >= 100 ? 0 : mantissa >= 10 ? 1 : 2;
+  let str = mantissa.toFixed(decimals);
+  if (decimals > 0) {
+    str = str.replace(/0+$/, '').replace(/\.$/, '');
+  }
+  return str + unit;
+}
+
+function tokensUnit(n) {
+  if (n >= 1e9) return 'B';
+  if (n >= 1e6) return 'M';
+  if (n >= 1e3) return 'K';
+  return '';
+}
+
+// sigDigits formats a number to `figs` significant digits, trailing zeros
+// trimmed: 12.9, 1.54, 580, 6.91.
+function sigDigits(n, figs) {
+  if (!isFinite(n)) return '0';
+  if (n === 0) return '0';
+  const rounded = sigRound(n, figs);
+  const mag = Math.max(0, Math.floor(Math.log10(Math.abs(rounded))));
+  const decimals = Math.max(0, figs - 1 - mag);
+  let str = rounded.toFixed(decimals);
+  if (decimals > 0) {
+    str = str.replace(/0+$/, '').replace(/\.$/, '');
+  }
+  return str;
+}
+
+function fmtMoneyShort(n) {
+  return '$' + sigDigits(n, 3);
+}
+
+function fmtMoney(n) {
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtPct(x) { return (x * 100).toFixed(1) + '%'; }
+
+function renderUsage() {
+  const s = usageState.summary;
+  if (!s) return;
+  const isCost = usageState.metric === 'cost';
+  usageHeadline.textContent = isCost
+    ? fmtMoney(s.total_cost_usd)
+    : fmtTokens(s.total_tokens);
+  const sub = [`${s.sessions} sessions`];
+  if (s.unpriced_share > 0.001) sub.push(`API estimate excludes ${fmtPct(s.unpriced_share)} unpriced records`);
+  usageSub.textContent = sub.join(' · ');
+
+  usageProviders.innerHTML = '';
+  for (const p of s.providers) {
+    const value = isCost ? fmtMoney(p.cost_usd) : fmtTokens(p.tokens);
+    const meta = isCost
+      ? `${fmtPct(p.cost_share)} of cost · ${fmtTokens(p.tokens)} tokens`
+      : `${fmtPct(p.token_share)} of tokens · ${fmtMoney(p.cost_usd)}`;
+    const row = document.createElement('div');
+    row.className = 'usage-provider';
+    row.innerHTML = `
+      <div class="usage-provider-main">
+        <span class="provider-dot ${p.provider}"></span>
+        <span class="logo">${LOGOS[p.provider] || ''}</span>
+        ${escapeHTML(USAGE_PROVIDER_NAMES[p.provider] || p.provider)}
+        <span class="usage-provider-count">${p.sessions} sessions</span>
+      </div>
+      <div class="usage-provider-value">${value}</div>
+      <p class="usage-provider-meta">${meta}</p>`;
+    usageProviders.appendChild(row);
+  }
+
+  const t = s.totals;
+  usageTotals.innerHTML = '';
+  const cells = [
+    ['Processed tokens', fmtTokens(t.uncached_input_tokens + t.cached_input_tokens + t.cache_creation_tokens + t.output_tokens)],
+    ['Cached input', fmtTokens(t.cached_input_tokens)],
+    ['Uncached input', fmtTokens(t.uncached_input_tokens)],
+    ['Output', fmtTokens(t.output_tokens)],
+    ['Cache savings', fmtMoney(s.cache_savings_usd)],
+  ];
+  for (const [label, value] of cells) {
+    const div = document.createElement('div');
+    div.innerHTML = `<p class="label">${label}</p><p class="value">${value}</p>`;
+    usageTotals.appendChild(div);
+  }
+
+  usageChartTitle.textContent = isCost ? 'Daily cost' : 'Daily processed tokens';
+  renderChart(s, isCost);
+  renderBreakdown(s, isCost);
+}
+
+/* ---------- daily chart ---------- */
+
+// renderChart draws an SVG chart: the top provider renders as a filled
+// smooth area, the others as thin smooth lines. Hovering shows a tooltip
+// with each provider's value and the day total.
+function renderChart(s, isCost) {
+  const days = s.days || [];
+  const width = 900, height = 470, padL = 84, padR = 20, padT = 18, padB = 36;
+  const plotW = width - padL - padR, plotH = height - padT - padB;
+  const series = s.providers.map(p => p.provider);
+  if (days.length === 0 || series.length === 0) {
+    usageChartBox.innerHTML = '<p class="usage-sub">No data in this window.</p>';
+    return;
+  }
+  const val = (d, p) => isCost ? (d.providers[p]?.cost_usd || 0) : (d.providers[p]?.tokens || 0);
+  const dayTotal = d => series.reduce((a, p) => a + val(d, p), 0);
+  // T3-style axis: a 1/2/2.5/5 step so gridlines read like $500, $1,000.
+  const step = niceCeil(Math.max(1e-9, ...days.map(dayTotal)) / 3);
+  const maxVal = step * 3;
+
+  const xAt = i => days.length <= 1 ? padL + plotW / 2 : padL + (i / (days.length - 1)) * plotW;
+  const yAt = v => padT + (1 - v / maxVal) * plotH;
+  const yBase = yAt(0);
+
+  const pointsFor = p => days.map((d, i) => [xAt(i), yAt(val(d, p))]);
+  // smooth returns a Catmull-Rom bezier path; control points are clamped to
+  // the plot so sharp drops cannot overshoot below the axis.
+  function smooth(points) {
+    if (points.length < 3) return 'M' + points.map(pt => pt.join(' ')).join(' L');
+    let d = `M${points[0][0]},${points[0][1]}`;
+    const clamp = y => Math.min(Math.max(y, padT), yBase);
+    for (let i = 0; i < points.length - 1; i++) {
+      const p0 = points[Math.max(0, i - 1)], p1 = points[i], p2 = points[i + 1], p3 = points[Math.min(points.length - 1, i + 2)];
+      const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = clamp(p1[1] + (p2[1] - p0[1]) / 6);
+      const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = clamp(p2[1] - (p3[1] - p1[1]) / 6);
+      d += ` C${c1x},${c1y} ${c2x},${c2y} ${p2[0]},${p2[1]}`;
+    }
+    return d;
+  }
+
+  let svg = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Daily chart">`;
+  for (let i = 0; i <= 3; i++) {
+    const v = step * i;
+    const y = yAt(v);
+    svg += `<line x1="${padL}" y1="${y}" x2="${width - padR}" y2="${y}" stroke="var(--border)"/>`;
+    svg += `<text x="${padL - 10}" y="${y + 3}" text-anchor="end">${isCost ? moneyTick(v) : tokenTick(v)}</text>`;
+  }
+
+  const topProvider = s.providers[0].provider;
+  for (const p of [...series].reverse()) {
+    const pts = pointsFor(p);
+    const line = smooth(pts);
+    if (p === topProvider) {
+      const area = `${line} L${xAt(days.length - 1)},${yBase} L${xAt(0)},${yBase} Z`;
+      svg += `<path class="chart-line ${p}" d="${area}" stroke="var(--chart-1)" stroke-width="2.6"/>`;
+    } else {
+      svg += `<path class="chart-line ${p}" d="${line}" fill="none" stroke-width="2.2"/>`;
+    }
+  }
+  const labelIdx = days.length > 8 ? [0, Math.floor((days.length - 1) / 2), days.length - 1] : days.map((_, i) => i);
+  for (const i of labelIdx) {
+    const label = new Date(days[i].day + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }).toUpperCase();
+    svg += `<text x="${xAt(i)}" y="${height - 8}" text-anchor="${i === 0 ? 'start' : i === days.length - 1 ? 'end' : 'middle'}">${label}</text>`;
+  }
+  svg += `<line id="chart-guide" x1="0" y1="${padT}" x2="0" y2="${yBase}" stroke="var(--border-strong)" opacity="0"/>`;
+  svg += '</svg>';
+  usageChartBox.innerHTML = svg;
+
+  const tip = document.createElement('div');
+  tip.className = 'usage-tip';
+  usageChartBox.appendChild(tip);
+
+  const svgEl = usageChartBox.querySelector('svg');
+  const guide = usageChartBox.querySelector('#chart-guide');
+  svgEl.addEventListener('mousemove', (e) => {
+    const rect = svgEl.getBoundingClientRect();
+    const relX = (e.clientX - rect.left) / rect.width * width;
+    const i = days.length <= 1 ? 0 : Math.round((relX - padL) / plotW * (days.length - 1));
+    const idx = Math.max(0, Math.min(days.length - 1, i));
+    const d = days[idx];
+    let rows = '';
+    for (const prov of s.providers) {
+      const id = prov.provider;
+      const v = val(d, id);
+      rows += `<div class="tip-row"><span class="logo">${LOGOS[id] || ''}</span><span class="name">${escapeHTML(USAGE_PROVIDER_NAMES[id] || id)}</span><span>${isCost ? fmtMoney(v) : fmtTokens(v)}</span></div>`;
+    }
+    tip.innerHTML = `<div class="tip-day">${new Date(d.day + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</div>${rows}<div class="tip-total"><span>Total</span><span>${isCost ? fmtMoney(dayTotal(d)) : fmtTokens(dayTotal(d))}</span></div>`;
+    const boxRect = usageChartBox.getBoundingClientRect();
+    let tx = e.clientX - boxRect.left + 18;
+    if (tx + 215 > boxRect.width) tx = e.clientX - boxRect.left - 215 - 8;
+    tip.style.left = `${tx}px`;
+    tip.style.top = '14px';
+    tip.style.opacity = '1';
+    guide.setAttribute('x1', xAt(idx));
+    guide.setAttribute('x2', xAt(idx));
+    guide.setAttribute('opacity', '1');
+  });
+  svgEl.addEventListener('mouseleave', () => { tip.style.opacity = '0'; guide.setAttribute('opacity', '0'); });
+}
+
+// moneyTick formats y ticks like $1,500.00.
+function moneyTick(v) {
+  return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// tokenTick formats axis ticks like 1.50B, 500M.
+function tokenTick(v) {
+  return fmtTokens(v);
+}
+
+// niceCeil rounds up to a 1/2/5 step so axis ticks read like $1,500 / 2B.
+function niceCeil(v) {
+  if (v <= 0) return 1;
+  const exp = Math.pow(10, Math.floor(Math.log10(v)));
+  const f = v / exp;
+  const nice = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
+  return nice * exp;
+}
+
+function fmtAxis(v) {
+  if (v >= 1e9) return '$' + sigDigits(v, 3) + 'B';
+  if (v >= 1e6) return '$' + sigDigits(v, 3) + 'M';
+  if (v >= 1e3) return '$' + sigDigits(v, 3) + 'K';
+  return '$' + sigDigits(v, 3);
+}
+
+/* ---------- breakdown table ---------- */
+
+function renderBreakdown(s, isCost) {
+  if (usageState.mode === 'model') {
+    const models = [...s.models].sort((a, b) => isCost ? b.cost_usd - a.cost_usd : b.tokens - a.tokens);
+    let html = `<table class="usage-table"><thead><tr><th>Model</th><th>Cost</th><th>Share</th><th>Tokens</th></tr></thead><tbody>`;
+    for (const m of models) {
+      const costCell = m.unpriced ? '<span class="unpriced">Unpriced</span>' : fmtMoney(m.cost_usd);
+      html += `<tr>
+        <td><span class="model-name"><span class="logo">${LOGOS[m.provider] || ''}</span>${escapeHTML(m.model)}</span></td>
+        <td>${costCell}</td>
+        <td class="${m.unpriced ? 'dim-cell' : ''}">${m.unpriced ? '&mdash;' : fmtPct(m.share)}</td>
+        <td class="dim-cell">${fmtTokens(m.tokens)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    usageBreakdownTable.innerHTML = html;
+  } else {
+    const days = s.days || [];
+    let html = `<table class="usage-table"><thead><tr><th>Day</th><th>Cost</th><th>Share</th><th>Tokens</th></tr></thead><tbody>`;
+    const total = isCost ? s.total_cost_usd : s.total_tokens;
+    for (const d of days) {
+      const dayCost = s.providers.reduce((a, p) => a + (d.providers[p.provider]?.cost_usd || 0), 0);
+      const dayTokens = s.providers.reduce((a, p) => a + (d.providers[p.provider]?.tokens || 0), 0);
+      const v = isCost ? dayCost : dayTokens;
+      const share = total > 0 ? v / total : 0;
+      html += `<tr><td>${new Date(d.day + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</td><td>${fmtMoney(dayCost)}</td><td class="dim-cell">${fmtPct(share)}</td><td class="dim-cell">${fmtTokens(dayTokens)}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    usageBreakdownTable.innerHTML = html;
+  }
+}

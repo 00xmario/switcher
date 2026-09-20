@@ -38,6 +38,7 @@ import (
 	"switcher/internal/server"
 	"switcher/internal/store"
 	"switcher/internal/update"
+	"switcher/internal/usage"
 )
 
 // version is overridable at build time: -ldflags "-X main.version=x.y.z".
@@ -133,9 +134,23 @@ func run(port int) {
 			proxyManager.RefreshUsageAll(context.Background())
 		}
 	}()
+	usageService := usage.NewService(config.Dir(), nil)
+	// Cost/token usage: rescan the common windows periodically in the
+	// background so the API always has a recent summary ready.
+	go func() {
+		usageService.Scan(30)
+		usageService.Scan(90)
+	}()
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			usageService.RefreshStale([]int{30, 90, 7}, 15*time.Minute)
+		}
+	}()
 	api := &server.API{
 		Store: st, Logins: logins, Proxy: proxyManager, Providers: providers,
-		ManagementKey: managementKey, Version: version, Updater: updater,
+		ManagementKey: managementKey, Version: version, Updater: updater, Usage: usageService,
 	}
 
 	// Each provider with a browser redirect has its own callback listener;

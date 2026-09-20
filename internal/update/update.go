@@ -143,6 +143,11 @@ func (c *Checker) InstallAndRestart() error {
 	}
 	binaryPath := filepath.Join(dir, asset)
 
+	// The exec bit: downloaded files are not executable.
+	if err := os.Chmod(binaryPath, 0o755); err != nil {
+		return fmt.Errorf("prepare binary: %w", err)
+	}
+
 	// Smoke test before replacing a working install.
 	if out, err := exec.Command(binaryPath, "version").CombinedOutput(); err != nil {
 		return fmt.Errorf("downloaded binary failed to start: %s (%v)", strings.TrimSpace(string(out)), err)
@@ -154,9 +159,6 @@ func (c *Checker) InstallAndRestart() error {
 	}
 	if current, err = filepath.EvalSymlinks(current); err != nil {
 		return fmt.Errorf("resolve running binary: %w", err)
-	}
-	if err := os.Chmod(binaryPath, 0o755); err != nil {
-		return fmt.Errorf("swap binary: %w", err)
 	}
 
 	// Swap: move the old file aside, move the new one into place; restore

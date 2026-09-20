@@ -123,23 +123,23 @@ func (s *Store) Delete(id string) error {
 
 // LoadState reads the routing state; a missing file yields the zero state.
 func (s *Store) LoadState() (State, error) {
-	var legacy struct {
-		// Active was a single string before multi-provider support; accept
-		// both shapes so old state files migrate without a fuss.
-		Active    json.RawMessage  `json:"active"`
-		Exhausted map[string]int64 `json:"exhausted"`
+	raw, err := os.ReadFile(s.statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return State{Active: map[string]string{}, Exhausted: map[string]int64{}}, nil
 	}
-	if err := readJSON(s.statePath, &legacy); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return State{Active: map[string]string{}, Exhausted: map[string]int64{}}, nil
-		}
+	if err != nil {
 		return State{}, err
 	}
-
-	state := State{Exhausted: legacy.Exhausted, Active: map[string]string{}}
-	if len(legacy.Active) > 0 {
-		if err := json.Unmarshal(legacy.Active, &state.Active); err != nil {
-			// Legacy single-provider format: the string belonged to codex.
+	var state State
+	if json.Unmarshal(raw, &state) != nil {
+		// Legacy shape: active was a single string that belonged to codex.
+		state = State{Active: map[string]string{}, Exhausted: map[string]int64{}}
+		var legacy struct {
+			Active    json.RawMessage  `json:"active"`
+			Exhausted map[string]int64 `json:"exhausted"`
+		}
+		if json.Unmarshal(raw, &legacy) == nil {
+			state.Exhausted = legacy.Exhausted
 			var old string
 			if json.Unmarshal(legacy.Active, &old) == nil && old != "" {
 				state.Active["codex"] = old
