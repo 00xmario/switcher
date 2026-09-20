@@ -562,6 +562,35 @@ function promptKey(name) {
   });
 }
 
+// The hub dialog hands the user everything T3 Code's "Add a CLIProxyAPI
+// hub" dialog asks for: the hub URL and the management key.
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('#hub-button')) return;
+  document.querySelector('.hub-modal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'device-overlay';
+  overlay.innerHTML = `
+    <div class="device-modal" role="dialog" aria-modal="true" aria-label="Use Switcher as a hub">
+      <button class="modal-close" title="Close" aria-label="Close">✕</button>
+      <h3>Use Switcher as a hub</h3>
+      <p>In T3 Code: <em>Settings → Providers → Add a CLIProxyAPI hub</em>. Enter these values; the key stays on this machine.</p>
+      <label class="field-label">Hub URL</label>
+      <div class="copy-row"><input readonly value="${escapeHTML(data.hub_url || 'http://127.0.0.1:8787')}"><button class="copy-btn" data-copy="${escapeHTML(data.hub_url || '')}">Copy</button></div>
+      <label class="field-label">Management key</label>
+      <div class="copy-row"><input readonly type="password" value="${escapeHTML(data.hub_management_key || '')}"><button class="copy-btn" data-copy="${escapeHTML(data.hub_management_key || '')}">Copy</button></div>
+      <p class="device-wait">T3 Code shows the quota of every account this hub pools. Codex and Claude accounts are supported.</p>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  overlay.querySelector('.modal-close').addEventListener('click', close);
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  document.addEventListener('keydown', onKey);
+  overlay.querySelectorAll('.copy-btn').forEach(b => b.addEventListener('click', () => {
+    navigator.clipboard?.writeText(b.dataset.copy).then(() => toast('Copied'), () => {});
+  }));
+});
+
 /* ---------- boot ---------- */
 
 // Prefer the generated PNG logo when it exists (scripts/generate-logo.py);

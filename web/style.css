@@ -412,6 +412,21 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
 }
 .device-modal .modal-close:hover { color: var(--text); }
 .device-modal h3 { margin: 0 0 10px; font-size: 17px; }
+.device-modal .field-label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--dim); }
+.copy-row { display: flex; gap: 8px; margin-bottom: 10px; }
+.copy-row input {
+  flex: 1;
+  min-width: 0;
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+}
+.copy-btn { flex: none; padding: 8px 12px; font-size: 13px; }
+.hub-modal { max-width: 460px; }
+.top-actions #hub-button { margin-right: 2px; }
 .device-modal p { margin: 8px 0; color: var(--dim); font-size: 14px; }
 .device-code {
   font: 600 26px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;

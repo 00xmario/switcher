@@ -19,10 +19,11 @@ import (
 
 // API wraps the JSON API the web UI talks to.
 type API struct {
-	Store     *store.Store
-	Logins    *login.Manager
-	Proxy     *proxy.Manager
-	Providers map[string]provider.Provider
+	Store         *store.Store
+	Logins        *login.Manager
+	Proxy         *proxy.Manager
+	Providers     map[string]provider.Provider
+	ManagementKey string
 }
 
 // Register mounts the API on the given mux.
@@ -150,10 +151,12 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		hidden = []string{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active":   a.Proxy.ActiveAll(),
-		"accounts": views,
-		"order":    order,
-		"hidden":   hidden,
+		"active":             a.Proxy.ActiveAll(),
+		"accounts":           views,
+		"order":              order,
+		"hidden":             hidden,
+		"hub_url":            "http://127.0.0.1:8787",
+		"hub_management_key": a.ManagementKey,
 	})
 }
 

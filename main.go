@@ -12,7 +12,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"html"
@@ -24,6 +26,7 @@ import (
 	"switcher/internal/codexcfg"
 	"switcher/internal/config"
 	"switcher/internal/login"
+	"switcher/internal/mgmtapi"
 	"switcher/internal/provider"
 	"switcher/internal/provider/claude"
 	"switcher/internal/provider/codex"
@@ -84,6 +87,24 @@ func run(port int) {
 		log.Fatalf("load state: %v", err)
 	}
 
+	// The management key lets tools like T3 Code talk to Switcher's
+	// CLIProxyAPI-compatible hub surface. Generated once, shown in the UI.
+	state, err := st.LoadState()
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+	managementKey := state.ManagementKey
+	if managementKey == "" {
+		raw := make([]byte, 24)
+		if _, err := rand.Read(raw); err != nil {
+			log.Fatalf("generate management key: %v", err)
+		}
+		managementKey = hex.EncodeToString(raw)
+		state.ManagementKey = managementKey
+		if err := st.SaveState(state); err != nil {
+			log.Fatalf("persist management key: %v", err)
+		}
+	}
 	// Successful logins persist immediately from the callback goroutine;
 	// the first account of a provider automatically becomes active.
 	logins := login.New(func(a store.Account) error {
@@ -95,8 +116,9 @@ func run(port int) {
 		}
 		return nil
 	})
+	mgmtAPI := &mgmtapi.API{Store: st, Proxy: proxyManager, Logins: logins, ManagementKey: managementKey}
 
-	api := &server.API{Store: st, Logins: logins, Proxy: proxyManager, Providers: providers}
+	api := &server.API{Store: st, Logins: logins, Proxy: proxyManager, Providers: providers, ManagementKey: managementKey}
 
 	// Each provider with a browser redirect has its own callback listener;
 	// the ports are fixed by the OAuth clients' registered redirect URIs.
@@ -108,6 +130,7 @@ func run(port int) {
 
 	mux := http.NewServeMux()
 	api.Register(mux)
+	mgmtAPI.Register(mux) // CLIProxyAPI-compatible hub surface for T3 Code
 	mux.Handle("/codex/", proxyManager)
 	mux.Handle("/claude/", proxyManager)
 	mux.Handle("/grok/", proxyManager)

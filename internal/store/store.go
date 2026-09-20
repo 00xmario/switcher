@@ -41,6 +41,7 @@ type State struct {
 	Exhausted       map[string]int64  `json:"exhausted,omitempty"`
 	ProviderOrder   []string          `json:"provider_order,omitempty"`
 	HiddenProviders []string          `json:"hidden_providers,omitempty"`
+	ManagementKey   string            `json:"management_key,omitempty"`
 }
 
 // ErrNotFound is returned when an account ID does not exist.
