@@ -45,8 +45,9 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           APP="build/Switcher.app"
           rm -rf "$APP"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/logos"
           cp build/macos/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cp build/macos/logos/*.png "$APP/Contents/Resources/logos/"
           sed "s/VERSION_TOKEN/${VERSION}/g" build/macos/Info.plist > "$APP/Contents/Info.plist"
           GOOS=darwin GOARCH=arm64 \
             go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \

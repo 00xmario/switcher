@@ -1,11 +1,12 @@
 // Switcher menu bar app: supervises the bundled switcher server and shows
-// per-account usage in the status bar menu. Single-file Swift, compiled
-// with swiftc (no Xcode project).
+// per-account usage in a custom-drawn dropdown (cards, toggles, logos).
+// Single-file Swift, compiled with swiftc (no Xcode project).
 import AppKit
 
 let hubURL = URL(string: "http://127.0.0.1:8787")!
 let launchAgentLabel = "sh.switcher.app"
 let launchAgentPath = NSHomeDirectory() + "/Library/LaunchAgents/" + launchAgentLabel + ".plist"
+let menuWidth: CGFloat = 320
 
 struct UsageWindow: Codable {
     let label: String
@@ -28,15 +29,110 @@ struct Account: Codable {
     let usage: Usage?
 }
 
+struct UpdateInfo: Codable {
+    let latest: String?
+    let update_available: Bool?
+}
+
 struct AppState: Codable {
-    let active: [String: String]?
     let accounts: [Account]
     let order: [String]?
     let hidden: [String]?
+    let version: String?
+    let update: UpdateInfo?
 }
 
 let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode"]
 let planNames = ["pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free"]
+
+// palette
+let inkColor = NSColor(red: 0.13, green: 0.12, blue: 0.11, alpha: 1)
+let dimColor = NSColor(red: 0.48, green: 0.51, blue: 0.55, alpha: 1)
+let accentColor = NSColor(red: 0.25, green: 0.61, blue: 0.44, alpha: 1)
+let warnColor = NSColor(red: 0.85, green: 0.64, blue: 0.31, alpha: 1)
+let surfaceColor = NSColor.controlBackgroundColor
+let cardBorderColor = NSColor.systemGray.withAlphaComponent(0.35)
+
+func label(_ text: String, font: NSFont, color: NSColor, alignment: NSTextAlignment = .left) -> NSTextField {
+    let field = NSTextField(labelWithString: text)
+    field.font = font
+    field.textColor = color
+    field.lineBreakMode = .byTruncatingTail
+    return field
+}
+
+func cardView(width: CGFloat, height: CGFloat) -> NSView {
+    let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    card.wantsLayer = true
+    card.layer?.backgroundColor = surfaceColor.cgColor
+    card.layer?.borderColor = cardBorderColor.cgColor
+    card.layer?.borderWidth = 1
+    card.layer?.cornerRadius = 10
+    card.layer?.masksToBounds = true
+    return card
+}
+
+func sectionLabel(_ text: String, width: CGFloat) -> NSView {
+    let field = label(text.uppercased(), font: NSFont.systemFont(ofSize: 10.5, weight: .semibold), color: dimColor)
+    field.frame = NSRect(x: 2, y: 0, width: width, height: 16)
+    let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 18))
+    row.addSubview(field)
+    return row
+}
+
+func textRow(width: CGFloat, text: String) -> NSView {
+    let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 36))
+    let field = label(text, font: NSFont.systemFont(ofSize: 12.5), color: dimColor)
+    field.frame = NSRect(x: 12, y: 10, width: width - 24, height: 16)
+    row.addSubview(field)
+    return row
+}
+
+func roundButton(width: CGFloat, title: String, target: AnyObject?, action: Selector) -> NSView {
+    let card = cardView(width: width, height: 36)
+    let button = NSButton(title: title, target: target, action: action)
+    button.isBordered = false
+    button.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+    button.frame = NSRect(x: 0, y: 9, width: width, height: 20)
+    button.alignment = .center
+    card.addSubview(button)
+    return card
+}
+
+func menuItemWithView(_ view: NSView) -> NSMenuItem {
+    let item = NSMenuItem()
+    item.view = view
+    item.isEnabled = false
+    return item
+}
+
+func visibleOrder(_ state: AppState?) -> [String] {
+    let order = state?.order ?? ["codex", "claude", "grok", "opencode"]
+    let hidden = Set(state?.hidden ?? [])
+    return order.filter { !hidden.contains($0) }
+}
+
+func truncate(_ s: String, _ n: Int) -> String {
+    s.count > n ? String(s.prefix(n)) + "…" : s
+}
+
+// Hover-highlighting, clickable row. Tapping invokes the handler.
+final class ClickableRow: NSView {
+    var onClicked: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        if let handler = onClicked { handler() }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.systemGray.withAlphaComponent(0.12).cgColor
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -50,19 +146,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.autoenablesItems = false
         statusItem.menu = menu
         rebuildMenu()
-        // The server refreshes usage itself; the menu just re-renders.
         Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.rebuildMenu()
         }
     }
 
-    // MARK: - server supervision
+    // MARK: server supervision
 
     func serverReachable(timeout: Double) -> Bool {
-        guard let data = fetchData(hubURL.appendingPathComponent("api/state"), timeout: timeout) else {
-            return false
-        }
-        return !data.isEmpty
+        fetchState(timeout: timeout) != nil
     }
 
     func ensureServerRunning() {
@@ -81,104 +173,170 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try process.run()
             serverProcess = process
-            Thread.sleep(forTimeInterval: 0.8) // let it bind before the menu pulls
+            Thread.sleep(forTimeInterval: 0.8)
         } catch {
             NSLog("switcher: could not start server: \(error)")
         }
     }
 
-    // MARK: - menu
+    // MARK: data
+
+    func fetchState(timeout: Double = 5) -> AppState? {
+        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
+        request.timeoutInterval = timeout
+        let semaphore = DispatchSemaphore(value: 0)
+        var decoded: AppState?
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            if let data = data { decoded = try? JSONDecoder().decode(AppState.self, from: data) }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + timeout)
+        return decoded
+    }
+
+    func post(path: String, completion: (() -> Void)? = nil) {
+        var request = URLRequest(url: hubURL.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { _, _, _ in completion?() }.resume()
+    }
+
+    // MARK: menu construction
 
     func rebuildMenu() {
         menu.removeAllItems()
 
-        let header = NSMenuItem(title: "Switcher", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        menu.addItem(.separator())
+        // Header: centered logo mark, like the inspiration shot.
+        let headerView = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 60))
+        let logo = NSImageView(frame: NSRect(x: (menuWidth - 42) / 2, y: 8, width: 42, height: 42))
+        logo.image = Bundle.main.image(forResource: "AppIcon")
+        headerView.addSubview(logo)
+        menu.addItem(menuItemWithView(headerView))
 
         let state = fetchState()
         if state == nil {
-            let item = NSMenuItem(title: "Server unreachable", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
+            menu.addItem(menuItemWithView(textRow(width: menuWidth, text: "Server unreachable")))
         } else {
             for providerID in visibleOrder(state) {
                 let accounts = (state?.accounts ?? []).filter { $0.provider == providerID }
-                let section = NSMenuItem(title: providerNames[providerID] ?? providerID, action: nil, keyEquivalent: "")
-                section.isEnabled = false
-                menu.addItem(section)
-                if accounts.isEmpty {
-                    let empty = NSMenuItem(title: "    No accounts", action: nil, keyEquivalent: "")
-                    empty.isEnabled = false
-                    menu.addItem(empty)
-                    continue
-                }
-                for account in accounts {
-                    for item in accountMenuItems(account) {
-                        menu.addItem(item)
-                    }
-                }
+                if accounts.isEmpty { continue } // dead sections stay out of the menu
+                menu.addItem(menuItemWithView(sectionLabel(providerNames[providerID] ?? providerID, width: menuWidth)))
+                menu.addItem(menuItemWithView(providerCard(providerID: providerID, accounts: accounts)))
             }
         }
 
         menu.addItem(.separator())
-        let openItem = NSMenuItem(title: "Open web app", action: #selector(openWebApp), keyEquivalent: "")
-        openItem.target = self
-        menu.addItem(openItem)
 
-        let startAtLogin = NSMenuItem(title: "Start at login", action: #selector(toggleStartAtLogin), keyEquivalent: "")
-        startAtLogin.target = self
-        startAtLogin.state = startAtLoginEnabled() ? .on : .off
-        menu.addItem(startAtLogin)
+        // Bottom action buttons.
+        let installAvailable = state?.update?.update_available == true
+        let updateTitle = installAvailable ? "Install update" : "Check for updates"
+        let actionRow = NSStackView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 42))
+        actionRow.orientation = .horizontal
+        actionRow.distribution = .fillEqually
+        actionRow.spacing = 8
+        actionRow.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 8, right: 10)
+        let webButton = roundButton(width: (menuWidth - 38) / 2, title: "Open web app", target: self, action: #selector(openWebApp))
+        let updateButton = roundButton(width: (menuWidth - 38) / 2, title: updateTitle, target: self, action: #selector(runUpdate))
+        actionRow.addArrangedSubview(webButton)
+        actionRow.addArrangedSubview(updateButton)
+        menu.addItem(menuItemWithView(actionRow))
 
-        menu.addItem(.separator())
+        // Start at login with a real toggle switch.
+        let toggleCard = cardView(width: menuWidth, height: 42)
+        let field = label("Start at login", font: NSFont.systemFont(ofSize: 13), color: inkColor)
+        field.frame = NSRect(x: 12, y: 13, width: menuWidth - 80, height: 16)
+        toggleCard.addSubview(field)
+        let toggle = NSSwitch(frame: NSRect(x: menuWidth - 58, y: 8, width: 44, height: 26))
+        toggle.state = startAtLoginEnabled() ? .on : .off
+        toggle.target = self
+        toggle.action = #selector(toggleStartAtLogin)
+        toggleCard.addSubview(toggle)
+        menu.addItem(menuItemWithView(toggleCard))
+
         let quitItem = NSMenuItem(title: "Quit Switcher", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
 
-    func accountMenuItems(_ account: Account) -> [NSMenuItem] {
-        var items: [NSMenuItem] = []
-        let plan = account.plan.flatMap { planNames[$0] }.map { " · " + $0 } ?? ""
-        var status = ""
-        if let until = account.exhausted_until, Date(timeIntervalSince1970: until) > Date() {
-            status = " · Out of usage"
+    func providerCard(providerID: String, accounts: [Account]) -> NSView {
+        let height = accounts.reduce(CGFloat(8)) { $0 + rowHeight(for: $1) }
+        let card = cardView(width: menuWidth, height: height)
+        var y = height
+        for (index, account) in accounts.enumerated() {
+            y -= rowHeight(for: account)
+
+            let row = ClickableRow(frame: NSRect(x: 0, y: y, width: menuWidth, height: rowHeight(for: account)))
+            row.onClicked = { [weak self] in
+                self?.post(path: "api/accounts/\(account.id)/activate") { [weak self] in
+                    DispatchQueue.main.async { self?.rebuildMenu() }
+                }
+            }
+
+            let logo = NSImageView(frame: NSRect(x: 12, y: rowHeight(for: account) / 2 - 12, width: 24, height: 24))
+            let logoImage = NSImage(named: NSImage.Name("logo-" + providerID))
+            logoImage?.size = NSSize(width: 24, height: 24)
+            logo.image = logoImage
+            if providerID == "grok" || providerID == "opencode" { logoImage?.isTemplate = true }
+            row.addSubview(logo)
+
+            let plan = account.plan.flatMap { planNames[$0] }.map { " · " + $0 } ?? ""
+            let title = label(truncate(account.email, 24) + plan,
+                font: NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular),
+                color: account.active ? accentColor : inkColor)
+            title.frame = NSRect(x: 44, y: rowHeight(for: account) - 18, width: menuWidth - 110, height: 15)
+            row.addSubview(title)
+
+            var usageY = rowHeight(for: account) - 32
+            for window in account.usage?.windows ?? [] {
+                let left = max(0, min(100, 100 - window.used_percent))
+                let usage = label("   " + window.label + ": \(left)% left",
+                    font: NSFont.systemFont(ofSize: 11), color: dimColor)
+                usage.frame = NSRect(x: 44, y: usageY, width: menuWidth - 110, height: 14)
+                row.addSubview(usage)
+                usageY -= 15
+            }
+
+            if account.active {
+                let check = NSImageView(frame: NSRect(x: menuWidth - 26, y: rowHeight(for: account) / 2 - 6, width: 13, height: 13))
+                check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
+                check.contentTintColor = accentColor
+                row.addSubview(check)
+            } else if let until = account.exhausted_until, Date(timeIntervalSince1970: until) > Date() {
+                let badge = label("Out of usage", font: NSFont.systemFont(ofSize: 10.5), color: warnColor)
+                badge.alignment = .right
+                badge.frame = NSRect(x: menuWidth - 96, y: rowHeight(for: account) - 18, width: 86, height: 14)
+                row.addSubview(badge)
+            }
+
+            if index < accounts.count - 1 {
+                let divider = NSView(frame: NSRect(x: 12, y: y, width: menuWidth - 24, height: 1))
+                divider.wantsLayer = true
+                divider.layer?.backgroundColor = cardBorderColor.cgColor
+                card.addSubview(divider)
+            }
+            card.addSubview(row)
         }
-        let line = NSMenuItem(
-            title: truncate(account.email, 34) + plan + status,
-            action: nil, keyEquivalent: "")
-        line.isEnabled = false
-        if account.active { line.state = .on }
-        items.append(line)
-        for window in account.usage?.windows ?? [] {
-            let left = max(0, min(100, 100 - window.used_percent))
-            let usage = NSMenuItem(title: "    " + window.label + ": \(left)% left", action: nil, keyEquivalent: "")
-            usage.isEnabled = false
-            items.append(usage)
-        }
-        if !account.active {
-            let use = NSMenuItem(title: "    Use this account", action: #selector(useAccount(_:)), keyEquivalent: "")
-            use.target = self
-            use.representedObject = account.id
-            items.append(use)
-        }
-        return items
+        return card
     }
 
-    // MARK: - actions
+    func rowHeight(for account: Account) -> CGFloat {
+        let windows = CGFloat(account.usage?.windows?.count ?? 0)
+        return 24 + windows * 15
+    }
+
+    // MARK: actions
 
     @objc func openWebApp() {
         NSWorkspace.shared.open(hubURL)
     }
 
-    @objc func useAccount(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        var request = URLRequest(url: hubURL.appendingPathComponent("api/accounts/\(id)/activate"))
-        request.httpMethod = "POST"
-        URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
-            DispatchQueue.main.async { self?.rebuildMenu() }
-        }.resume()
+    @objc func runUpdate() {
+        post(path: "api/update") { [weak self] in
+            DispatchQueue.main.async {
+                // The server exec-restarts; give it a beat, then refresh.
+                Thread.sleep(forTimeInterval: 1.5)
+                self?.rebuildMenu()
+            }
+        }
     }
 
     @objc func toggleStartAtLogin() {
@@ -201,50 +359,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func quit() {
-        if let process = serverProcess, process.isRunning {
-            process.terminate()
-        }
+        if let process = serverProcess, process.isRunning { process.terminate() }
         NSApp.terminate(nil)
-    }
-
-    // MARK: - helpers
-
-    let launchAgentPath = launchAgentLabel
-
-    func fetchState(timeout: Double = 5) -> AppState? {
-        guard let data = fetchData(hubURL.appendingPathComponent("api/state"), timeout: timeout) else {
-            return nil
-        }
-        return try? JSONDecoder().decode(AppState.self, from: data)
-    }
-
-    func fetchData(_ url: URL, timeout: Double) -> Data? {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = timeout
-        let semaphore = DispatchSemaphore(value: 0)
-        var payload: Data?
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            payload = data
-            semaphore.signal()
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + timeout)
-        return payload
-    }
-
-    func visibleOrder(_ state: AppState?) -> [String] {
-        let order = state?.order ?? ["codex", "claude", "grok", "opencode"]
-        let hidden = Set(state?.hidden ?? [])
-        return order.filter { !hidden.contains($0) }
-    }
-
-    func truncate(_ s: String, _ n: Int) -> String {
-        s.count > n ? String(s.prefix(n)) + "…" : s
     }
 
     func startAtLoginEnabled() -> Bool {
         FileManager.default.fileExists(atPath: launchAgentPath)
     }
+
 }
+
+// menuItemWithView attaches a custom view to a menu item.
+
+
+
+
+
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
