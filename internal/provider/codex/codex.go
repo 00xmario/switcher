@@ -189,7 +189,7 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	req.Header.Set("User-Agent", codexUserAgent)
 	req.Header.Set("originator", "codex_cli_rs")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
 	}
@@ -243,6 +243,10 @@ func windowLabel(seconds int64) string {
 
 // codexUserAgent mirrors the CLI's User-Agent so usage queries pass the
 // upstream's client checks the same way proxied traffic does.
+// oauthClient bounds token and refresh exchanges so a stalled upstream
+// cannot hold the callback request open for minutes.
+var oauthHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 const codexUserAgent = "codex_cli_rs/0.154.0 (Mac OS 26.0.0; arm64)"
 
 // ParseRateLimit implements provider.Provider. Codex reports subscription
@@ -418,7 +422,7 @@ func tokenRequest(ctx context.Context, form url.Values) (oauthToken, error) {
 		return oauthToken{}, fmt.Errorf("token request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return oauthToken{}, fmt.Errorf("token request: %w", err)
 	}

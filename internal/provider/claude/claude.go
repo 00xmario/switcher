@@ -165,7 +165,7 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-beta", oauthBeta)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("refresh request: %w", err)
 	}
@@ -411,6 +411,10 @@ func accountFromToken(tok oauthToken) (store.Account, error) {
 	acc.ID = fmt.Sprintf("%s-%x", acc.Provider, sum[:4])
 	return acc, nil
 }
+
+// oauthHTTPClient bounds token and refresh exchanges so a stalled upstream
+// cannot hold the callback request open.
+var oauthHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // keychainCreds mirrors the JSON the Claude Code CLI stores in the macOS
 // keychain (service "Claude Code-credentials").
