@@ -45,6 +45,7 @@ const PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', grok: 'Grok', opencod
 
 // ChatGPT plan tiers as OpenAI markets them.
 const PLAN_NAMES = {
+  max: 'Max 20x',
   pro: 'Pro 20x',
   prolite: 'Pro 5x',
   plus: 'Plus',
@@ -425,9 +426,25 @@ document.getElementById('update-slot').addEventListener('click', (event) => {
   if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
 });
 
-// startProviderLogin runs the OAuth (or device) flow for a provider and
-// polls it in the background. Shared by "Add account" and "Relogin".
+// startProviderLogin reuses the provider CLI's own stored login when one
+// exists (T3 Code's trick: the Claude Code CLI keeps its tokens in the
+// keychain), and falls back to the browser flow otherwise. Shared by
+// "Add account" and "Relogin".
 async function startProviderLogin(providerID) {
+  try {
+    const res = await fetch('/api/login/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: providerID }),
+    });
+    if (res.ok) {
+      const body = await res.json();
+      toast(`Imported the ${PROVIDER_NAMES[providerID] || providerID} CLI login: ${body.account.email}`);
+      await refreshState();
+      await refreshAllUsage();
+      return;
+    }
+  } catch { /* fall through to the interactive flow */ }
   const login = await api('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

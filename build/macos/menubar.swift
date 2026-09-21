@@ -45,7 +45,7 @@ struct AppState: Codable {
 }
 
 let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode"]
-let planNames = ["pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free"]
+let planNames = ["max": "Max 20x", "pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free"]
 
 // Palette mirrors the web app's light and dark tokens (web/style.css).
 // Layer colours cannot be dynamic NSColors, so the menu picks a palette from

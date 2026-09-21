@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -409,6 +410,114 @@ func accountFromToken(tok oauthToken) (store.Account, error) {
 	sum := sha256.Sum256([]byte(acc.Provider + "|" + acc.Email + "|" + tok.Account.UUID))
 	acc.ID = fmt.Sprintf("%s-%x", acc.Provider, sum[:4])
 	return acc, nil
+}
+
+// keychainCreds mirrors the JSON the Claude Code CLI stores in the macOS
+// keychain (service "Claude Code-credentials").
+type keychainCreds struct {
+	McpOAuth      map[string]any `json:"mcpOAuth"`
+	ClaudeAiOauth struct {
+		AccessToken      string   `json:"accessToken"`
+		RefreshToken     string   `json:"refreshToken"`
+		ExpiresAt        int64    `json:"expiresAt"` // unix ms
+		SubscriptionType string   `json:"subscriptionType"`
+		Scopes           []string `json:"scopes"`
+	} `json:"claudeAiOauth"`
+}
+
+// profile mirrors api.anthropic.com/api/oauth/profile.
+type claudeProfile struct {
+	Account struct {
+		UUID  string `json:"uuid"`
+		Email string `json:"email"`
+	} `json:"account"`
+	Organization struct {
+		Name string `json:"name"`
+	} `json:"organization"`
+	HasClaudeMax bool `json:"has_claude_max"`
+	HasClaudePro bool `json:"has_claude_pro"`
+}
+
+// ImportFromKeychain implements the optional importer interface: it lifts
+// the tokens the Claude Code CLI already stores in the macOS keychain, so a
+// machine that signed in to Claude Code gets a Switcher account with no
+// browser flow at all (the same trick T3 Code plays). The first import may
+// prompt the user to approve keychain access for the `security` tool.
+func (p *Provider) ImportFromKeychain(ctx context.Context) (store.Account, error) {
+	out, err := exec.CommandContext(ctx, "security", "find-generic-password",
+		"-s", "Claude Code-credentials", "-w").Output()
+	if err != nil {
+		return store.Account{}, fmt.Errorf("no Claude Code CLI credentials in the keychain")
+	}
+	var creds keychainCreds
+	if err := json.Unmarshal(bytes.TrimSpace(out), &creds); err != nil {
+		return store.Account{}, fmt.Errorf("decode keychain credentials: %w", err)
+	}
+	oauth := creds.ClaudeAiOauth
+	if oauth.AccessToken == "" || oauth.RefreshToken == "" {
+		return store.Account{}, errors.New("keychain credentials have no OAuth token")
+	}
+
+	acc := store.Account{
+		Provider:  "claude",
+		Plan:      oauth.SubscriptionType,
+		CreatedAt: time.Now().Unix(),
+		Token: store.Token{
+			AccessToken:  oauth.AccessToken,
+			RefreshToken: oauth.RefreshToken,
+			ExpiresAt:    oauth.ExpiresAt / 1000,
+		},
+	}
+	// Expired or about to: refresh right away so the account is usable.
+	if time.Now().Add(2*time.Minute).Unix() >= acc.Token.ExpiresAt {
+		if err := p.Refresh(ctx, &acc); err != nil {
+			return store.Account{}, fmt.Errorf("refresh expired CLI token: %w", err)
+		}
+	}
+
+	profile, err := p.fetchProfile(ctx, acc.Token.AccessToken)
+	if err != nil {
+		return store.Account{}, fmt.Errorf("claude profile: %w", err)
+	}
+	acc.Email = profile.Account.Email
+	acc.Token.AccountID = profile.Account.UUID
+	if profile.HasClaudeMax {
+		acc.Plan = "max"
+	} else if profile.HasClaudePro {
+		acc.Plan = "pro"
+	}
+	if acc.Email == "" {
+		return store.Account{}, errors.New("claude profile has no email")
+	}
+	sum := sha256.Sum256([]byte(acc.Provider + "|" + acc.Email + "|" + profile.Account.UUID))
+	acc.ID = fmt.Sprintf("%s-%x", acc.Provider, sum[:4])
+	return acc, nil
+}
+
+func (p *Provider) fetchProfile(ctx context.Context, accessToken string) (claudeProfile, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.anthropic.com/api/oauth/profile", nil)
+	if err != nil {
+		return claudeProfile{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("anthropic-beta", oauthBeta)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return claudeProfile{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return claudeProfile{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return claudeProfile{}, fmt.Errorf("profile http %d", resp.StatusCode)
+	}
+	var profile claudeProfile
+	if err := json.Unmarshal(raw, &profile); err != nil {
+		return claudeProfile{}, err
+	}
+	return profile, nil
 }
 
 // gcVerifiersLocked drops verifiers for abandoned logins.

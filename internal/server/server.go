@@ -51,6 +51,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("GET /api/state", a.handleState)
 	mux.HandleFunc("POST /api/login", a.handleLoginStart)
+	mux.HandleFunc("POST /api/login/import", a.handleLoginImport)
 	mux.HandleFunc("GET /api/login/{state}", a.handleLoginPoll)
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
@@ -222,6 +223,49 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"version":            a.Version,
 		"update":             a.UpdateState(),
 	})
+}
+
+// importer is the optional provider capability of reusing credentials the
+// provider's own CLI already stores on this machine.
+type importer interface {
+	ImportFromKeychain(ctx context.Context) (store.Account, error)
+}
+
+// handleLoginImport creates an account from the provider CLI's locally
+// stored credentials (Claude Code's keychain entry). Answers 501 when the
+// provider has no importer and 409 when there is nothing to import, so the
+// web UI can fall back to the browser flow.
+func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	prov, ok := a.Providers[body.Provider]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown provider"})
+		return
+	}
+	imp, ok := prov.(importer)
+	if !ok {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "provider has no import path"})
+		return
+	}
+	account, err := imp.ImportFromKeychain(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := a.Store.Save(account); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "save account: " + err.Error()})
+		return
+	}
+	if a.Proxy.ActiveID(account.Provider) == "" {
+		_ = a.Proxy.Activate(account.ID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": viewOfBase(a, account)})
 }
 
 func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
