@@ -118,6 +118,15 @@ function statusOf(account) {
   return { cls: '', label: 'Idle' };
 }
 
+// PROVIDER_BAR_COLORS mirrors T3 Code's usageProviders.ts: the fill is the
+// theme's foreground colour (provider-tinted), so it reads on both themes.
+const PROVIDER_BAR_COLORS = {
+  codex: 'var(--text)',
+  claude: '#d97757',
+  grok: 'color-mix(in oklab, var(--text) 72%, var(--bg))',
+  opencode: 'var(--text)',
+};
+
 function windowHTML(win, providerID) {
   const left = Math.max(0, Math.min(100, 100 - win.used_percent));
   const used = 100 - left;
@@ -127,7 +136,10 @@ function windowHTML(win, providerID) {
   const recovery = left < 100
     ? `<div class="recover">↻ +${used}% in ${remaining || 'a moment'}</div>`
     : '';
-  const bar = `<div class="bar"><div class="fill" style="width:${left}%"></div><span class="bar-pill ${left === 0 ? 'zero' : ''}">${escapeHTML(`${name} ${left}%`)}</span></div>`;
+  const color = PROVIDER_BAR_COLORS[providerID] || 'var(--text)';
+  const fill = left > 0 ? `<div class="fill" style="width:${left}%; background-color:${color}"></div>` : '';
+  const hatch = used > 0 ? `<div class="hatch" style="width:${used}%; color:${color}"></div>` : '';
+  const bar = `<div class="bar">${fill}${hatch}<span class="bar-label"><span class="bar-name">${escapeHTML(name)}</span><span class="bar-pct">${left}%</span></span><span class="reset-badge">${resetText}</span></div>`;
   return `
     <div class="window">
       <div class="win-left">
@@ -137,7 +149,6 @@ function windowHTML(win, providerID) {
       </div>
       <div class="win-bar">
         ${bar}
-        <span class="reset-badge">${resetText}</span>
       </div>
     </div>`;
 }

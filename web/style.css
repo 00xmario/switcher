@@ -14,9 +14,7 @@
   --accent-soft: rgba(63, 185, 111, .12);
   --chart-1: #3a3d42;
   --chart-fill: rgba(23, 25, 29, .08);
-  --pill-bg: #17191d;
-  --pill-text: #ffffff;
-  --pill-zero-text: #7a818c;
+  --muted: #f1f1f3;
   --warn: #b45309;
   --danger: #d0483a;
   --bar-fill: #565e69;
@@ -38,6 +36,7 @@ html[data-theme="dark"] {
   --faint: #5f5f5f;
   --accent: #3fb96f;
   --accent-soft: rgba(63, 185, 111, .14);
+  --muted: #161616;
   --chart-1: #e5e5e5;
   --chart-fill: rgba(255, 255, 255, .07);
   --warn: #d9a44f;
@@ -69,9 +68,7 @@ html[data-theme="dark"] {
     --shadow: 0 1px 2px rgb(0 0 0 / .3);
     --chart-1: #e5e5e5;
     --chart-fill: rgba(255, 255, 255, .07);
-    --pill-bg: #3f4145;
-    --pill-text: #ffffff;
-    --pill-zero-text: #a3a3a3;
+    --muted: #161616;
   }
 }
 
@@ -309,62 +306,58 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
 .win-pct span { font-size: 14px; font-weight: 450; color: var(--dim); margin-left: 6px; letter-spacing: 0; }
 .recover { color: var(--dim); font-size: 13px; margin-top: 3px; }
 
-.win-bar { flex: 1; position: relative; height: 42px; }
+.win-bar { flex: 1; position: relative; height: 38px; }
 .bar {
   position: absolute;
   inset: 0;
-  border-radius: 10px;
-  background: repeating-linear-gradient(
-    -45deg,
-    transparent 0 6px,
-    var(--border) 6px 7px
-  );
+  border-radius: 9px;
+  background: var(--muted);
   overflow: hidden;
 }
+/* T3 Code's bar: the remaining share is the provider colour at 35% opacity,
+   the spent share is hatched with the same colour, and the label is plain
+   foreground text sitting on top - it adapts to the theme on its own. */
 .fill {
   position: absolute;
   inset: 0 auto 0 0;
-  background: var(--bar-fill);
-  border-radius: 10px;
-  display: flex;
-  align-items: center;
-  color: var(--bar-fill-text);
-  font-size: 14px;
-  font-weight: 550;
-  white-space: nowrap;
-  min-width: 0;
-  overflow: hidden;
-}
-.fill span { display: none; }
-.bar-pill {
-  position: absolute;
-  left: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 2;
-  background: var(--pill-bg);
-  color: var(--pill-text);
-  font-size: 14px;
-  font-weight: 550;
-  white-space: nowrap;
-  padding: 7px 12px;
+  opacity: .35;
   border-radius: 9px;
 }
-.bar-pill.zero { color: var(--pill-zero-text); background: transparent; padding-left: 4px; }
+.hatch {
+  position: absolute;
+  inset: 0 0 0 auto;
+  opacity: .2;
+  background-image: repeating-linear-gradient(135deg, currentColor 0 1px, transparent 1px 5px);
+}
+.bar-label {
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+  z-index: 1;
+}
+.bar-name { font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.bar-pct { font-weight: 600; font-variant-numeric: tabular-nums; }
 .reset-badge {
   position: absolute;
-  right: 10px;
+  right: 8px;
   top: 50%;
   transform: translateY(-50%);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  font-size: 12.5px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  border-radius: 6px;
+  font-size: 11.5px;
   color: var(--dim);
-  padding: 4px 10px;
+  padding: 3px 8px;
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  z-index: 1;
+  white-space: nowrap;
 }
 
 .unknown {

@@ -73,10 +73,32 @@ only integration point; a new provider is one package.
 
 ## Install
 
-Requires Go 1.24+.
+### macOS app (recommended)
+
+1. Grab the latest `Switcher_<version>.dmg` from
+   [Releases](https://github.com/00xmario/switcher/releases/latest).
+2. Open the DMG and drag **Switcher.app** into **Applications**.
+3. Eject the DMG after copying.
+4. Launch Switcher from Applications. It starts a menu bar icon (`⇄`) plus
+   the local server on `127.0.0.1:8787`.
+
+Switcher is signed ad-hoc because it ships outside the App Store without a
+paid Developer ID, so macOS Gatekeeper may block the first launch. Clear the
+quarantine flag once with:
 
 ```sh
-git clone <your-fork-url> && cd switcher
+xattr -dr com.apple.quarantine /Applications/Switcher.app
+```
+
+Then launch normally. To have it start at login, open the menu bar dropdown
+and enable **Start at login**.
+
+### From source
+
+Requires Go 1.27+.
+
+```sh
+git clone https://github.com/00xmario/switcher && cd switcher
 make install          # builds and puts `switcher` on your PATH
 ```
 
