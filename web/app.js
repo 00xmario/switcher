@@ -344,12 +344,12 @@ providersEl.addEventListener('click', async (event) => {
       await api(`/api/accounts/${id}/activate`, { method: 'POST' });
       await refreshState();
     } else if (button.dataset.act === 'relogin') {
-      // Account ids derive from provider + email + upstream account id, so
-      // signing in to the same account overwrites it in place: the id, the
-      // active slot, and every window survive.
+      // Relogin threads the account id through the flow: when the signed-in
+      // identity matches, the tokens overwrite that account in place (the
+      // id, the active slot, and the windows survive).
       button.disabled = true;
       try {
-        await startProviderLogin(button.dataset.provider);
+        await startProviderLogin(button.dataset.provider, id);
       } finally {
         button.disabled = false;
       }
@@ -430,7 +430,7 @@ document.getElementById('update-slot').addEventListener('click', (event) => {
 // exists (T3 Code's trick: the Claude Code CLI keeps its tokens in the
 // keychain), and falls back to the browser flow otherwise. Shared by
 // "Add account" and "Relogin".
-async function startProviderLogin(providerID) {
+async function startProviderLogin(providerID, reloginOf) {
   try {
     const res = await fetch('/api/login/import', {
       method: 'POST',
@@ -448,7 +448,7 @@ async function startProviderLogin(providerID) {
   const login = await api('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider: providerID }),
+    body: JSON.stringify({ provider: providerID, relogin_of: reloginOf || undefined }),
   });
   if (login.kind === 'device') {
     showDeviceModal(login.verification_url, login.user_code);

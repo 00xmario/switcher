@@ -274,7 +274,8 @@ func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Provider string `json:"provider"`
+		Provider  string `json:"provider"`
+		ReloginOf string `json:"relogin_of"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -285,7 +286,7 @@ func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown provider"})
 		return
 	}
-	handle, err := a.Logins.Start(r.Context(), prov)
+	handle, err := a.Logins.Start(r.Context(), prov, body.ReloginOf)
 	if errors.Is(err, provider.ErrUnsupported) {
 		// Providers without a browser callback (grok) use the device
 		// authorization grant instead: also a web login, just with a code.

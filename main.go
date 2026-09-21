@@ -120,7 +120,7 @@ func run(port int) {
 			return proxyManager.Activate(a.ID)
 		}
 		return nil
-	})
+	}, st.Get)
 	mgmtAPI := &mgmtapi.API{Store: st, Proxy: proxyManager, Logins: logins, ManagementKey: managementKey}
 
 	updater := update.New(version)
