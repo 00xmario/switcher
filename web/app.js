@@ -181,6 +181,7 @@ function accountHTML(account) {
             ${isActive ? 'Active' : 'Use this account'}
           </button>
           ${account.reset_credits ? `<button data-act="use-reset" title="Spend one banked reset: clears this account's out-of-usage state">Use reset</button>` : ''}
+          ${ADD_METHOD[account.provider] === 'key' ? '' : `<button data-act="relogin" data-provider="${escapeHTML(account.provider)}" title="Sign in again to refresh this account's tokens in place">Relogin</button>`}
           <button data-act="delete" title="Remove account">Remove</button>
         </div>
       </div>
@@ -341,6 +342,17 @@ providersEl.addEventListener('click', async (event) => {
     if (button.dataset.act === 'activate') {
       await api(`/api/accounts/${id}/activate`, { method: 'POST' });
       await refreshState();
+    } else if (button.dataset.act === 'relogin') {
+      // Account ids derive from provider + email + upstream account id, so
+      // signing in to the same account overwrites it in place: the id, the
+      // active slot, and every window survive.
+      button.disabled = true;
+      try {
+        await startProviderLogin(button.dataset.provider);
+      } finally {
+        button.disabled = false;
+      }
+      await refreshState();
     } else if (button.dataset.act === 'use-reset') {
       button.disabled = true;
       const res = await api(`/api/accounts/${id}/use-reset`, { method: 'POST' });
@@ -413,6 +425,30 @@ document.getElementById('update-slot').addEventListener('click', (event) => {
   if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
 });
 
+// startProviderLogin runs the OAuth (or device) flow for a provider and
+// polls it in the background. Shared by "Add account" and "Relogin".
+async function startProviderLogin(providerID) {
+  const login = await api('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: providerID }),
+  });
+  if (login.kind === 'device') {
+    showDeviceModal(login.verification_url, login.user_code);
+  } else {
+    const w = 520, h = 720;
+    const left = Math.max(0, Math.round((screen.width - w) / 2));
+    const top = Math.max(0, Math.round((screen.height - h) / 2));
+    const popup = window.open(login.url, 'switcher-login', `width=${w},height=${h},left=${left},top=${top}`);
+    if (!popup) {
+      // Popup blocked: navigate this tab; the callback page says how to get back.
+      location.href = login.url;
+      return;
+    }
+  }
+  pollLogin(login.state); // detached: the button stays usable for another attempt
+}
+
 providersEl.addEventListener('click', async (event) => {
   const add = event.target.closest('button[data-add]');
   if (!add || add.disabled) return;
@@ -431,25 +467,7 @@ providersEl.addEventListener('click', async (event) => {
       await refreshState();
       await refreshAllUsage();
     } else {
-      const login = await api('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: providerID }),
-      });
-      if (login.kind === 'device') {
-        showDeviceModal(login.verification_url, login.user_code);
-      } else {
-        const w = 520, h = 720;
-        const left = Math.max(0, Math.round((screen.width - w) / 2));
-        const top = Math.max(0, Math.round((screen.height - h) / 2));
-        const popup = window.open(login.url, 'switcher-login', `width=${w},height=${h},left=${left},top=${top}`);
-        if (!popup) {
-          // Popup blocked: navigate this tab; the callback page says how to get back.
-          location.href = login.url;
-          return;
-        }
-      }
-      pollLogin(login.state); // detached: the button stays usable for another attempt
+      await startProviderLogin(providerID);
     }
   } catch (err) {
     toast(err.message);
