@@ -36,6 +36,7 @@ import (
 	"switcher/internal/provider/opencode"
 	"switcher/internal/proxy"
 	"switcher/internal/server"
+	"switcher/internal/settings"
 	"switcher/internal/store"
 	"switcher/internal/update"
 	"switcher/internal/usage"
@@ -89,6 +90,12 @@ func run(port int) {
 	proxyManager, err := proxy.New(st, providers)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
+	}
+
+	settingsStore := settings.New(config.Dir())
+	// The device token exists for the menu bar app as soon as auth is on.
+	if settingsStore.Enabled() {
+		_, _ = settingsStore.EnsureDeviceToken()
 	}
 
 	// The management key lets tools like T3 Code talk to Switcher's
@@ -152,6 +159,7 @@ func run(port int) {
 	api := &server.API{
 		Store: st, Logins: logins, Proxy: proxyManager, Providers: providers,
 		ManagementKey: managementKey, Version: version, Updater: updater, Usage: usageService,
+		Settings: settingsStore,
 	}
 
 	// Each provider with a browser redirect has its own callback listener;
@@ -194,18 +202,38 @@ func run(port int) {
 		staticHandler.ServeHTTP(w, r)
 	}))
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	log.Printf("Switcher v%s running: http://127.0.0.1:%d (codex proxy on the same port under /v1)", version, port)
-	// Timeouts: slowloris from any local process should not hold
-	// goroutines and FDs forever. No WriteTimeout: proxied streaming
-	// responses (SSE) may legitimately stay open for minutes.
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           server.LocalOnly(port, mux),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       120 * time.Second,
+
+	// Listener topology: the loopback listener is always plain HTTP (the
+	// CLIs, T3 Code, and the menu bar app need no configuration), and the
+	// optional LAN listener is always TLS. Binding the LAN without a
+	// password on disk is refused: no TOFU window. LocalOnly runs outside
+	// the auth gate so rebinding checks happen pre-auth.
+	gate := &server.AuthGate{Store: settingsStore}
+	loopback := server.Listener{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: server.LocalOnlyWith(server.LocalOptions{Port: port}, gate.Wrap(mux)),
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	listeners := []server.Listener{loopback}
+	if settingsStore.Load().BindLAN && settingsStore.Load().TLS && settingsStore.HasPassword() {
+		if lan := server.LANAddress(); lan != "" {
+			cert, err := server.EnsureTLSCert(config.Dir(), lan, port)
+			if err != nil {
+				log.Printf("lan listener: tls setup failed: %v", err)
+			} else {
+				listeners = append(listeners, server.Listener{
+					Addr:    fmt.Sprintf("%s:%d", lan, port),
+					TLS:     true,
+					Cert:    cert,
+					Handler: server.LocalOnlyWith(server.LocalOptions{Port: port, LANHost: lan}, gate.Wrap(mux)),
+				})
+				log.Printf("lan listener: https://%s:%d (self-signed)", lan, port)
+			}
+		} else {
+			log.Printf("lan binding requested but no non-loopback IPv4 address found")
+		}
+	}
+	if err := server.ServeAll(listeners); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }

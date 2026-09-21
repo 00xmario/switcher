@@ -11,15 +11,20 @@ import (
 	"strings"
 	"time"
 
+	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"switcher/internal/login"
 	"switcher/internal/provider"
 	"switcher/internal/proxy"
+	"switcher/internal/settings"
 	"switcher/internal/store"
 	"switcher/internal/update"
 	"switcher/internal/usage"
 	"sync"
+	"syscall"
 )
 
 // API wraps the JSON API the web UI talks to.
@@ -32,6 +37,7 @@ type API struct {
 	Version       string
 	Updater       *update.Checker
 	Usage         *usage.Service
+	Settings      *settings.Store
 
 	creditsMu    sync.Mutex
 	creditsCache map[string]creditsEntry
@@ -51,6 +57,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("GET /api/state", a.handleState)
 	mux.HandleFunc("POST /api/login", a.handleLoginStart)
+	a.registerAuthRoutes(mux)
 	mux.HandleFunc("POST /api/login/import", a.handleLoginImport)
 	mux.HandleFunc("GET /api/login/{state}", a.handleLoginPoll)
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
@@ -72,9 +79,21 @@ func (a *API) Register(mux *http.ServeMux) {
 // changing methods, rejects cross-site browser requests via the Origin and
 // Sec-Fetch-Site headers. The codex proxy path is intentionally exempt:
 // the CLI sends no Origin header.
+// LocalOptions configures the LocalOnly middleware: which port the
+// listener serves and, when a LAN listener is active, the LAN host that
+// counts as local.
+type LocalOptions struct {
+	Port    int
+	LANHost string // bound LAN IP; empty means loopback-only
+}
+
 func LocalOnly(port int, next http.Handler) http.Handler {
+	return LocalOnlyWith(LocalOptions{Port: port}, next)
+}
+
+func LocalOnlyWith(opts LocalOptions, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isLocalHost(r.Host, port) {
+		if !isLocalHost(r.Host, opts.LANHost) {
 			http.Error(w, "switcher only accepts local connections", http.StatusForbidden)
 			return
 		}
@@ -87,7 +106,7 @@ func LocalOnly(port int, next http.Handler) http.Handler {
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if origin := r.Header.Get("Origin"); origin != "" && !isLocalOrigin(origin, port) {
+			if origin := r.Header.Get("Origin"); origin != "" && !isLocalOrigin(origin, opts) {
 				http.Error(w, "cross-origin requests are not allowed", http.StatusForbidden)
 				return
 			}
@@ -96,27 +115,32 @@ func LocalOnly(port int, next http.Handler) http.Handler {
 	})
 }
 
-func isLocalHost(host string, port int) bool {
+func isLocalHost(host string, lanHost string) bool {
 	host = strings.ToLower(host)
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+	if host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]" {
+		return true
+	}
+	return lanHost != "" && host == strings.ToLower(lanHost)
 }
 
 // isLocalOrigin parses the origin and requires a loopback host on the
 // server's own port; any-port localhost origins are rejected.
-func isLocalOrigin(origin string, port int) bool {
+func isLocalOrigin(origin string, opts LocalOptions) bool {
 	u, err := url.Parse(strings.ToLower(origin))
 	if err != nil {
 		return false
 	}
 	host := u.Hostname()
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-		return false
+		if opts.LANHost == "" || host != strings.ToLower(opts.LANHost) {
+			return false
+		}
 	}
 	portText := u.Port()
-	return portText == strconv.Itoa(port)
+	return portText == strconv.Itoa(opts.Port)
 }
 
 // accountView is the API representation of one account, including the
@@ -213,16 +237,23 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 	if hidden == nil {
 		hidden = []string{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"active":             a.Proxy.ActiveAll(),
-		"accounts":           views,
-		"order":              order,
-		"hidden":             hidden,
-		"hub_url":            "http://127.0.0.1:8787",
-		"hub_management_key": a.ManagementKey,
-		"version":            a.Version,
-		"update":             a.UpdateState(),
-	})
+	// The management key is only disclosed to cookie-authenticated
+	// browsers (or when auth is off): a device token is the same trust
+	// tier as the local files, so it earns the state but not the key.
+	revealHubKey := AuthKind(r) != AuthDevice
+	state := map[string]any{
+		"active":   a.Proxy.ActiveAll(),
+		"accounts": views,
+		"order":    order,
+		"hidden":   hidden,
+		"hub_url":  "http://127.0.0.1:8787",
+		"version":  a.Version,
+		"update":   a.UpdateState(),
+	}
+	if revealHubKey {
+		state["hub_management_key"] = a.ManagementKey
+	}
+	writeJSON(w, http.StatusOK, state)
 }
 
 // importer is the optional provider capability of reusing credentials the
@@ -266,6 +297,239 @@ func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
 		_ = a.Proxy.Activate(account.ID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": viewOfBase(a, account)})
+}
+
+// registerAuthRoutes mounts the optional-authentication endpoints. These
+// are exempt from the auth gate itself (see authGate.gate) and enforce
+// their own rules: password setup is loopback-only, everything else is
+// rate limited and constant-time.
+func (a *API) registerAuthRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/auth/status", a.handleAuthStatus)
+	mux.HandleFunc("POST /api/auth/login", a.handleAuthLogin)
+	mux.HandleFunc("POST /api/auth/logout", a.handleAuthLogout)
+	mux.HandleFunc("POST /api/auth/password", a.handleAuthPassword)
+	mux.HandleFunc("POST /api/auth/disable", a.handleAuthDisable)
+	mux.HandleFunc("POST /api/auth/rotate-device-token", a.handleRotateDeviceToken)
+	mux.HandleFunc("GET /api/settings", a.handleSettingsGet)
+	mux.HandleFunc("PATCH /api/settings", a.handleSettingsPatch)
+}
+
+// loopbackOnly refuses requests that did not arrive on a loopback host.
+func loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
+	host := r.URL.Query().Get("_host")
+	_ = host
+	if !isLocalHost(r.Host, "") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only local requests may change credentials"})
+		return false
+	}
+	return true
+}
+
+func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	st := a.Settings.Load()
+	if !isLocalHost(r.Host, "") {
+		// Pre-auth info disclosure: a LAN client only learns whether auth
+		// is on and a password exists.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"auth_enabled": a.Settings.Enabled(),
+			"password_set": a.Settings.HasPassword(),
+		})
+		return
+	}
+	response := map[string]any{
+		"auth_enabled":     a.Settings.Enabled(),
+		"password_set":     a.Settings.HasPassword(),
+		"bind_lan":         st.BindLAN,
+		"tls":              st.TLS,
+		"lan_ip":           LANAddress(),
+		"sessions":         a.Settings.SessionCount(),
+		"device_token_set": a.Settings.HasDeviceToken(),
+	}
+	// A valid session cookie re-learns its CSRF token (localStorage was
+	// cleared but the browser kept the cookie).
+	if cookie, err := r.Cookie(sessionCookie); err == nil && a.Settings.ValidateSession(cookie.Value) {
+		response["csrf"] = a.Settings.CSRFToken()
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// handleAuthLogin verifies the password (rate limited, constant time) and
+// issues the session cookie plus the CSRF token for the web UI.
+func (a *API) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := a.Settings.CheckLockout(); err != nil {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		return
+	}
+	if !a.Settings.VerifyPassword(body.Password) {
+		a.Settings.RecordFailure()
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "wrong password"})
+		return
+	}
+	a.Settings.ResetFailures()
+	token, err := a.Settings.NewSession()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not create session"})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
+		MaxAge:   int((24 * time.Hour * 7).Seconds()),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "csrf": a.Settings.CSRFToken()})
+}
+
+func (a *API) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if cookie, err := r.Cookie(sessionCookie); err == nil {
+		a.Settings.DeleteSession(cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// handleAuthPassword sets the first password or changes it; both are
+// loopback-only when no password exists on disk yet (no TOFU from LAN).
+func (a *API) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	var body struct {
+		Current string `json:"current"`
+		Next    string `json:"next"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if a.Settings.HasPassword() {
+		if err := a.Settings.ChangePassword(body.Current, body.Next); err != nil {
+			if strings.Contains(err.Error(), "wrong password") {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	} else {
+		if err := a.Settings.SetPassword(body.Next); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	// Ensure the device token file so the menu bar app can authenticate.
+	_, _ = a.Settings.EnsureDeviceToken()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "csrf": a.Settings.CSRFToken()})
+}
+
+func (a *API) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if !a.Settings.VerifyPassword(body.Password) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "wrong password"})
+		return
+	}
+	if err := a.Settings.DisableAuth(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// handleRotateDeviceToken replaces the local device token. It is
+// loopback-only AND requires proof: a valid session (with CSRF) or the
+// current device token itself.
+func (a *API) handleRotateDeviceToken(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	authorized := false
+	if cookie, err := r.Cookie(sessionCookie); err == nil && a.Settings.ValidateSession(cookie.Value) {
+		if want := a.Settings.CSRFToken(); want != "" && subtleEqual(r.Header.Get(csrfHeader), want) {
+			authorized = true
+		}
+	}
+	if !authorized {
+		if token, err := a.Settings.ReadDeviceToken(); err == nil && subtleEqual(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), token) {
+			authorized = true
+		}
+	}
+	if !authorized {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticate to rotate the device token"})
+		return
+	}
+	if _, err := a.Settings.RotateDeviceToken(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// handleSettingsGet/Patch manage the network toggles. Enabling LAN requires
+// authentication enabled AND a password on disk (no TOFU window), and the
+// LAN listener is always TLS.
+func (a *API) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
+	st := a.Settings.Load()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"auth_enabled": st.AuthEnabled,
+		"bind_lan":     st.BindLAN,
+		"tls":          st.TLS,
+		"lan_ip":       LANAddress(),
+		"password_set": st.PasswordHash != "",
+	})
+}
+
+func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	var body struct {
+		BindLAN bool `json:"bind_lan"`
+		TLS     bool `json:"tls"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	st := a.Settings.Load()
+	if body.BindLAN && (!st.AuthEnabled || !a.Settings.HasPassword()) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "set a password before binding the LAN"})
+		return
+	}
+	if body.BindLAN {
+		body.TLS = true // LAN is TLS-only, enforced server-side
+	}
+	st.BindLAN = body.BindLAN
+	st.TLS = body.TLS
+	if err := a.Settings.Save(st); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	// The listeners live in main.go: re-exec in place so the new topology
+	// (LAN + TLS) takes effect immediately.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		restartSelf()
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
@@ -572,4 +836,19 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// restartSelf re-executes the running binary, preserving argv and env. Used
+// after settings changes that affect the listener topology.
+func restartSelf() {
+	current, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if current, err = filepath.EvalSymlinks(current); err != nil {
+		return
+	}
+	log.Printf("settings: restarting in place for the new listener topology")
+	time.Sleep(200 * time.Millisecond)
+	_ = syscall.Exec(current, os.Args, os.Environ())
 }

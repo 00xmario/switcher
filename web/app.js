@@ -57,11 +57,45 @@ const ADD_METHOD = { codex: 'browser', claude: 'browser', grok: 'device', openco
 
 /* ---------- helpers ---------- */
 
-async function api(path, options) {
+let authState = { enabled: false, locked: false };
+
+async function api(path, options = {}) {
+  // Cookie-authenticated state-changing requests must carry the CSRF
+  // token; attach it automatically so every call site stays simple.
+  if (options.method && options.method !== 'GET' && options.method !== 'HEAD') {
+    const csrf = localStorage.getItem('switcher-csrf');
+    if (csrf) {
+      options.headers = { 'X-Switcher-CSRF': csrf, ...(options.headers || {}) };
+    }
+  }
   const res = await fetch(path, options);
   const body = await res.json().catch(() => ({}));
+  if (res.status === 401 && body.auth_required) {
+    authLocked();
+    throw new Error('Authentication required');
+  }
   if (!res.ok) throw new Error(errorMessage(body, res.statusText));
   return body;
+}
+
+// authLocked swaps the page to the login view and stops the background
+// polling until the user signs in.
+function authLocked() {
+  if (authState.locked) return;
+  authState.locked = true;
+  clearInterval(stateTimer);
+  usageTimer && clearTimeout(usageTimer);
+  showLoginView();
+}
+
+// fetchWithCSRF attaches the CSRF token to state-changing requests when a
+// token is known.
+function fetchWithCSRF(path, options = {}) {
+  const csrf = localStorage.getItem('switcher-csrf') || '';
+  return fetch(path, {
+    ...options,
+    headers: { ...(options.headers || {}), 'X-Switcher-CSRF': csrf },
+  });
 }
 
 function errorMessage(body, fallback) {
@@ -421,10 +455,7 @@ providersEl.addEventListener('dragover', (event) => {
   target.parentNode.insertBefore(dragged, before ? target : target.nextSibling);
 });
 
-document.getElementById('update-slot').addEventListener('click', (event) => {
-  const updateBtn = event.target.closest('button[data-act="install-update"]');
-  if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
-});
+
 
 // startProviderLogin reuses the provider CLI's own stored login when one
 // exists (T3 Code's trick: the Claude Code CLI keeps its tokens in the
@@ -710,7 +741,7 @@ async function runUpdateFlow(button) {
 
 refreshState().then(refreshAllUsage);
 scheduleUsage();
-setInterval(refreshState, 4000);
+const stateTimer = setInterval(refreshState, 4000);
 
 
 /* ================= Usage page (cost + tokens) ================= */
@@ -1145,4 +1176,199 @@ if (location.hash === '#usage') setPage('usage');
 const themeParam = new URLSearchParams(location.search).get('theme');
 if (themeParam === 'dark' || themeParam === 'light' || themeParam === 'system') {
   applyTheme(themeParam);
+}
+
+/* ================= Optional authentication ================= */
+
+// showLoginView replaces the page with the sign-in card. Same design
+// tokens as the rest of the app; no refresh needed afterwards.
+function showLoginView() {
+  const overlay = document.createElement('div');
+  overlay.className = 'login-overlay';
+  overlay.innerHTML = `
+    <div class="login-card">
+      <span class="brand-mark"><svg viewBox="0 0 48 48" aria-hidden="true">
+        <rect width="48" height="48" rx="11" fill="currentColor"/>
+        <g stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" fill="none">
+          <path d="M13.5 19.5h21"/><path d="M29.5 14.5l5 5-5 5"/>
+          <path d="M34.5 28.5h-21"/><path d="M18.5 23.5l-5 5 5 5"/>
+        </g>
+      </svg></span>
+      <h1>Switcher is locked</h1>
+      <p class="login-sub">Enter your password to continue.</p>
+      <form id="login-form">
+        <input type="password" id="login-password" autocomplete="current-password" placeholder="Password" required>
+        <button type="submit" id="login-submit">Unlock</button>
+      </form>
+      <p class="login-error" id="login-error"></p>
+    </div>`;
+  document.body.appendChild(overlay);
+  const form = overlay.querySelector('#login-form');
+  const input = overlay.querySelector('#login-password');
+  const submit = overlay.querySelector('#login-submit');
+  const error = overlay.querySelector('#login-error');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    submit.disabled = true;
+    submit.textContent = 'Checking...';
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: input.value }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        error.textContent = body.error || 'Wrong password';
+        submit.disabled = false;
+        submit.textContent = 'Unlock';
+        return;
+      }
+      if (body.csrf) localStorage.setItem('switcher-csrf', body.csrf);
+      overlay.remove();
+      authState.locked = false;
+      await refreshState();
+      refreshAllUsage();
+      setInterval(refreshState, 4000);
+      scheduleUsage();
+    } catch (err) {
+      error.textContent = err.message;
+      submit.disabled = false;
+      submit.textContent = 'Unlock';
+    }
+  });
+  input.focus();
+}
+
+/* ================= Settings page ================= */
+
+const settingsPage = document.createElement('section');
+settingsPage.id = 'settings-page';
+settingsPage.hidden = true;
+usagePage.after(settingsPage);
+
+document.getElementById('page-tabs').insertAdjacentHTML('beforeend',
+  '<button id="tab-settings" class="page-tab" type="button">Settings</button>');
+document.getElementById('tab-settings').addEventListener('click', () => setPage('settings'));
+setPage = function (page) {
+  document.querySelectorAll('.page-tab').forEach(b => b.classList.toggle('active', b.id === `tab-${page}`));
+  document.getElementById('providers').hidden = page !== 'accounts';
+  document.querySelector('footer.footnote').hidden = page !== 'accounts';
+  usagePage.hidden = page !== 'usage';
+  settingsPage.hidden = page !== 'settings';
+  if (page === 'settings') renderSettings();
+};
+
+async function renderSettings() {
+  let status;
+  try {
+    status = await api('/api/auth/status');
+  } catch {
+    return;
+  }
+  settingsPage.innerHTML = `
+    <div class="settings-grid">
+      <div class="settings-card">
+        <h2>Security</h2>
+        <p class="settings-sub">Authentication is off by default: Switcher only accepts local connections. Turn it on before exposing the server beyond this machine.</p>
+        ${status.auth_enabled ? `
+          <div class="settings-row">
+            <div><strong>Password</strong><span class="dim"> · set</span></div>
+            <button id="change-password-btn" type="button">Change</button>
+          </div>
+          <div class="settings-row"><div><strong>Active sessions</strong><span class="dim"> · ${status.sessions}</span></div>
+            <button id="logout-all" type="button">Log out everywhere</button></div>
+          <div class="settings-row"><div><strong>Disable authentication</strong><span class="dim"> · turns everything off</span></div>
+            <button id="disable-auth" type="button" class="danger">Disable</button></div>
+        ` : `
+          <p class="settings-sub">No password set. Set one to enable authentication and unlock the LAN option.</p>
+          <form id="set-password-form">
+            <input type="password" id="pw-next" placeholder="New password (8+ characters)" autocomplete="new-password" required minlength="8">
+            <button type="submit">Set password</button>
+          </form>
+        `}
+      </div>
+      <div class="settings-card">
+        <h2>Network</h2>
+        <div class="settings-row">
+          <div><strong>Bind LAN</strong><span class="dim"> · ${status.lan_ip ? 'https://' + status.lan_ip + ':8787' : 'no LAN address found'}</span></div>
+          <label class="switch-wrap"><input type="checkbox" id="bind-lan" ${status.bind_lan ? 'checked' : ''} ${status.auth_enabled && status.password_set ? '' : 'disabled'}><span class="switch-visual"></span></label>
+        </div>
+        <p class="settings-sub">The LAN listener is always TLS (self-signed; browsers ask you to trust it once). The local listener stays plain HTTP so the CLIs need no changes. Note: the CLI proxy paths stay open on the LAN, so devices on your network can use your subscriptions through them; only enable this on networks you trust.</p>
+        <div class="settings-row"><div><strong>Device token</strong><span class="dim"> · menu bar app authenticates with it</span></div>
+          <button id="rotate-token" type="button">Rotate</button></div>
+      </div>
+    </div>`;
+
+  const bindLan = settingsPage.querySelector('#bind-lan');
+  bindLan?.addEventListener('change', async () => {
+    const res = await fetchWithCSRF('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bind_lan: bindLan.checked, tls: bindLan.checked }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      bindLan.checked = !bindLan.checked;
+      toast(body.error || 'Could not update settings');
+      return;
+    }
+    toast('Saved. The server restarts listeners on next launch.');
+    await new Promise(r => setTimeout(r, 600));
+    location.reload();
+  });
+
+  settingsPage.querySelector('#set-password-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const next = settingsPage.querySelector('#pw-next').value;
+    const res = await fetchWithCSRF('/api/auth/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ next }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { toast(body.error || 'Could not set password'); return; }
+    localStorage.setItem('switcher-csrf', body.csrf);
+    toast('Password set');
+    renderSettings();
+  });
+
+  settingsPage.querySelector('#disable-auth')?.addEventListener('click', async () => {
+    const password = prompt('Password to disable authentication?');
+    if (!password) return;
+    const res = await fetchWithCSRF('/api/auth/disable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    if (!res.ok) { const b = await res.json().catch(() => ({})); toast(b.error || 'Wrong password'); return; }
+    toast('Authentication disabled');
+    renderSettings();
+  });
+
+  settingsPage.querySelector('#rotate-token')?.addEventListener('click', async () => {
+    const res = await fetchWithCSRF('/api/auth/rotate-device-token', { method: 'POST' });
+    if (res.ok) toast('Device token rotated; the menu bar app re-reads it next launch');
+  });
+
+  settingsPage.querySelector('#logout-all')?.addEventListener('click', async () => {
+    const res = await fetchWithCSRF('/api/auth/logout', { method: 'POST' });
+    if (res.ok) { localStorage.removeItem('switcher-csrf'); location.reload(); }
+  });
+
+  settingsPage.querySelector('#change-password-btn')?.addEventListener('click', async () => {
+    const current = prompt('Current password?');
+    if (current === null) return;
+    const next = prompt('New password (8+ characters)?');
+    if (!next) return;
+    const res = await fetchWithCSRF('/api/auth/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ current, next }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { toast(body.error || 'Could not change password'); return; }
+    localStorage.setItem('switcher-csrf', body.csrf);
+    toast('Password changed');
+  });
 }

@@ -4,6 +4,14 @@
 import AppKit
 
 let hubURL = URL(string: "http://127.0.0.1:8787")!
+
+// deviceToken is read once per session: the local-token file (0600) holds
+// the secret the server issues when authentication is enabled.
+let deviceToken: String? = {
+    guard let raw = try? String(contentsOfFile: NSHomeDirectory() + "/.switcher/local-token", encoding: .utf8) else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.count == 64 ? trimmed : nil
+}()
 let launchAgentLabel = "sh.switcher.app"
 let launchAgentPath = NSHomeDirectory() + "/Library/LaunchAgents/" + launchAgentLabel + ".plist"
 let menuWidth: CGFloat = 340
@@ -427,6 +435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func fetchStateAsync() {
         var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
         request.timeoutInterval = 5
+        if let token = deviceToken { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let self = self, let data = data,
                   let decoded = try? JSONDecoder().decode(AppState.self, from: data) else { return }
@@ -444,6 +453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func serverReachable(timeout: Double) -> Bool {
         var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
         request.timeoutInterval = timeout
+        if let token = deviceToken { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
         let semaphore = DispatchSemaphore(value: 0)
         var ok = false
         URLSession.shared.dataTask(with: request) { _, response, _ in
@@ -484,6 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func post(path: String, completion: (() -> Void)? = nil) {
         var request = URLRequest(url: hubURL.appendingPathComponent(path))
         request.httpMethod = "POST"
+        if let token = deviceToken { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
         URLSession.shared.dataTask(with: request) { _, _, _ in completion?() }.resume()
     }
 
