@@ -875,118 +875,199 @@ function renderUsage() {
 // renderChart draws an SVG chart: the top provider renders as a filled
 // smooth area, the others as thin smooth lines. Hovering shows a tooltip
 // with each provider's value and the day total.
+// Daily chart, ported 1:1 from T3 Code's UsageProviderChart.tsx: layered
+// provider fills at 12% opacity painted heaviest-first, 2px non-scaling
+// strokes, monotone cubic smoothing, axis labels in their own column.
+const CHART_W = 960;
+const CHART_H = 260;
+const CHART_TOP = 8;
+
+function chartValue(d, provider, isCost) {
+  return isCost ? (d.providers[provider]?.cost_usd || 0) : (d.providers[provider]?.tokens || 0);
+}
+
+function chartColumns(days, providers, isCost) {
+  return days.map((d) => {
+    const bands = providers.map((p) => ({ provider: p, value: chartValue(d, p, isCost) }));
+    return { bands, total: bands.reduce((a, b) => a + b.value, 0) };
+  });
+}
+
+// monotoneTangents: shape-preserving cubic tangents that cannot overshoot
+// spiky usage data (ported verbatim from T3 Code).
+function monotoneTangents(points) {
+  const count = points.length;
+  if (count < 2) return [0];
+  const slopes = [];
+  for (let i = 0; i < count - 1; i++) {
+    const dx = points[i + 1].x - points[i].x;
+    const dy = points[i + 1].y - points[i].y;
+    slopes.push(dx === 0 ? 0 : dy / dx);
+  }
+  const tangents = Array.from({ length: count }, () => 0);
+  tangents[0] = slopes[0] ?? 0;
+  tangents[count - 1] = slopes[count - 2] ?? 0;
+  for (let i = 1; i < count - 1; i++) {
+    const previous = slopes[i - 1] ?? 0;
+    const next = slopes[i] ?? 0;
+    tangents[i] = previous * next <= 0 ? 0 : (previous + next) / 2;
+  }
+  for (let i = 0; i < count - 1; i++) {
+    const slope = slopes[i] ?? 0;
+    if (slope === 0) {
+      tangents[i] = 0;
+      tangents[i + 1] = 0;
+      continue;
+    }
+    const a = (tangents[i] ?? 0) / slope;
+    const b = (tangents[i + 1] ?? 0) / slope;
+    const magnitude = a * a + b * b;
+    if (magnitude > 9) {
+      const scale = 3 / Math.sqrt(magnitude);
+      tangents[i] = scale * a * slope;
+      tangents[i + 1] = scale * b * slope;
+    }
+  }
+  return tangents;
+}
+
+function smoothCurve(points) {
+  if (points.length < 2) return [];
+  const tangents = monotoneTangents(points);
+  const segments = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const from = points[i], to = points[i + 1];
+    const dx = to.x - from.x;
+    segments.push({
+      from,
+      c1: { x: from.x + dx / 3, y: from.y + ((tangents[i] ?? 0) * dx) / 3 },
+      c2: { x: to.x - dx / 3, y: to.y - ((tangents[i + 1] ?? 0) * dx) / 3 },
+      to,
+    });
+  }
+  return segments;
+}
+
+function curvePath(segments) {
+  const first = segments[0];
+  if (first === undefined) return "";
+  let path = `M${first.from.x.toFixed(2)},${first.from.y.toFixed(2)}`;
+  for (const segment of segments) {
+    path += ` C${segment.c1.x.toFixed(2)},${segment.c1.y.toFixed(2)} ${segment.c2.x.toFixed(2)},${segment.c2.y.toFixed(2)} ${segment.to.x.toFixed(2)},${segment.to.y.toFixed(2)}`;
+  }
+  return path;
+}
+
+// niceScale: readable 1/2/5 x 10^n steps with the max rounded up to a tick.
+function niceScale(peak, count) {
+  if (peak <= 0) return { max: 0, ticks: [0] };
+  const rawStep = peak / count;
+  const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+  const normalized = rawStep / magnitude;
+  const step = (normalized > 5 ? 10 : normalized > 2 ? 5 : normalized > 1 ? 2 : 1) * magnitude;
+  const max = Math.ceil(peak / step) * step;
+  const ticks = [];
+  for (let v = 0; v <= max + step * 1e-6; v += step) ticks.push(v);
+  return { max, ticks };
+}
+
 function renderChart(s, isCost) {
   const days = s.days || [];
-  const width = 900, height = 520, padL = 92, padR = 20, padT = 18, padB = 38;
-  const plotW = width - padL - padR, plotH = height - padT - padB;
-  const series = s.providers.map(p => p.provider);
-  if (days.length === 0 || series.length === 0) {
+  const providers = s.providers.map((p) => p.provider);
+  if (days.length === 0 || providers.length === 0) {
     usageChartBox.innerHTML = '<p class="usage-sub">No data in this window.</p>';
     return;
   }
-  const val = (d, p) => isCost ? (d.providers[p]?.cost_usd || 0) : (d.providers[p]?.tokens || 0);
-  const dayTotal = d => series.reduce((a, p) => a + val(d, p), 0);
-  // T3-style axis: a 1/2/2.5/5 step so gridlines read like $500, $1,000.
-  const step = niceCeil(Math.max(1e-9, ...days.map(dayTotal)) / 3);
-  const maxVal = step * 3;
+  const series = chartColumns(days, providers, isCost);
+  // The scale tops out at the largest single provider value, not the sum:
+  // layered series each measure from zero.
+  const peak = series.reduce((m, c) => c.bands.reduce((n, b) => Math.max(n, b.value), m), 0);
+  const { max, ticks } = niceScale(peak, 4);
+  const step = days.length === 1 ? 0 : CHART_W / (days.length - 1);
+  const toY = (v) => (max === 0 ? CHART_H : CHART_H - (v / max) * (CHART_H - CHART_TOP));
 
-  const xAt = i => days.length <= 1 ? padL + plotW / 2 : padL + (i / (days.length - 1)) * plotW;
-  const yAt = v => padT + (1 - v / maxVal) * plotH;
-  const yBase = yAt(0);
+  const built = providers.map((provider) => {
+    const line = curvePath(smoothCurve(series.map((c, i) => ({
+      x: i * step,
+      y: toY(c.bands.find((b) => b.provider === provider)?.value ?? 0),
+    }))));
+    const total = series.reduce((a, c) => a + (c.bands.find((b) => b.provider === provider)?.value ?? 0), 0);
+    return {
+      provider,
+      total,
+      area: line === "" ? "" : `${line} L${CHART_W},${CHART_H} L0,${CHART_H} Z`,
+      line,
+    };
+  });
+  // Paint the heavier series first so the lighter one is not buried.
+  built.sort((a, b) => b.total - a.total);
 
-  const pointsFor = p => days.map((d, i) => [xAt(i), yAt(val(d, p))]);
-  // smooth returns a Catmull-Rom bezier path; control points are clamped to
-  // the plot so sharp drops cannot overshoot below the axis.
-  function smooth(points) {
-    if (points.length < 3) return 'M' + points.map(pt => pt.join(' ')).join(' L');
-    let d = `M${points[0][0]},${points[0][1]}`;
-    const clamp = y => Math.min(Math.max(y, padT), yBase);
-    for (let i = 0; i < points.length - 1; i++) {
-      const p0 = points[Math.max(0, i - 1)], p1 = points[i], p2 = points[i + 1], p3 = points[Math.min(points.length - 1, i + 2)];
-      const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = clamp(p1[1] + (p2[1] - p0[1]) / 6);
-      const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = clamp(p2[1] - (p3[1] - p1[1]) / 6);
-      d += ` C${c1x},${c1y} ${c2x},${c2y} ${p2[0]},${p2[1]}`;
-    }
-    return d;
-  }
+  const gridlines = ticks.map((t) => {
+    const y = toY(t).toFixed(2);
+    return `<line x1="0" x2="${CHART_W}" y1="${y}" y2="${y}" stroke="var(--border)" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
+  }).join('');
+  const fills = built.map(({ provider, area }) =>
+    `<path d="${area}" fill="${PROVIDER_BAR_COLORS[provider] || 'var(--text)'}" fill-opacity="0.12"/>`).join('');
+  const strokes = built.map(({ provider, line }) =>
+    `<path d="${line}" fill="none" stroke="${PROVIDER_BAR_COLORS[provider] || 'var(--text)'}" stroke-width="2" vector-effect="non-scaling-stroke"/>`).join('');
 
-  let svg = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Daily chart">`;
-  for (let i = 0; i <= 3; i++) {
-    const v = step * i;
-    const y = yAt(v);
-    svg += `<line x1="${padL}" y1="${y}" x2="${width - padR}" y2="${y}" stroke="var(--border)"/>`;
-    svg += `<text x="${padL - 10}" y="${y + 3}" text-anchor="end">${isCost ? moneyTick(v) : tokenTick(v)}</text>`;
-  }
+  usageChartBox.innerHTML = `
+    <div class="chart-row">
+      <div class="chart-y">${ticks.map((t) => {
+        const y = toY(t) / CHART_H * 100;
+        return `<span style="top:${y}%">${t === 0 ? '0' : (isCost ? fmtMoney(t) : fmtTokens(t))}</span>`;
+      }).join('')}</div>
+      <div class="chart-plot">
+        <svg viewBox="0 0 ${CHART_W} ${CHART_H}" preserveAspectRatio="none" role="img" aria-label="Daily chart">
+          ${gridlines}${fills}${strokes}
+          <line id="chart-guide" x1="0" x2="0" y1="${CHART_TOP}" y2="${CHART_H}" stroke="var(--dim)" stroke-width="1" opacity="0" vector-effect="non-scaling-stroke"/>
+        </svg>
+        <div class="usage-tip" style="opacity:0"></div>
+      </div>
+    </div>
+    <div class="chart-x">
+      <span>${days[0] ? xLabel(days[0].day) : ''}</span>
+      <span>${xLabel(days[Math.floor((days.length - 1) / 2)].day)}</span>
+      <span>${xLabel(days[days.length - 1].day)}</span>
+    </div>`;
 
-  const topProvider = s.providers[0].provider;
-  for (const p of [...series].reverse()) {
-    const pts = pointsFor(p);
-    const line = smooth(pts);
-    if (p === topProvider) {
-      const area = `${line} L${xAt(days.length - 1)},${yBase} L${xAt(0)},${yBase} Z`;
-      svg += `<path class="chart-area ${p}" d="${area}" stroke="var(--chart-1)" stroke-width="2.6"/>`;
-    } else {
-      svg += `<path class="chart-line ${p}" d="${line}" fill="none" stroke-width="2.2"/>`;
-    }
-  }
-  const labelIdx = days.length > 8 ? [0, Math.floor((days.length - 1) / 2), days.length - 1] : days.map((_, i) => i);
-  for (const i of labelIdx) {
-    const label = new Date(days[i].day + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }).toUpperCase();
-    svg += `<text x="${xAt(i)}" y="${height - 8}" text-anchor="${i === 0 ? 'start' : i === days.length - 1 ? 'end' : 'middle'}">${label}</text>`;
-  }
-  svg += `<line id="chart-guide" x1="0" y1="${padT}" x2="0" y2="${yBase}" stroke="var(--border-strong)" opacity="0"/>`;
-  svg += '</svg>';
-  usageChartBox.innerHTML = svg;
-
-  const tip = document.createElement('div');
-  tip.className = 'usage-tip';
-  usageChartBox.appendChild(tip);
-
-  const svgEl = usageChartBox.querySelector('svg');
+  const tip = usageChartBox.querySelector('.usage-tip');
+  const plot = usageChartBox.querySelector('.chart-plot');
+  const svg = plot.querySelector('svg');
   const guide = usageChartBox.querySelector('#chart-guide');
-  svgEl.addEventListener('mousemove', (e) => {
-    const rect = svgEl.getBoundingClientRect();
-    const relX = (e.clientX - rect.left) / rect.width * width;
-    const i = days.length <= 1 ? 0 : Math.round((relX - padL) / plotW * (days.length - 1));
-    const idx = Math.max(0, Math.min(days.length - 1, i));
+  plot.addEventListener('mousemove', (e) => {
+    const bounds = plot.getBoundingClientRect();
+    const localX = Math.min(bounds.width, Math.max(0, e.clientX - bounds.left));
+    const localY = Math.min(bounds.height, Math.max(0, e.clientY - bounds.top));
+    const index = Math.round((localX / bounds.width) * (days.length - 1));
+    const idx = Math.max(0, Math.min(days.length - 1, index));
+    const column = series[idx];
     const d = days[idx];
     let rows = '';
-    for (const prov of s.providers) {
-      const id = prov.provider;
-      const v = val(d, id);
-      rows += `<div class="tip-row"><span class="logo">${LOGOS[id] || ''}</span><span class="name">${escapeHTML(USAGE_PROVIDER_NAMES[id] || id)}</span><span>${isCost ? fmtMoney(v) : fmtTokens(v)}</span></div>`;
+    for (const p of providers) {
+      const v = column.bands.find((b) => b.provider === p)?.value ?? 0;
+      rows += `<div class="tip-row"><span class="logo">${LOGOS[p] || ''}</span><span class="name">${escapeHTML(USAGE_PROVIDER_NAMES[p] || p)}</span><span>${isCost ? fmtMoney(v) : fmtTokens(v)}</span></div>`;
     }
-    tip.innerHTML = `<div class="tip-day">${new Date(d.day + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</div>${rows}<div class="tip-total"><span>Total</span><span>${isCost ? fmtMoney(dayTotal(d)) : fmtTokens(dayTotal(d))}</span></div>`;
-    const boxRect = usageChartBox.getBoundingClientRect();
-    let tx = e.clientX - boxRect.left + 18;
-    if (tx + 215 > boxRect.width) tx = e.clientX - boxRect.left - 215 - 8;
-    tip.style.left = `${tx}px`;
-    tip.style.top = '14px';
+    tip.innerHTML = `<div class="tip-day">${new Date(d.day + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</div>${rows}<div class="tip-total"><span>Total</span><span>${isCost ? fmtMoney(column.total) : fmtTokens(column.total)}</span></div>`;
+    const gap = 12;
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = localX + gap + tw <= bounds.width ? localX + gap : localX - gap - tw;
+    let top = localY + gap + tip.offsetHeight <= bounds.height ? localY + gap : localY - gap - tip.offsetHeight;
+    left = Math.max(0, Math.min(left, bounds.width - tw));
+    top = Math.max(0, top);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
     tip.style.opacity = '1';
-    guide.setAttribute('x1', xAt(idx));
-    guide.setAttribute('x2', xAt(idx));
-    guide.setAttribute('opacity', '1');
+    const gx = (idx * (days.length === 1 ? 0 : CHART_W / (days.length - 1))).toFixed(2);
+    guide.setAttribute('x1', gx);
+    guide.setAttribute('x2', gx);
+    guide.setAttribute('opacity', '0.6');
   });
-  svgEl.addEventListener('mouseleave', () => { tip.style.opacity = '0'; guide.setAttribute('opacity', '0'); });
+  plot.addEventListener('mouseleave', () => { tip.style.opacity = '0'; guide.setAttribute('opacity', '0'); });
 }
 
-// moneyTick formats y ticks like $1,500.00.
-function moneyTick(v) {
-  return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-// tokenTick formats axis ticks like 1.50B, 500M.
-function tokenTick(v) {
-  return fmtTokens(v);
-}
-
-// niceCeil rounds up to a 1/2/5 step so axis ticks read like $1,500 / 2B.
-function niceCeil(v) {
-  if (v <= 0) return 1;
-  const exp = Math.pow(10, Math.floor(Math.log10(v)));
-  const f = v / exp;
-  const nice = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
-  return nice * exp;
+function xLabel(day) {
+  return new Date(day + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
 /* ---------- breakdown table ---------- */
@@ -1021,3 +1102,7 @@ function renderBreakdown(s, isCost) {
     usageBreakdownTable.innerHTML = html;
   }
 }
+
+// #usage deep link: open the usage page directly (must run after the usage
+// module's declarations above).
+if (location.hash === '#usage') setPage('usage');
