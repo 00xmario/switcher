@@ -1141,3 +1141,8 @@ function renderBreakdown(s, isCost) {
 // #usage deep link: open the usage page directly (must run after the usage
 // module's declarations above).
 if (location.hash === '#usage') setPage('usage');
+// ?theme=dark|light|system overrides the stored theme (screenshots, demos).
+const themeParam = new URLSearchParams(location.search).get('theme');
+if (themeParam === 'dark' || themeParam === 'light' || themeParam === 'system') {
+  applyTheme(themeParam);
+}

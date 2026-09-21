@@ -2,16 +2,19 @@
 
 A tiny local tool for switching your AI CLI logins between accounts on demand.
 
-One active account serves all traffic. You switch accounts from the web UI.
-Switching happens **only** when you switch, or when the active account runs
-out of usage, in which case Switcher moves to another account and retries
-transparently. That is the entire feature list.
+One active account serves all traffic. Switching happens **only** when you
+switch, or when the active account runs out of usage, in which case Switcher
+moves to another account and retries transparently.
 
 ```
 codex CLI ──▶ Switcher (127.0.0.1:8787) ──▶ upstream, signed in as the active account
                     ▲
                     └── web UI: add / switch / remove accounts
 ```
+
+| Accounts | Usage | Menu bar |
+|---|---|---|
+| ![Accounts](docs/screenshots/accounts-dark.png) | ![Usage](docs/screenshots/usage-dark.png) | ![Menu bar](docs/screenshots/menubar-dark.png) |
 
 ## Why
 
@@ -48,25 +51,42 @@ round-robin, no plugins.
 
 ## Features
 
-- **Manual switching, only from the web UI**: switching never happens on its
-  own as long as the active account works.
+- **Manual switching, only from you**: switching never happens on its own
+  as long as the active account works. Use the web UI or the menu bar
+  dropdown.
 - **Automatic failover on exhaustion**: when the active account reports it
   is out of usage (HTTP 429 `usage_limit_reached`), Switcher marks it with
   the upstream reset time and, if another account is usable, retries your
   in-flight request on it transparently.
 - **No switch when there is nowhere to go**: if every account is out of
   usage, Switcher does not rotate; it passes the upstream error through.
-- **Login in the app**: adding an account runs the provider's real OAuth
-  flow in your browser; tokens are stored locally, `0600`.
+- **Per-account usage windows**: session / weekly / monthly limits with
+  reset countdowns, live in the web UI and the menu bar dropdown.
+- **Cost and tokens**: a Usage tab that reads the provider CLIs' own
+  session logs (like ccusage does) and prices them with LiteLLM rates:
+  daily cost chart, per-provider and per-model breakdowns, cache savings.
+- **Login without logging in**: the Claude login imports the Claude Code
+  CLI's tokens from the macOS keychain, so if you use Claude Code you do
+  not sign in again at all.
+- **Relogin per account**: sign in again in one click; the tokens overwrite
+  the account in place, keeping its id, active slot, and history.
+- **Banked resets**: Codex usage-limit resets can be spent from the UI.
+- **T3 Code hub**: speaks CLIProxyAPI's management protocol, so T3 Code
+  shows every account's quota from one place.
+- **Menu bar app**: the macOS app supervises the server, shows every
+  account's usage and plan, switches, refreshes, and updates itself.
 - **Single Go binary**: the frontend is embedded; there is no Node build.
+  Dark and light themes, drag-to-reorder providers, hide providers you
+  do not use.
 
 ## Providers
 
-| Provider | Status |
-|---|---|
-| Codex (ChatGPT Plus / Pro login) | supported |
-| Grok | planned |
-| Claude | planned |
+| Provider | Login | Status |
+|---|---|---|
+| Codex (ChatGPT Plus / Pro / Team) | browser OAuth | supported |
+| Claude (Pro / Max, subscription) | imports the Claude Code CLI login, or browser OAuth | supported |
+| Grok (Build) | device-code flow | supported |
+| OpenCode | API key | supported |
 
 The `provider.Provider` interface (login, refresh, forward, usage) is the
 only integration point; a new provider is one package.
@@ -149,6 +169,10 @@ internal/provider/codex/ Codex OAuth + upstream details
 internal/login/          browser login orchestration
 internal/proxy/          request forwarding + the switching rules
 internal/codexcfg/       codex config.toml installer (idempotent)
+internal/usage/          cost and token usage from the CLIs' own session logs
+internal/mgmtapi/        CLIProxyAPI-compatible hub surface for T3 Code
+internal/update/         self-update from GitHub releases
+build/macos/             the menu bar app (single-file Swift) and packaging
 web/                     dependency-free frontend (served from the binary)
 ```
 
@@ -170,9 +194,9 @@ If you want watch-and-restart for Go code anyway, the standard
 
 ## Disclaimer
 
-Switcher is an unofficial tool and is not affiliated with OpenAI. It proxies
-your own accounts on your own machine; what you do with that is your
-business and your responsibility.
+Switcher is an unofficial tool and is not affiliated with OpenAI, Anthropic,
+or xAI. It proxies your own accounts on your own machine; what you do with
+that is your business and your responsibility.
 
 ## License
 
