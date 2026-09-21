@@ -225,6 +225,12 @@ func callbackHandler(logins *login.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		state := r.URL.Query().Get("state")
+		// OpenAI's authorize redirect does not echo the state back, and
+		// Anthropic's returns it in a fragment the browser never sends.
+		// With no state in the URL, a single in-flight login is the one.
+		if state == "" {
+			state = logins.SinglePending()
+		}
 		err := logins.Complete(r.Context(), state, code)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err != nil {

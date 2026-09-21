@@ -167,6 +167,21 @@ func (m *Manager) track(state string) {
 	m.mu.Unlock()
 }
 
+// SinglePending returns the only tracked pending login state, or "" when
+// none or more than one exist. OpenAI's redirect does not echo the state
+// parameter back on the callback URL, so a single in-flight login resolves
+// by being the only one (the Codex CLI works the same way).
+func (m *Manager) SinglePending() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pending) == 1 {
+		for state := range m.pending {
+			return state
+		}
+	}
+	return ""
+}
+
 // gcLocked drops pending logins older than the TTL.
 func (m *Manager) gcLocked() {
 	now := time.Now()
