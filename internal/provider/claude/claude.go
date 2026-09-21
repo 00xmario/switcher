@@ -68,16 +68,15 @@ func (p *Provider) LoginStart(_ context.Context) (provider.LoginInfo, error) {
 	if _, err := rand.Read(verifierBytes); err != nil {
 		return provider.LoginInfo{}, fmt.Errorf("generate pkce verifier: %w", err)
 	}
-	stateBytes := make([]byte, 16)
-	if _, err := rand.Read(stateBytes); err != nil {
-		return provider.LoginInfo{}, fmt.Errorf("generate state: %w", err)
-	}
+	// Anthropic's authorize endpoint rejects a random state nonce with
+	// "Invalid request format": the state must be the PKCE verifier (the
+	// Claude Code CLI does the same), so we key the verifier map by the
+	// verifier itself.
 	verifier := base64.RawURLEncoding.EncodeToString(verifierBytes)
-	state := base64.RawURLEncoding.EncodeToString(stateBytes)
 
 	p.mu.Lock()
 	p.gcVerifiersLocked()
-	p.verifier[state] = verifierEntry{value: verifier, startedAt: time.Now()}
+	p.verifier[verifier] = verifierEntry{value: verifier, startedAt: time.Now()}
 	p.mu.Unlock()
 
 	sum := sha256.Sum256([]byte(verifier))
@@ -89,8 +88,8 @@ func (p *Provider) LoginStart(_ context.Context) (provider.LoginInfo, error) {
 	q.Set("scope", scope)
 	q.Set("code_challenge", base64.RawURLEncoding.EncodeToString(sum[:]))
 	q.Set("code_challenge_method", "S256")
-	q.Set("state", state)
-	return provider.LoginInfo{Kind: "browser", URL: authURLPath() + "?" + q.Encode(), State: state}, nil
+	q.Set("state", verifier)
+	return provider.LoginInfo{Kind: "browser", URL: authURLPath() + "?" + q.Encode(), State: verifier}, nil
 }
 
 func authURLPath() string {
