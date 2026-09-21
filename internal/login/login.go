@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"log"
 	"switcher/internal/provider"
 	"switcher/internal/store"
 )
@@ -77,7 +78,7 @@ func (m *Manager) Start(ctx context.Context, prov provider.Provider) (Handle, er
 	if err != nil {
 		return Handle{}, fmt.Errorf("start login: %w", err)
 	}
-	m.track(info.State)
+	m.track(info.State, prov)
 	return Handle{State: info.State, URL: info.URL, Kind: info.Kind}, nil
 }
 
@@ -88,7 +89,7 @@ func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider) (Hand
 	if err != nil {
 		return Handle{}, fmt.Errorf("start device login: %w", err)
 	}
-	m.track(info.State)
+	m.track(info.State, prov)
 	go func() {
 		account, err := poll(ctx)
 		if err == nil && m.persist != nil {
@@ -112,8 +113,25 @@ func (m *Manager) Complete(ctx context.Context, state, code string) error {
 	delete(m.pending, state)
 	m.mu.Unlock()
 	if !ok {
-		return ErrUnknown
+		// The callback can arrive without a usable state (OpenAI omits it,
+		// Anthropic puts it in a fragment): a single in-flight login is the
+		// one being completed.
+		if state == "" {
+			state = m.SinglePending()
+		}
+		if state == "" {
+			log.Printf("login: callback rejected, %d pending, none resolvable", len(m.pendingStates()))
+			return ErrUnknown
+		}
+		m.mu.Lock()
+		p, ok = m.pending[state]
+		delete(m.pending, state)
+		m.mu.Unlock()
+		if !ok {
+			return ErrUnknown
+		}
 	}
+	log.Printf("login: completing flow for %s (state %.8s...)", p.provider.ID(), state)
 
 	account, err := p.provider.LoginExchange(ctx, state, code)
 	if err == nil && m.persist != nil {
@@ -121,6 +139,11 @@ func (m *Manager) Complete(ctx context.Context, state, code string) error {
 	}
 	if err != nil {
 		err = fmt.Errorf("login exchange: %w", err)
+	}
+	if err != nil {
+		log.Printf("login: flow %.8s... failed: %v", state, err)
+	} else {
+		log.Printf("login: flow %.8s... completed for %s", state, account.Email)
 	}
 	m.mu.Lock()
 	m.gcResultsLocked()
@@ -160,10 +183,10 @@ func (m *Manager) Outcome(state string, wait time.Duration) (account store.Accou
 }
 
 // track records a new pending flow.
-func (m *Manager) track(state string) {
+func (m *Manager) track(state string, prov provider.Provider) {
 	m.mu.Lock()
 	m.gcLocked()
-	m.pending[state] = &pending{done: make(chan struct{}), started: time.Now()}
+	m.pending[state] = &pending{provider: prov, done: make(chan struct{}), started: time.Now()}
 	m.mu.Unlock()
 }
 
@@ -180,6 +203,17 @@ func (m *Manager) SinglePending() string {
 		}
 	}
 	return ""
+}
+
+// pendingStates lists the tracked pending login states.
+func (m *Manager) pendingStates() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.pending))
+	for state := range m.pending {
+		out = append(out, state)
+	}
+	return out
 }
 
 // gcLocked drops pending logins older than the TTL.
