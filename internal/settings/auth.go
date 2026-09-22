@@ -210,6 +210,19 @@ func (s *Store) DeleteSession(token string) {
 	s.mu.Unlock()
 }
 
+// DeleteAllSessions clears every session: the in-memory map and the
+// persisted sessions file. Every signed-in browser or device is logged out.
+// A missing sessions file is fine: there was nothing to clear.
+func (s *Store) DeleteAllSessions() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions = map[string]time.Time{}
+	// Persist an empty file inside the same critical section so a
+	// concurrent NewSession cannot leave a session alive in memory but
+	// gone on disk.
+	return writeAtomic(s.sessionsPath(), []byte(`{"sessions":{}}`))
+}
+
 // HasDeviceToken reports whether a local device token file exists.
 func (s *Store) HasDeviceToken() bool {
 	_, err := s.ReadDeviceToken()

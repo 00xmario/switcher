@@ -508,6 +508,22 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
   background: var(--danger);
 }
 .confirm-actions .danger:hover { filter: brightness(1.06); border-color: var(--danger); }
+
+/* password prompt dialog (change password, disable auth) */
+.password-modal { max-width: 380px; text-align: left; }
+.password-modal h3 { margin: 0 0 8px; font-size: 17px; }
+.password-modal input {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 4px 0 14px;
+  outline: none;
+}
+.password-modal input:focus { border-color: var(--accent); }
 @keyframes confirm-pop {
   from { transform: scale(.96); opacity: 0; }
   to { transform: scale(1); opacity: 1; }

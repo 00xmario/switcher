@@ -202,6 +202,11 @@ func run(port int) {
 		staticHandler.ServeHTTP(w, r)
 	}))
 
+	// Hardening headers on every response from the main listeners. The UI
+	// has no inline scripts (the theme init lives in app.js), so the CSP
+	// stays strict; styles need unsafe-inline for the SVG chart styling.
+	hardened := hardenedHeaders(mux)
+
 	log.Printf("Switcher v%s running: http://127.0.0.1:%d (codex proxy on the same port under /v1)", version, port)
 
 	// Listener topology: the loopback listener is always plain HTTP (the
@@ -212,7 +217,7 @@ func run(port int) {
 	gate := &server.AuthGate{Store: settingsStore}
 	loopback := server.Listener{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-		Handler: server.LocalOnlyWith(server.LocalOptions{Port: port}, gate.Wrap(mux)),
+		Handler: server.LocalOnlyWith(server.LocalOptions{Port: port}, gate.Wrap(hardened)),
 	}
 	listeners := []server.Listener{loopback}
 	if settingsStore.Load().BindLAN && settingsStore.Load().TLS && settingsStore.HasPassword() {
@@ -225,7 +230,7 @@ func run(port int) {
 					Addr:    fmt.Sprintf("%s:%d", lan, port),
 					TLS:     true,
 					Cert:    cert,
-					Handler: server.LocalOnlyWith(server.LocalOptions{Port: port, LANHost: lan}, gate.Wrap(mux)),
+					Handler: server.LocalOnlyWith(server.LocalOptions{Port: port, LANHost: lan}, gate.Wrap(hardened)),
 				})
 				log.Printf("lan listener: https://%s:%d (self-signed)", lan, port)
 			}
@@ -236,6 +241,20 @@ func run(port int) {
 	if err := server.ServeAll(listeners); err != nil {
 		log.Fatalf("server: %v", err)
 	}
+}
+
+// hardenedHeaders sets the static-UI hardening headers on every response:
+// nosniff and a strict CSP. The UI ships no inline scripts (app.js is an
+// external module), so script-src allows 'self' only.
+func hardenedHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // serveCallback starts a localhost OAuth callback listener. A failure to

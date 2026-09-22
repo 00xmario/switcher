@@ -307,6 +307,7 @@ func (a *API) registerAuthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/status", a.handleAuthStatus)
 	mux.HandleFunc("POST /api/auth/login", a.handleAuthLogin)
 	mux.HandleFunc("POST /api/auth/logout", a.handleAuthLogout)
+	mux.HandleFunc("DELETE /api/auth/sessions", a.handleAuthLogoutAll)
 	mux.HandleFunc("POST /api/auth/password", a.handleAuthPassword)
 	mux.HandleFunc("POST /api/auth/disable", a.handleAuthDisable)
 	mux.HandleFunc("POST /api/auth/rotate-device-token", a.handleRotateDeviceToken)
@@ -314,11 +315,17 @@ func (a *API) registerAuthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/settings", a.handleSettingsPatch)
 }
 
-// loopbackOnly refuses requests that did not arrive on a loopback host.
+// loopbackOnly refuses requests that did not arrive on a loopback socket.
+// The socket is the authority: a LAN client can spoof Host: 127.0.0.1, but
+// it cannot spoof its source address. The Host check stays as a second gate.
 func loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
-	host := r.URL.Query().Get("_host")
-	_ = host
-	if !isLocalHost(r.Host, "") {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	loopback := ip != nil && ip.IsLoopback()
+	if !loopback || !isLocalHost(r.Host, "") {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only local requests may change credentials"})
 		return false
 	}
@@ -340,6 +347,7 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		"auth_enabled":     a.Settings.Enabled(),
 		"password_set":     a.Settings.HasPassword(),
 		"bind_lan":         st.BindLAN,
+		"lan_active":       LANListenerActive(),
 		"tls":              st.TLS,
 		"lan_ip":           LANAddress(),
 		"sessions":         a.Settings.SessionCount(),
@@ -398,6 +406,17 @@ func (a *API) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// handleAuthLogoutAll clears every session: all browsers and devices are
+// signed out, and the caller's cookie is expired too.
+func (a *API) handleAuthLogoutAll(w http.ResponseWriter, r *http.Request) {
+	if err := a.Settings.DeleteAllSessions(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
 // handleAuthPassword sets the first password or changes it; both are
 // loopback-only when no password exists on disk yet (no TOFU from LAN).
 func (a *API) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
@@ -412,9 +431,15 @@ func (a *API) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
+	if err := a.Settings.CheckLockout(); err != nil {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		return
+	}
 	if a.Settings.HasPassword() {
 		if err := a.Settings.ChangePassword(body.Current, body.Next); err != nil {
 			if strings.Contains(err.Error(), "wrong password") {
+				// A wrong current password is a failed verification attempt.
+				a.Settings.RecordFailure()
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 				return
 			}
@@ -427,6 +452,7 @@ func (a *API) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	a.Settings.ResetFailures()
 	// Ensure the device token file so the menu bar app can authenticate.
 	_, _ = a.Settings.EnsureDeviceToken()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "csrf": a.Settings.CSRFToken()})
@@ -443,14 +469,27 @@ func (a *API) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
+	if err := a.Settings.CheckLockout(); err != nil {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		return
+	}
 	if !a.Settings.VerifyPassword(body.Password) {
+		a.Settings.RecordFailure()
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "wrong password"})
 		return
 	}
+	a.Settings.ResetFailures()
 	if err := a.Settings.DisableAuth(); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	// Disabling auth tears down the LAN listener too: re-exec so the new
+	// topology takes effect instead of leaving an unauthenticated LAN
+	// listener up until the next restart.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		restartSelf()
+	}()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
@@ -485,12 +524,16 @@ func (a *API) handleRotateDeviceToken(w http.ResponseWriter, r *http.Request) {
 
 // handleSettingsGet/Patch manage the network toggles. Enabling LAN requires
 // authentication enabled AND a password on disk (no TOFU window), and the
-// LAN listener is always TLS.
+// LAN listener is always TLS. bind_lan reports the ACTIVE listener state:
+// a saved-but-not-yet-bound request shows as pending until the restart.
 func (a *API) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	st := a.Settings.Load()
+	lanActive := LANListenerActive()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"auth_enabled": st.AuthEnabled,
-		"bind_lan":     st.BindLAN,
+		"bind_lan":     lanActive,
+		"bind_pending": st.BindLAN && !lanActive,
+		"lan_active":   lanActive,
 		"tls":          st.TLS,
 		"lan_ip":       LANAddress(),
 		"password_set": st.PasswordHash != "",
@@ -838,9 +881,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// restartForTest, when set, replaces restartSelf in tests so the exec
+// restart never fires against the test binary.
+var restartForTest func()
+
 // restartSelf re-executes the running binary, preserving argv and env. Used
 // after settings changes that affect the listener topology.
 func restartSelf() {
+	if restartForTest != nil {
+		restartForTest()
+		return
+	}
 	current, err := os.Executable()
 	if err != nil {
 		return

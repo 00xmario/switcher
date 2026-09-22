@@ -463,7 +463,7 @@ providersEl.addEventListener('dragover', (event) => {
 // "Add account" and "Relogin".
 async function startProviderLogin(providerID, reloginOf) {
   try {
-    const res = await fetch('/api/login/import', {
+    const res = await api('/api/login/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: providerID }),
@@ -664,6 +664,38 @@ function promptKey(name) {
   });
 }
 
+// askPassword is the in-app replacement for prompt() when a password is
+// collected: masked input, themed modal, null on cancel.
+function askPassword(title, subtitle, submitLabel = 'Confirm') {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'device-overlay confirm-overlay';
+    overlay.innerHTML = `
+      <div class="device-modal confirm-modal password-modal" role="alertdialog" aria-modal="true" aria-label="${escapeHTML(title)}">
+        <h3>${escapeHTML(title)}</h3>
+        ${subtitle ? `<p class="confirm-message">${escapeHTML(subtitle)}</p>` : ''}
+        <input type="password" autocomplete="current-password" spellcheck="false">
+        <div class="device-copy confirm-actions">
+          <button type="button" data-cancel>Cancel</button>
+          <button type="button" class="primary" data-ok>${escapeHTML(submitLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector('input');
+    input.focus();
+    const close = (value) => { overlay.remove(); document.removeEventListener('keydown', onKey); resolve(value); };
+    const submit = () => close(input.value);
+    const onKey = (e) => {
+      if (e.key === 'Escape') close(null);
+      if (e.key === 'Enter') submit();
+    };
+    overlay.querySelector('[data-ok]').addEventListener('click', submit);
+    overlay.querySelector('[data-cancel]').addEventListener('click', () => close(null));
+    input.addEventListener('keydown', onKey);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
+  });
+}
+
 // The hub dialog hands the user everything T3 Code's "Add a CLIProxyAPI
 // hub" dialog asks for: the hub URL and the management key.
 document.addEventListener('click', (event) => {
@@ -709,7 +741,7 @@ async function runUpdateFlow(button) {
   try {
     // The server downloads, swaps, and exec-restarts: the response often
     // never arrives. Fire the request, then poll for the version change.
-    fetch('/api/update', { method: 'POST' }).catch(() => {});
+    api('/api/update', { method: 'POST' }).catch(() => {});
     const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 1500));
@@ -741,7 +773,7 @@ async function runUpdateFlow(button) {
 
 refreshState().then(refreshAllUsage);
 scheduleUsage();
-const stateTimer = setInterval(refreshState, 4000);
+let stateTimer = setInterval(refreshState, 4000);
 
 
 /* ================= Usage page (cost + tokens) ================= */
@@ -795,7 +827,7 @@ document.getElementById('usage-refresh').addEventListener('click', async () => {
   btn.classList.add('spinning');
   const minSpin = new Promise(resolve => setTimeout(resolve, 700));
   try {
-    await Promise.all([fetch('/api/tokens/refresh', { method: 'POST' }), minSpin]);
+    await Promise.all([api('/api/tokens/refresh', { method: 'POST' }), minSpin]);
     await loadUsage();
   } finally {
     btn.classList.remove('spinning');
@@ -1182,7 +1214,7 @@ if (themeParam === 'dark' || themeParam === 'light' || themeParam === 'system') 
 
 // showLoginView replaces the page with the sign-in card. Same design
 // tokens as the rest of the app; no refresh needed afterwards.
-function showLoginView() {
+function showLoginView(message) {
   const overlay = document.createElement('div');
   overlay.className = 'login-overlay';
   overlay.innerHTML = `
@@ -1195,7 +1227,7 @@ function showLoginView() {
         </g>
       </svg></span>
       <h1>Switcher is locked</h1>
-      <p class="login-sub">Enter your password to continue.</p>
+      <p class="login-sub">${escapeHTML(message || 'Enter your password to continue.')}</p>
       <form id="login-form">
         <input type="password" id="login-password" autocomplete="current-password" placeholder="Password" required>
         <button type="submit" id="login-submit">Unlock</button>
@@ -1229,7 +1261,8 @@ function showLoginView() {
       authState.locked = false;
       await refreshState();
       refreshAllUsage();
-      setInterval(refreshState, 4000);
+      clearInterval(stateTimer);
+      stateTimer = setInterval(refreshState, 4000);
       scheduleUsage();
     } catch (err) {
       error.textContent = err.message;
@@ -1263,6 +1296,15 @@ setPage = function (page) {
   if (page === 'settings') renderSettings();
 };
 
+// lanStateText describes the LAN listener's real state: the settings file
+// records the request, lan_active is what the listeners actually serve.
+function lanStateText(status) {
+  const ip = status.lan_ip ? `https://${status.lan_ip}:8787` : 'no LAN address found';
+  if (status.lan_active) return `${ip} · active`;
+  if (status.bind_lan || status.bind_pending) return `${ip} · pending restart`;
+  return ip;
+}
+
 async function renderSettings() {
   let status;
   try {
@@ -1282,6 +1324,8 @@ async function renderSettings() {
           </div>
           <div class="settings-row"><div><strong>Active sessions</strong><span class="dim"> · ${status.sessions}</span></div>
             <button id="logout-all" type="button">Log out everywhere</button></div>
+          <div class="settings-row"><div><strong>Log out this browser</strong><span class="dim"> · ends this session only</span></div>
+            <button id="logout-here" type="button">Log out</button></div>
           <div class="settings-row"><div><strong>Disable authentication</strong><span class="dim"> · turns everything off</span></div>
             <button id="disable-auth" type="button" class="danger">Disable</button></div>
         ` : `
@@ -1295,7 +1339,7 @@ async function renderSettings() {
       <div class="settings-card">
         <h2>Network</h2>
         <div class="settings-row">
-          <div><strong>Bind LAN</strong><span class="dim"> · ${status.lan_ip ? 'https://' + status.lan_ip + ':8787' : 'no LAN address found'}</span></div>
+          <div><strong>Bind LAN</strong><span class="dim"> · ${lanStateText(status)}</span></div>
           <label class="switch-wrap"><input type="checkbox" id="bind-lan" ${status.bind_lan ? 'checked' : ''} ${status.auth_enabled && status.password_set ? '' : 'disabled'}><span class="switch-visual"></span></label>
         </div>
         <p class="settings-sub">The LAN listener is always TLS (self-signed; browsers ask you to trust it once). The local listener stays plain HTTP so the CLIs need no changes. Note: the CLI proxy paths stay open on the LAN, so devices on your network can use your subscriptions through them; only enable this on networks you trust.</p>
@@ -1338,7 +1382,7 @@ async function renderSettings() {
   });
 
   settingsPage.querySelector('#disable-auth')?.addEventListener('click', async () => {
-    const password = prompt('Password to disable authentication?');
+    const password = await askPassword('Disable authentication?', 'Enter your password to turn authentication off.', 'Disable');
     if (!password) return;
     const res = await fetchWithCSRF('/api/auth/disable', {
       method: 'POST',
@@ -1356,14 +1400,19 @@ async function renderSettings() {
   });
 
   settingsPage.querySelector('#logout-all')?.addEventListener('click', async () => {
+    const res = await fetchWithCSRF('/api/auth/sessions', { method: 'DELETE' });
+    if (res.ok) { localStorage.removeItem('switcher-csrf'); location.reload(); }
+  });
+
+  settingsPage.querySelector('#logout-here')?.addEventListener('click', async () => {
     const res = await fetchWithCSRF('/api/auth/logout', { method: 'POST' });
     if (res.ok) { localStorage.removeItem('switcher-csrf'); location.reload(); }
   });
 
   settingsPage.querySelector('#change-password-btn')?.addEventListener('click', async () => {
-    const current = prompt('Current password?');
-    if (current === null) return;
-    const next = prompt('New password (8+ characters)?');
+    const current = await askPassword('Change password', 'Enter your current password.', 'Continue');
+    if (!current) return;
+    const next = await askPassword('Change password', 'Enter the new password (8+ characters).', 'Change');
     if (!next) return;
     const res = await fetchWithCSRF('/api/auth/password', {
       method: 'POST',
@@ -1374,5 +1423,6 @@ async function renderSettings() {
     if (!res.ok) { toast(body.error || 'Could not change password'); return; }
     localStorage.setItem('switcher-csrf', body.csrf);
     toast('Password changed');
+    await showLoginView('Password changed. Sign in again with the new password.');
   });
 }

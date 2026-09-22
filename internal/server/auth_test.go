@@ -7,8 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+	"time"
 
 	"switcher/internal/settings"
 )
@@ -187,14 +187,9 @@ func TestExemptPathsStayOpen(t *testing.T) {
 			t.Fatalf("proxy path %s was auth-gated", path)
 		}
 	}
-	// The hub stays management-key gated (401 without the key), not auth-gated.
-	res, _ := http.Get(h.server.URL + "/v0/management/auth-files")
-	res.Body.Close()
-	if res.StatusCode == http.StatusUnauthorized && !strings.Contains("", "") {
-		// The hub answers its own 401 with the management-key error; the
-		// exact status is the hub's business, the point is it did not 404.
-		t.Skip("hub returns its own status")
-	}
+	// The hub is registered by main.go (mgmtapi.Register), not by this
+	// harness; its management-key gate is covered by the gate order tests
+	// and unchanged by the auth work.
 }
 
 func TestStaticServedUnauthenticated(t *testing.T) {
@@ -375,5 +370,176 @@ func TestExpiredSessionRejected(t *testing.T) {
 	store := settings.New(dir)
 	if store.ValidateSession("1111111111111111111111111111111111111111111111111111111111111111") {
 		t.Fatal("expired session accepted")
+	}
+}
+
+// loopbackHarness builds an API with a password on disk and no listeners:
+// requests are driven directly against the mux so RemoteAddr can be set
+// per request, exactly like the real listeners would.
+func loopbackHarness(t *testing.T) (*settings.Store, *http.ServeMux) {
+	t.Helper()
+	store := settings.New(t.TempDir())
+	if err := store.SetPassword("hunter22"); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	api := &API{Settings: store}
+	api.registerAuthRoutes(mux)
+	return store, mux
+}
+
+func TestLoopbackOnlyRejectsSpoofedHost(t *testing.T) {
+	_, mux := loopbackHarness(t)
+	// httptest.NewRequest sets RemoteAddr to 192.0.2.1:1234 (a LAN-class
+	// address): a spoofed Host: 127.0.0.1 must not buy loopback access.
+	body := bytes.NewBufferString(`{"current":"hunter22","next":"newerpass99"}`)
+	req := httptest.NewRequest("POST", "/api/auth/password", body)
+	req.Host = "127.0.0.1:8787"
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("spoofed Host from a LAN socket: %d, want 403", res.Code)
+	}
+}
+
+func TestLoopbackOnlyAcceptsLoopbackSocket(t *testing.T) {
+	store, mux := loopbackHarness(t)
+	body := bytes.NewBufferString(`{"current":"hunter22","next":"newerpass99"}`)
+	req := httptest.NewRequest("POST", "/api/auth/password", body)
+	req.RemoteAddr = "127.0.0.1:9999"
+	req.Host = "127.0.0.1:8787"
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("loopback socket password change: %d, want 200", res.Code)
+	}
+	if !store.VerifyPassword("newerpass99") {
+		t.Fatal("password change did not take effect")
+	}
+}
+
+func TestLoopbackOnlyAcceptsIPv6LoopbackSocket(t *testing.T) {
+	_, mux := loopbackHarness(t)
+	body := bytes.NewBufferString(`{"current":"hunter22","next":"newerpass99"}`)
+	req := httptest.NewRequest("POST", "/api/auth/password", body)
+	req.RemoteAddr = "[::1]:52341"
+	req.Host = "127.0.0.1:8787"
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("IPv6 loopback socket password change: %d, want 200", res.Code)
+	}
+}
+
+func TestPasswordChangeRateLimited(t *testing.T) {
+	_, mux := loopbackHarness(t)
+	for i := 0; i < 5; i++ {
+		body := bytes.NewBufferString(`{"current":"totallywrong","next":"newerpass99"}`)
+		req := httptest.NewRequest("POST", "/api/auth/password", body)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Host = "127.0.0.1:8787"
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status %d, want 401", i, res.Code)
+		}
+	}
+	// Five wrong currents trip the lockout: the next attempt is refused
+	// with 429 before any verification work, even with the right password.
+	body := bytes.NewBufferString(`{"current":"hunter22","next":"newerpass99"}`)
+	req := httptest.NewRequest("POST", "/api/auth/password", body)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:8787"
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked-out password change: %d, want 429", res.Code)
+	}
+}
+
+func TestDisableAuthClearsSessionsAndRestarts(t *testing.T) {
+	store, _ := loopbackHarness(t)
+	token, err := store.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := make(chan struct{}, 1)
+	original := restartForTest
+	restartForTest = func() { restarted <- struct{}{} }
+	defer func() { restartForTest = original }()
+
+	mux := http.NewServeMux()
+	api := &API{Settings: store}
+	api.registerAuthRoutes(mux)
+	body := bytes.NewBufferString(`{"password":"hunter22"}`)
+	req := httptest.NewRequest("POST", "/api/auth/disable", body)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:8787"
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("disable with the right password: %d, want 200", res.Code)
+	}
+	if store.Enabled() || store.HasPassword() {
+		t.Fatal("auth still on after disable")
+	}
+	if store.ValidateSession(token) {
+		t.Fatal("session survived disable")
+	}
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("disable did not schedule a restart of the listeners")
+	}
+}
+
+func TestDisableAuthWrongPasswordRecordsFailure(t *testing.T) {
+	store, mux := loopbackHarness(t)
+	restartForTest = func() {}
+	defer func() { restartForTest = nil }()
+	for i := 0; i < 6; i++ {
+		body := bytes.NewBufferString(`{"password":"totallywrong"}`)
+		req := httptest.NewRequest("POST", "/api/auth/disable", body)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Host = "127.0.0.1:8787"
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if i < 5 && res.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status %d, want 401", i, res.Code)
+		}
+		if i == 5 && res.Code != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d: status %d, want 429 after lockout", i, res.Code)
+		}
+	}
+	if !store.Enabled() || !store.HasPassword() {
+		t.Fatal("disable went through without the correct password")
+	}
+}
+
+func TestLogoutEverywhereClearsAllSessions(t *testing.T) {
+	store, mux := loopbackHarness(t)
+	tokens := make([]string, 2)
+	for i := range tokens {
+		var err error
+		tokens[i], err = store.NewSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest("DELETE", "/api/auth/sessions", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1:8787"
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("logout everywhere: %d, want 200", res.Code)
+	}
+	for _, token := range tokens {
+		if store.ValidateSession(token) {
+			t.Fatal("a session survived logout everywhere")
+		}
+	}
+	if n := store.SessionCount(); n != 0 {
+		t.Fatalf("sessions remain after logout everywhere: %d", n)
 	}
 }

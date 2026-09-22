@@ -87,6 +87,37 @@ func TestSessionsSurviveRestart(t *testing.T) {
 	}
 }
 
+func TestDeleteAllSessions(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	tokens := make([]string, 3)
+	for i := range tokens {
+		var err error
+		tokens[i], err = s.NewSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.SessionCount() != len(tokens) {
+		t.Fatalf("session count %d, want %d", s.SessionCount(), len(tokens))
+	}
+	if err := s.DeleteAllSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if s.SessionCount() != 0 {
+		t.Fatalf("sessions remain after DeleteAllSessions: %d", s.SessionCount())
+	}
+	for _, token := range tokens {
+		if s.ValidateSession(token) {
+			t.Fatal("a session survived DeleteAllSessions")
+		}
+	}
+	// A fresh store (server restart) must not resurrect anything either.
+	if n := New(dir).SessionCount(); n != 0 {
+		t.Fatalf("sessions revived from disk after DeleteAllSessions: %d", n)
+	}
+}
+
 func TestDeviceTokenRoundTrip(t *testing.T) {
 	s := New(t.TempDir())
 	token, err := s.EnsureDeviceToken()
