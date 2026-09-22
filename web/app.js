@@ -112,6 +112,7 @@ function escapeHTML(s) {
 
 // fmtRemaining renders a countdown the way T3 does: "6d 23h", "3h 44m".
 function fmtRemaining(untilUnix) {
+  if (!untilUnix || untilUnix <= 0) return null; // no reset time reported
   let ms = untilUnix * 1000 - Date.now();
   if (ms <= 0) return null; // window already rolled; upstream will refresh soon
   const m = Math.floor(ms / 60000);
