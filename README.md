@@ -130,10 +130,13 @@ switcher install         # points the codex CLI at Switcher (idempotent, backs u
 ```
 
 1. Open <http://127.0.0.1:8787>.
-2. **Add Codex account**: a browser window opens for the normal ChatGPT
-   sign-in; the account lands in Switcher.
-3. Click **Use this account** to make it active.
-4. Run `codex` as usual. That's it.
+2. **Add accounts**: Codex opens the normal ChatGPT sign-in; Claude imports
+   the Claude Code CLI's login from the keychain (or signs in); Grok uses a
+   device code; OpenCode takes an API key.
+3. Click **Use this account** to make it active. Check the **Usage** tab
+   for cost and token breakdowns, and **Settings** to set a password or
+   expose the server to your LAN.
+4. Run `codex`, `claude`, `grok`, or `opencode` as usual. That's it.
 
 `switcher uninstall` removes Switcher from the codex config again (a
 `.switcher-backup` copy of your config is kept alongside it).
@@ -152,11 +155,30 @@ switcher install         # points the codex CLI at Switcher (idempotent, backs u
 
 ## Security model
 
-- Binds to `127.0.0.1` only; there is no authentication because there is no
-  network exposure. Do not expose it.
+- **Default: local only, no authentication.** The server binds `127.0.0.1`
+  and nothing leaves the machine, which is why the default install has no
+  login. This is the same trust model as the CLIs themselves.
+- **Optional authentication.** The Settings tab can require a password
+  (PBKDF2-SHA256, 600k iterations, hashed with a per-user salt; sessions
+  are random tokens stored only as SHA-256 hashes with a 7-day sliding
+  expiry, HttpOnly SameSite=Strict cookies, CSRF-protected mutations, and
+  login lockout). A local device token lets the menu bar app authenticate
+  without a browser.
+- **LAN exposure, opt-in and TLS-only.** Once a password is set, a
+  second listener can bind the LAN IP; it is always TLS (self-signed
+  ECDSA certificate, regenerated automatically when your IP changes) and
+  the local listener stays plain HTTP so the CLIs need no changes. Know
+  the edges: the CLI proxy paths and the management-key hub stay reachable
+  on the LAN, so only enable this on networks you trust.
+- Hardened headers everywhere: CSP (no inline script, form-action self),
+  nosniff, no-referrer. State-changing requests from a non-loopback socket
+  are refused for credential routes.
 - Tokens are stored unencrypted under `~/.switcher/` with `0600`
   permissions, same trust model as the CLIs themselves.
 - Request bodies are forwarded verbatim; Switcher never inspects prompts.
+
+Forgot your password? Delete `~/.switcher/settings.json` and restart
+Switcher; authentication resets to off.
 
 ## Layout
 
