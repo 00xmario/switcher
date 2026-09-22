@@ -34,6 +34,12 @@ var ErrUsageUnavailable = errors.New("usage unavailable")
 // flow (e.g. an OAuth-only provider asked for device login).
 var ErrUnsupported = errors.New("unsupported flow for this provider")
 
+// OAuthHTTPClient bounds every OAuth and control-plane HTTP call (token
+// exchanges, userinfo, onboarding, quota lookups) so a stalled upstream
+// cannot hold a login or usage request open indefinitely. Providers share
+// one client so the timeout policy has a single home.
+var OAuthHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 // LoginInfo describes how the user completes a login.
 type LoginInfo struct {
 	// Kind is "browser" (open URL, provider calls back) or "device"

@@ -52,8 +52,11 @@ struct AppState: Codable {
     let update: UpdateInfo?
 }
 
-let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode"]
-let planNames = ["max": "Max 20x", "pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free"]
+let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode",
+    "antigravity": "Antigravity", "gemini": "Gemini", "copilot": "Copilot"]
+let planNames = ["max": "Max 20x", "pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free",
+    "copilot_pro": "Pro", "copilot_pro_plus": "Pro+", "copilot_business": "Business", "copilot_enterprise": "Enterprise",
+    "copilot_free": "Free"]
 
 // Palette mirrors the web app's light and dark tokens (web/style.css).
 // Layer colours cannot be dynamic NSColors, so the menu picks a palette from

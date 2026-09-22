@@ -43,6 +43,28 @@ func TestTokenFilePermissions(t *testing.T) {
 	}
 }
 
+func TestTokenExtraRoundTrip(t *testing.T) {
+	s := New(t.TempDir())
+	a := Account{ID: "antigravity-abcd", Provider: "antigravity", Email: "me@example.com",
+		Token: Token{AccessToken: "at", Extra: map[string]any{
+			"project_id":      "proj-1",
+			"copilot_expires": float64(1900000000),
+		}}}
+	if err := s.Save(a); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get("antigravity-abcd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Token.Extra["project_id"] != "proj-1" {
+		t.Fatalf("extra round trip mismatch: %+v", got.Token.Extra)
+	}
+	if _, ok := got.Token.Extra["copilot_expires"].(float64); !ok {
+		t.Fatalf("extra numeric value decoded as %T", got.Token.Extra["copilot_expires"])
+	}
+}
+
 func TestStateRoundTripAndList(t *testing.T) {
 	s := New(t.TempDir())
 	for _, id := range []string{"b", "a"} {

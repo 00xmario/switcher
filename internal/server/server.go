@@ -597,7 +597,7 @@ func (a *API) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, provider.ErrUnsupported) {
 		// Providers without a browser callback (grok) use the device
 		// authorization grant instead: also a web login, just with a code.
-		handle, err = a.Logins.StartDevice(context.WithoutCancel(r.Context()), prov)
+		handle, err = a.Logins.StartDevice(context.WithoutCancel(r.Context()), prov, body.ReloginOf)
 	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not start login"})

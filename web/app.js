@@ -39,21 +39,34 @@ const LOGOS = {
   // OpenCode mark; the dark frame is inverted in dark theme so it stays
   // visible.
   opencode: `<svg viewBox="0 0 240 300" aria-hidden="true"><path d="M180 240H60V120H180V240Z" fill="#CFCECD"/><path d="M180 60H60V240H180V60ZM240 300H0V0H240V300Z" fill="#211E1E"/></svg>`,
+  // Antigravity mark: a simple diamond prism, currentColor so it follows
+  // the theme.
+  antigravity: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1.8 22.2 22H1.8L12 1.8z"/><path d="M12 7.4 17.9 19H6.1L12 7.4z" style="fill:var(--bg)"/></svg>`,
+  // Official four-point Gemini spark in Google blue; reads on both themes.
+  gemini: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 24c-.6-6.5-5.5-11.4-12-12C6.5 11.4 11.4 6.5 12 0c.6 6.5 5.5 11.4 12 12-6.5.6-11.4 5.5-12 12z" fill="#4285f4"/></svg>`,
+  // Copilot mark: a simple visor with two lenses, currentColor.
+  copilot: `<svg viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd" aria-hidden="true"><path d="M12 3c5.2 0 9 3.5 9 8.2v4.6c0 3-2.8 5.2-6.2 5.2H9.2C5.8 21 3 18.8 3 15.8v-4.6C3 6.5 6.8 3 12 3zm-3.4 8.3a1.75 1.75 0 1 0 0 3.5 1.75 1.75 0 0 0 0-3.5zm6.8 0a1.75 1.75 0 1 0 0 3.5 1.75 1.75 0 0 0 0-3.5z"/></svg>`,
 };
 
-const PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', grok: 'Grok', opencode: 'OpenCode' };
+const PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', grok: 'Grok', opencode: 'OpenCode', antigravity: 'Antigravity', gemini: 'Gemini', copilot: 'Copilot' };
 
-// ChatGPT plan tiers as OpenAI markets them.
+// Plan tiers as each provider markets them. Keys are the stored plan
+// values.
 const PLAN_NAMES = {
   max: 'Max 20x',
   pro: 'Pro 20x',
   prolite: 'Pro 5x',
   plus: 'Plus',
   free: 'Free',
+  copilot_pro: 'Pro',
+  copilot_pro_plus: 'Pro+',
+  copilot_business: 'Business',
+  copilot_enterprise: 'Enterprise',
+  copilot_free: 'Free',
 };
 
 // How each provider adds an account: browser popup, device code, or key.
-const ADD_METHOD = { codex: 'browser', claude: 'browser', grok: 'device', opencode: 'key' };
+const ADD_METHOD = { codex: 'browser', claude: 'browser', grok: 'device', opencode: 'key', antigravity: 'browser', gemini: 'browser', copilot: 'device' };
 
 /* ---------- helpers ---------- */
 
@@ -161,6 +174,9 @@ const PROVIDER_BAR_COLORS = {
   claude: '#d97757',
   grok: 'color-mix(in oklab, var(--text) 72%, var(--bg))',
   opencode: 'var(--text)',
+  antigravity: 'var(--accent)',
+  gemini: '#4285f4',
+  copilot: '#6e7781',
 };
 
 function windowHTML(win, providerID) {
@@ -485,7 +501,7 @@ async function startProviderLogin(providerID, reloginOf) {
     body: JSON.stringify({ provider: providerID, relogin_of: reloginOf || undefined }),
   });
   if (login.kind === 'device') {
-    showDeviceModal(login.verification_url, login.user_code);
+    showDeviceModal(login.verification_url, login.user_code, `Sign in to ${PROVIDER_NAMES[providerID] || providerID}`);
   } else {
     const w = 520, h = 720;
     const left = Math.max(0, Math.round((screen.width - w) / 2));
@@ -576,15 +592,17 @@ async function pollLogin(state) {
   toast('Login timed out');
 }
 
-// showDeviceModal presents the grok device code and a link to the
-// verification page; keep it on screen until the login resolves.
-function showDeviceModal(verifyURL, userCode) {
+// showDeviceModal presents a device code and a link to the verification
+// page; keep it on screen until the login resolves. providerTitle names the
+// provider ("Sign in to Grok").
+function showDeviceModal(verifyURL, userCode, providerTitle) {
+  const title = providerTitle || 'Sign in';
   const overlay = document.createElement('div');
   overlay.className = 'device-overlay';
   overlay.innerHTML = `
-    <div class="device-modal" role="dialog" aria-modal="true" aria-label="Sign in to Grok">
+    <div class="device-modal" role="dialog" aria-modal="true" aria-label="${escapeHTML(title)}">
       <button class="modal-close" title="Close" aria-label="Close">✕</button>
-      <h3>Sign in to Grok</h3>
+      <h3>${escapeHTML(title)}</h3>
       <p>Open <a href="${escapeHTML(verifyURL)}" target="_blank" rel="noopener">the verification page</a> and enter this code:</p>
       <div class="device-code">${escapeHTML(userCode)}</div>
       <div class="device-copy"><button type="button">Copy code</button></div>
@@ -595,7 +613,7 @@ function showDeviceModal(verifyURL, userCode) {
     navigator.clipboard?.writeText(userCode).then(() => toast('Code copied'), () => {});
   });
   // Escaping the dialog never aborts the login: the background poll keeps
-  // running and the account appears when x.ai confirms it.
+  // running and the account appears when the provider confirms it.
   const close = () => {
     overlay.remove();
     document.removeEventListener('keydown', onKey);

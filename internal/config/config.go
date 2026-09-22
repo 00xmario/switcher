@@ -16,6 +16,12 @@ const (
 	// ClaudeCallbackPort must match the redirect URI registered for the
 	// Claude Code OAuth client.
 	ClaudeCallbackPort = 54545
+	// AntigravityCallbackPort must match the redirect URI registered for
+	// the Antigravity Google OAuth client.
+	AntigravityCallbackPort = 51121
+	// GeminiCallbackPort must match the redirect URI registered for the
+	// Gemini CLI Google OAuth client.
+	GeminiCallbackPort = 51122
 )
 
 // Dir returns the Switcher data directory, creating it if needed.

@@ -87,6 +87,9 @@ round-robin, no plugins.
 | Claude (Pro / Max, subscription) | imports the Claude Code CLI login, or browser OAuth | supported |
 | Grok (Build) | device-code flow | supported |
 | OpenCode | API key | supported |
+| Antigravity (Google) | Google OAuth, onboards the cloud project automatically | supported |
+| Gemini (CLI login) | Google OAuth (same plumbing as Antigravity) | supported |
+| GitHub Copilot | GitHub device flow; imports the VS Code Copilot login when present | supported |
 
 The `provider.Provider` interface (login, refresh, forward, usage) is the
 only integration point; a new provider is one package.

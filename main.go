@@ -30,8 +30,11 @@ import (
 	"switcher/internal/login"
 	"switcher/internal/mgmtapi"
 	"switcher/internal/provider"
+	"switcher/internal/provider/antigravity"
 	"switcher/internal/provider/claude"
 	"switcher/internal/provider/codex"
+	"switcher/internal/provider/copilot"
+	"switcher/internal/provider/gemini"
 	"switcher/internal/provider/grok"
 	"switcher/internal/provider/opencode"
 	"switcher/internal/proxy"
@@ -82,12 +85,17 @@ func run(port int) {
 		claude.New(),
 		grok.New(),
 		opencode.New(),
+		antigravity.New(),
+		gemini.New(),
+		copilot.New(),
 	}
 	providers := make(map[string]provider.Provider, len(registered))
+	registrationOrder := make([]string, 0, len(registered))
 	for _, p := range registered {
 		providers[p.ID()] = p
+		registrationOrder = append(registrationOrder, p.ID())
 	}
-	proxyManager, err := proxy.New(st, providers)
+	proxyManager, err := proxy.New(st, providers, registrationOrder)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
@@ -164,12 +172,17 @@ func run(port int) {
 
 	// Each provider with a browser redirect has its own callback listener;
 	// the ports are fixed by the OAuth clients' registered redirect URIs.
+	// Codex registers /auth/callback, Claude /callback, Antigravity
+	// /oauth-callback, and Gemini /oauth2callback; all complete the same
+	// flow, so every path is served on every listener.
 	callbackMux := http.NewServeMux()
-	// Codex registers /auth/callback, Claude /callback; both complete the
-	// same flow, so both paths are served on both listeners.
-	callbackMux.HandleFunc("GET /auth/callback", callbackHandler(logins))
-	callbackMux.HandleFunc("GET /callback", callbackHandler(logins))
-	for _, port := range []int{config.CallbackPort, config.ClaudeCallbackPort} {
+	for _, path := range []string{"/auth/callback", "/callback", "/oauth-callback", "/oauth2callback"} {
+		callbackMux.HandleFunc("GET "+path, callbackHandler(logins))
+	}
+	for _, port := range []int{
+		config.CallbackPort, config.ClaudeCallbackPort,
+		config.AntigravityCallbackPort, config.GeminiCallbackPort,
+	} {
 		go serveCallback(callbackMux, port)
 	}
 
@@ -180,6 +193,9 @@ func run(port int) {
 	mux.Handle("/claude/", proxyManager)
 	mux.Handle("/grok/", proxyManager)
 	mux.Handle("/opencode/", proxyManager)
+	mux.Handle("/antigravity/", proxyManager)
+	mux.Handle("/gemini/", proxyManager)
+	mux.Handle("/copilot/", proxyManager)
 
 	// Dev mode serves the frontend straight from disk: edit web/, refresh
 	// the browser, done. No rebuild, no restart.

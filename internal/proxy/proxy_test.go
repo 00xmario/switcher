@@ -105,7 +105,7 @@ func newManager(t *testing.T, upstream *httptest.Server, accounts ...store.Accou
 			t.Fatal(err)
 		}
 	}
-	m, err := New(st, map[string]provider.Provider{prov.ID(): prov})
+	m, err := New(st, map[string]provider.Provider{prov.ID(): prov}, []string{prov.ID()})
 	if err != nil {
 		t.Fatal(err)
 	}

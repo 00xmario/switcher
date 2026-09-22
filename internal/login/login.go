@@ -88,15 +88,24 @@ func (m *Manager) Start(ctx context.Context, prov provider.Provider, reloginTarg
 }
 
 // StartDevice begins a device-code login and spawns the background poller:
-// when the user authorizes, the flow completes itself and persists.
-func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider) (Handle, error) {
+// when the user authorizes, the flow completes itself and persists. Like
+// Start, reloginTarget adopts the existing account id on completion.
+func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider, reloginTarget string) (Handle, error) {
 	info, poll, err := prov.DeviceStart(ctx)
 	if err != nil {
 		return Handle{}, fmt.Errorf("start device login: %w", err)
 	}
-	m.track(info.State, prov, "")
+	m.track(info.State, prov, reloginTarget)
 	go func() {
 		account, err := poll(ctx)
+		if err == nil && m.lookup != nil && reloginTarget != "" {
+			// Relogin: adopt the existing account id so the tokens
+			// overwrite in place and the active slot survives.
+			if old, lerr := m.lookup(reloginTarget); lerr == nil &&
+				old.Provider == account.Provider && old.Email == account.Email {
+				account.ID = old.ID
+			}
+		}
 		if err == nil && m.persist != nil {
 			err = m.persist(account)
 		}

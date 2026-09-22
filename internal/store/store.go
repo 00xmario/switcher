@@ -14,13 +14,17 @@ import (
 	"sync"
 )
 
-// Token set returned by an OAuth login or a refresh.
+// Token set returned by an OAuth login or a refresh. Extra carries
+// provider-specific fields (project ids, token expiry timestamps) that do
+// not fit the fixed columns; provider packages go through typed helpers,
+// never raw map pokes at call sites.
 type Token struct {
-	IDToken      string `json:"id_token"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	AccountID    string `json:"account_id,omitempty"`
-	ExpiresAt    int64  `json:"expires_at,omitempty"` // unix seconds
+	IDToken      string         `json:"id_token"`
+	AccessToken  string         `json:"access_token"`
+	RefreshToken string         `json:"refresh_token"`
+	AccountID    string         `json:"account_id,omitempty"`
+	ExpiresAt    int64          `json:"expires_at,omitempty"` // unix seconds
+	Extra        map[string]any `json:"extra,omitempty"`
 }
 
 // Account is one stored login for one provider.

@@ -54,8 +54,11 @@ type Manager struct {
 	managementKey string   // hub management key, kept in state.json
 }
 
-// New loads persisted state and returns the proxy manager.
-func New(st *store.Store, providers map[string]provider.Provider) (*Manager, error) {
+// New loads persisted state and returns the proxy manager. registration is
+// the provider registration order (nil tolerated): registered but
+// never-ordered providers append in that order instead of map order, so
+// the default display order is deterministic.
+func New(st *store.Store, providers map[string]provider.Provider, registration []string) (*Manager, error) {
 	state, err := st.LoadState()
 	if err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
@@ -77,7 +80,13 @@ func New(st *store.Store, providers map[string]provider.Provider) (*Manager, err
 			order = append(order, id)
 		}
 	}
-	// Providers registered but never ordered land at the end, stable.
+	// Providers registered but never ordered land at the end, stable: the
+	// registration order first, then anything else in map order.
+	for _, id := range registration {
+		if _, known := providers[id]; known && !containsID(order, id) {
+			order = append(order, id)
+		}
+	}
 	for id := range providers {
 		if !containsID(order, id) {
 			order = append(order, id)
