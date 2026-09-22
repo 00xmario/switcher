@@ -168,7 +168,9 @@ function windowHTML(win, providerID) {
   const used = 100 - left;
   const name = PROVIDER_NAMES[providerID] || providerID;
   const remaining = fmtRemaining(win.resets_at);
-  const resetText = remaining ? `↻ ${remaining}` : '↻ soon';
+  // A window at 100% with no reported reset time has nothing to count
+  // down: the badge would only say "soon", which is a guess, so hide it.
+  const resetText = remaining ? `↻ ${remaining}` : (left < 100 ? '↻ soon' : '');
   const recovery = left < 100
     ? `<div class="recover">↻ +${used}% in ${remaining || 'a moment'}</div>`
     : '';
