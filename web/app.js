@@ -1247,9 +1247,13 @@ settingsPage.id = 'settings-page';
 settingsPage.hidden = true;
 usagePage.after(settingsPage);
 
-document.getElementById('page-tabs').insertAdjacentHTML('beforeend',
-  '<button id="tab-settings" class="page-tab" type="button">Settings</button>');
-document.getElementById('tab-settings').addEventListener('click', () => setPage('settings'));
+const settingsTab = document.createElement('button');
+settingsTab.id = 'tab-settings';
+settingsTab.className = 'page-tab';
+settingsTab.type = 'button';
+settingsTab.textContent = 'Settings';
+settingsTab.addEventListener('click', () => setPage('settings'));
+document.querySelector('.page-tabs').appendChild(settingsTab);
 setPage = function (page) {
   document.querySelectorAll('.page-tab').forEach(b => b.classList.toggle('active', b.id === `tab-${page}`));
   document.getElementById('providers').hidden = page !== 'accounts';
