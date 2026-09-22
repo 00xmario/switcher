@@ -799,6 +799,8 @@ html[data-theme="light"] .window, html[data-theme="system"] .window { background
 .settings-row button { padding: 7px 12px; font-size: 13px; }
 .settings-row button.danger { color: var(--danger); border-color: var(--danger); }
 .settings-card input { font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; width: 100%; }
+.settings-card form { display: flex; flex-direction: column; gap: 12px; }
+.settings-card form button { align-self: flex-start; margin-top: 4px; }
 .switch-wrap { position: relative; display: inline-block; width: 44px; height: 26px; }
 .switch-wrap input { opacity: 0; width: 0; height: 0; }
 .switch-visual { position: absolute; inset: 0; background: color-mix(in srgb, var(--dim) 40%, transparent); border-radius: 13px; transition: background .18s ease; cursor: pointer; }
