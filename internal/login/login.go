@@ -109,6 +109,11 @@ func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider, relog
 		if err == nil && m.persist != nil {
 			err = m.persist(account)
 		}
+		if err != nil {
+			log.Printf("login: device flow for %s failed: %v", prov.ID(), err)
+		} else {
+			log.Printf("login: device flow for %s completed for %s", prov.ID(), account.Email)
+		}
 		m.mu.Lock()
 		m.gcResultsLocked()
 		m.results[info.State] = result{account: account, err: err, at: time.Now()}

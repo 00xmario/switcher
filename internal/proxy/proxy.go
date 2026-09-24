@@ -324,13 +324,38 @@ func (m *Manager) refreshAccount(ctx context.Context, prov provider.Provider, ac
 	usage, uerr := prov.Usage(ctx, account)
 	if uerr != nil {
 		// Keep the last good snapshot: a single failed poll must not
-		// blank out usage the UI was showing a minute ago.
+		// blank out usage the UI was showing a minute ago. But when the
+		// snapshot's own reset time has passed, it is provably stale
+		// (the window rolled during the outage): clearing it tells the
+		// UI the truth instead of showing numbers from last week.
+		if staleSnapshot(m.lastUsage[account.ID]) {
+			m.mu.Lock()
+			delete(m.lastUsage, account.ID)
+			m.mu.Unlock()
+			log.Printf("proxy: usage sync for %s (%s) failed and the cached window already reset; clearing", account.Email, account.Provider)
+			return
+		}
 		log.Printf("proxy: usage sync for %s (%s) failed, keeping last value: %v", account.Email, account.Provider, uerr)
 		return
 	}
 	m.mu.Lock()
 	m.lastUsage[account.ID] = usage
 	m.mu.Unlock()
+}
+
+// staleSnapshot reports whether a usage snapshot's every reset time has
+// already passed: the windows provably rolled during an outage.
+func staleSnapshot(u provider.Usage) bool {
+	if !u.Available || len(u.Windows) == 0 {
+		return false
+	}
+	now := time.Now().Unix()
+	for _, w := range u.Windows {
+		if w.ResetsAt == 0 || w.ResetsAt > now {
+			return false
+		}
+	}
+	return true
 }
 
 // refreshLock returns the per-account refresh mutex.

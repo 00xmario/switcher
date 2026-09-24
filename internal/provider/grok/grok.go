@@ -250,22 +250,22 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		upstreamBase+"/billing?format=credits", nil)
 	if err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: build request: %v", provider.ErrUsageUnavailable, err)
 	}
 	if err := p.ApplyAuth(req, a); err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: auth: %v", provider.ErrUsageUnavailable, err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := provider.OAuthHTTPClient.Do(req)
 	if err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return provider.Usage{}, provider.ErrUsageUnavailable
-	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: read body: %v", provider.ErrUsageUnavailable, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return provider.Usage{}, fmt.Errorf("%w: upstream status %d: %s", provider.ErrUsageUnavailable, resp.StatusCode, truncForLog(raw))
 	}
 
 	var parsed struct {
@@ -278,10 +278,10 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 		} `json:"config"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: decode: %v", provider.ErrUsageUnavailable, err)
 	}
 	if parsed.Config.CreditUsagePercent == nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, fmt.Errorf("%w: no creditUsagePercent in response", provider.ErrUsageUnavailable)
 	}
 
 	label := "Subscription"
@@ -437,4 +437,13 @@ func accountFromToken(tok oauthToken) (store.Account, error) {
 	sum := sha256.Sum256([]byte(acc.Provider + "|" + email + "|" + subject))
 	acc.ID = fmt.Sprintf("%s-%x", acc.Provider, sum[:4])
 	return acc, nil
+}
+
+// truncForLog shortens an upstream body for log lines.
+func truncForLog(b []byte) string {
+	const n = 200
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "..."
 }
