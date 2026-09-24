@@ -173,6 +173,21 @@ func invertedImage(_ image: NSImage, size: NSSize) -> NSImage? {
     return NSImage(cgImage: result, size: size)
 }
 
+// resetRemaining renders the countdown until a usage window resets, the
+// same formatting the web app uses: 38m, 6h 12m, or 2d 3h. Nil when there
+// is no reset time or it has already passed.
+func resetRemaining(_ untilUnix: Double?) -> String? {
+    guard let until = untilUnix, until > 0 else { return nil }
+    let ms = until * 1000 - Date().timeIntervalSince1970 * 1000
+    if ms <= 0 { return nil }
+    let m = Int(ms / 60000)
+    if m < 60 { return "\(m)m" }
+    let h = m / 60
+    if h < 24 { return "\(h)h \(m % 60)m" }
+    let d = h / 24
+    return "\(d)d \(h % 24)h"
+}
+
 // textWidth measures the frame width a label needs for a string, using a
 // real NSTextField so the field's own padding is included.
 func textWidth(_ text: String, font: NSFont) -> CGFloat {
@@ -663,8 +678,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // when labels differ in length (Weekly vs Session).
             let usageFont = NSFont.systemFont(ofSize: 11)
             let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            let resetFont = NSFont.systemFont(ofSize: 10.5)
             let windows = account.usage?.windows ?? []
             let labelColumn = windows.map { textWidth($0.label + ":", font: usageFont) }.max() ?? 0
+            // The reset suffix column is right-aligned against the row's
+            // right edge; reserve its width so values never collide with it.
+            let resetColumn = windows.reduce(0) { partial, window in
+                max(partial, textWidth(resetRemaining(window.resets_at) ?? "", font: resetFont))
+            }
             var usageY = titleY - titleUsageGap - usageLineHeight
             for window in windows {
                 let left = max(0, min(100, 100 - window.used_percent))
@@ -672,8 +693,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 name.frame = NSRect(x: textX, y: usageY, width: labelColumn, height: usageLineHeight)
                 row.addSubview(name)
                 let value = label("\(left)% left", font: valueFont, color: dimColor)
-                value.frame = NSRect(x: textX + labelColumn + 5, y: usageY, width: titleWidth - labelColumn - 5, height: usageLineHeight)
+                value.frame = NSRect(x: textX + labelColumn + 5, y: usageY, width: titleWidth - labelColumn - 5 - (resetColumn > 0 ? resetColumn + 12 : 0), height: usageLineHeight)
                 row.addSubview(value)
+                if let reset = resetRemaining(window.resets_at) {
+                    let resetLabel = label("↻ " + reset, font: resetFont, color: dimColor)
+                    resetLabel.alignment = .right
+                    resetLabel.frame = NSRect(x: contentWidth - cardInset - resetColumn, y: usageY + 0.5, width: resetColumn, height: usageLineHeight)
+                    row.addSubview(resetLabel)
+                }
                 usageY -= usageLineHeight
             }
 
