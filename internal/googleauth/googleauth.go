@@ -106,6 +106,9 @@ func postToken(ctx context.Context, form url.Values) (Token, error) {
 		return Token{}, fmt.Errorf("google token response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		if form.Get("grant_type") == "refresh_token" && provider.RefreshCredentialRejected(resp.StatusCode, raw) {
+			return Token{}, fmt.Errorf("google token request failed: http %d: %w", resp.StatusCode, provider.ErrReloginRequired)
+		}
 		return Token{}, fmt.Errorf("google token request failed: http %d", resp.StatusCode)
 	}
 	var tok Token

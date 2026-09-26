@@ -3,10 +3,14 @@ package googleauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+
+	"switcher/internal/provider"
 )
 
 func TestTokenExchangePostsSecretAndParses(t *testing.T) {
@@ -64,6 +68,46 @@ func TestRefreshToken(t *testing.T) {
 	}
 	if tok.AccessToken != "at2" || tok.ExpiresIn != 60 {
 		t.Fatalf("unexpected token: %+v", tok)
+	}
+}
+
+func TestRefreshTokenRejectionOnlyOnRefresh(t *testing.T) {
+	status, body := http.StatusBadRequest, `{"error":"invalid_grant","secret":"do-not-log"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	old := TokenURL
+	TokenURL = srv.URL
+	defer func() { TokenURL = old }()
+
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{http.StatusBadRequest, `{"error":"invalid_grant"}`, true},
+		{http.StatusUnauthorized, ``, true},
+		{http.StatusBadRequest, `{"error":"invalid_request"}`, false},
+		{http.StatusForbidden, `{"error":"invalid_grant"}`, false},
+		{http.StatusServiceUnavailable, `{"error":"invalid_grant"}`, false},
+		{http.StatusOK, `{not json`, false},
+	} {
+		status, body = tc.status, tc.body
+		_, err := RefreshToken(context.Background(), "secret", "rt", "client")
+		if err == nil || errors.Is(err, provider.ErrReloginRequired) != tc.want {
+			t.Fatalf("status %d body %q: err = %v, relogin = %t", status, body, err, tc.want)
+		}
+	}
+	status, body = http.StatusBadRequest, `{"error":"invalid_grant","secret":"do-not-log"}`
+	_, err := RefreshToken(context.Background(), "secret", "rt", "client")
+	if !errors.Is(err, provider.ErrReloginRequired) || strings.Contains(err.Error(), "do-not-log") {
+		t.Fatalf("refresh error leaked or lost classification: %v", err)
+	}
+	_, err = TokenExchange(context.Background(), "secret", "code", "client", "callback")
+	if errors.Is(err, provider.ErrReloginRequired) || strings.Contains(err.Error(), "do-not-log") {
+		t.Fatalf("login exchange leaked or classified refresh failure: %v", err)
 	}
 }
 

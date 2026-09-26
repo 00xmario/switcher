@@ -148,7 +148,7 @@ func (p *Provider) LoginExchange(ctx context.Context, state, code string) (store
 // Refresh renews the account's tokens with a JSON refresh request.
 func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	if a.Token.RefreshToken == "" {
-		return errors.New("no refresh token; sign in again")
+		return fmt.Errorf("claude refresh: missing refresh token: %w", provider.ErrReloginRequired)
 	}
 	reqBody, err := json.Marshal(map[string]any{
 		"client_id":     clientID,
@@ -175,6 +175,9 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 		return fmt.Errorf("refresh response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		if provider.RefreshCredentialRejected(resp.StatusCode, raw) {
+			return fmt.Errorf("refresh failed: http %d: %w", resp.StatusCode, provider.ErrReloginRequired)
+		}
 		return fmt.Errorf("refresh failed: http %d", resp.StatusCode)
 	}
 	var tok struct {
@@ -245,7 +248,7 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, provider.UsageStatusError(resp.StatusCode)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {

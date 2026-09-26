@@ -252,6 +252,35 @@ func TestRefresh(t *testing.T) {
 	}
 }
 
+func TestRefreshReloginClassification(t *testing.T) {
+	status, body := http.StatusBadRequest, `{"error":"invalid_grant"}`
+	stubGoogle(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	})
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{http.StatusBadRequest, `{"error":"invalid_grant"}`, true},
+		{http.StatusUnauthorized, ``, true},
+		{http.StatusForbidden, ``, false},
+		{http.StatusBadRequest, `{"error":"invalid_request"}`, false},
+		{http.StatusInternalServerError, ``, false},
+	} {
+		status, body = tc.status, tc.body
+		a := store.Account{Token: store.Token{RefreshToken: "rt"}}
+		err := New().Refresh(context.Background(), &a)
+		if err == nil || errors.Is(err, provider.ErrReloginRequired) != tc.want {
+			t.Fatalf("status %d: err = %v, relogin = %t", status, err, tc.want)
+		}
+	}
+	if err := New().Refresh(context.Background(), &store.Account{}); !errors.Is(err, provider.ErrReloginRequired) {
+		t.Fatalf("missing token: %v", err)
+	}
+}
+
 func TestUsageQuotaSummary(t *testing.T) {
 	reset := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	stubCloudCode(t, func(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +326,25 @@ func TestUsageWithoutGroups(t *testing.T) {
 	noProject := store.Account{Provider: "gemini", Token: store.Token{AccessToken: "at"}}
 	if _, err := p.Usage(context.Background(), noProject); !errors.Is(err, provider.ErrUsageUnavailable) {
 		t.Fatalf("err = %v, want ErrUsageUnavailable without a project", err)
+	}
+}
+
+func TestUsageAuthStatus(t *testing.T) {
+	status := http.StatusUnauthorized
+	stubCloudCode(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret-access" {
+			t.Errorf("missing usage authorization")
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"private":"do-not-log"}`))
+	})
+	acc := store.Account{Token: store.Token{AccessToken: "secret-access", Extra: map[string]any{"project_id": "p"}}}
+	for _, s := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusServiceUnavailable} {
+		status = s
+		_, err := New().Usage(context.Background(), acc)
+		if !errors.Is(err, provider.ErrUsageUnavailable) || errors.Is(err, provider.ErrUsageAuthRequired) != (s == http.StatusUnauthorized) || errors.Is(err, provider.ErrReloginRequired) || strings.Contains(err.Error(), "do-not-log") || strings.Contains(err.Error(), "secret-access") {
+			t.Fatalf("status %d: unexpected usage error: %v", s, err)
+		}
 	}
 }
 

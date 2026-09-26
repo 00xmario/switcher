@@ -264,6 +264,35 @@ func TestRefresh(t *testing.T) {
 	}
 }
 
+func TestRefreshReloginClassification(t *testing.T) {
+	status, body := http.StatusBadRequest, `{"error":"invalid_grant"}`
+	stubGoogle(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	})
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{http.StatusBadRequest, `{"error":"invalid_grant"}`, true},
+		{http.StatusUnauthorized, ``, true},
+		{http.StatusForbidden, ``, false},
+		{http.StatusBadRequest, `{"error":"invalid_request"}`, false},
+		{http.StatusServiceUnavailable, ``, false},
+	} {
+		status, body = tc.status, tc.body
+		a := store.Account{Token: store.Token{RefreshToken: "rt"}}
+		err := New().Refresh(context.Background(), &a)
+		if err == nil || errors.Is(err, provider.ErrReloginRequired) != tc.want {
+			t.Fatalf("status %d: err = %v, relogin = %t", status, err, tc.want)
+		}
+	}
+	if err := New().Refresh(context.Background(), &store.Account{}); !errors.Is(err, provider.ErrReloginRequired) {
+		t.Fatalf("missing token: %v", err)
+	}
+}
+
 func TestUsageQuotaSummary(t *testing.T) {
 	reset := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	stubCloudCode(t, func(w http.ResponseWriter, r *http.Request) {
@@ -340,6 +369,33 @@ func TestUsageUnavailable(t *testing.T) {
 	acc := store.Account{Provider: "antigravity", Token: store.Token{AccessToken: "at"}}
 	if _, err := p.Usage(context.Background(), acc); !errors.Is(err, provider.ErrUsageUnavailable) {
 		t.Fatalf("err = %v, want ErrUsageUnavailable", err)
+	}
+}
+
+func TestUsageAuthStatusAcrossFallback(t *testing.T) {
+	statusSummary, statusModels := http.StatusUnauthorized, http.StatusForbidden
+	stubs := map[string]int{"/v1internal:retrieveUserQuotaSummary": statusSummary, "/v1internal:fetchAvailableModels": statusModels}
+	stubCloudCode(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret-access" {
+			t.Errorf("missing usage authorization")
+		}
+		w.WriteHeader(stubs[r.URL.Path])
+		_, _ = w.Write([]byte(`{"private":"do-not-log"}`))
+	})
+	acc := store.Account{Token: store.Token{AccessToken: "secret-access", Extra: map[string]any{"project_id": "p"}}}
+	for _, tc := range []struct {
+		summary, models int
+		auth            bool
+	}{
+		{http.StatusUnauthorized, http.StatusForbidden, true},
+		{http.StatusForbidden, http.StatusUnauthorized, true},
+		{http.StatusForbidden, http.StatusInternalServerError, false},
+	} {
+		stubs["/v1internal:retrieveUserQuotaSummary"], stubs["/v1internal:fetchAvailableModels"] = tc.summary, tc.models
+		_, err := New().Usage(context.Background(), acc)
+		if !errors.Is(err, provider.ErrUsageUnavailable) || errors.Is(err, provider.ErrUsageAuthRequired) != tc.auth || errors.Is(err, provider.ErrReloginRequired) || strings.Contains(err.Error(), "do-not-log") || strings.Contains(err.Error(), "secret-access") {
+			t.Fatalf("statuses %d/%d: unexpected usage error: %v", tc.summary, tc.models, err)
+		}
 	}
 }
 

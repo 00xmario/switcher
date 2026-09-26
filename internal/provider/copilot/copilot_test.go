@@ -136,6 +136,40 @@ func TestDeviceFlowRejectsAndExpires(t *testing.T) {
 	}
 }
 
+func TestRefreshOnlyClassifiesGitHubMintUnauthorized(t *testing.T) {
+	status := http.StatusUnauthorized
+	stubEndpoints(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/copilot_internal/v2/token" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer github-token" {
+			t.Errorf("authorization = %q", got)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"secret":"do-not-log"}`))
+	})
+	for _, tc := range []struct {
+		status int
+		want   bool
+	}{
+		{http.StatusUnauthorized, true},
+		{http.StatusForbidden, false},
+		{http.StatusTooManyRequests, false},
+		{http.StatusBadGateway, false},
+		{http.StatusOK, false},
+	} {
+		status = tc.status
+		a := store.Account{Token: store.Token{RefreshToken: "github-token"}}
+		err := New().Refresh(context.Background(), &a)
+		if err == nil || errors.Is(err, provider.ErrReloginRequired) != tc.want || strings.Contains(err.Error(), "do-not-log") {
+			t.Fatalf("status %d: err = %v, relogin = %t", status, err, tc.want)
+		}
+	}
+	if err := New().Refresh(context.Background(), &store.Account{}); !errors.Is(err, provider.ErrReloginRequired) {
+		t.Fatalf("missing GitHub token: %v", err)
+	}
+}
+
 func TestFetchCopilotTokenExpiryFormats(t *testing.T) {
 	// Unix seconds and RFC3339 strings decode to the same unix value.
 	for raw, want := range map[string]int64{
@@ -208,9 +242,29 @@ func TestUsageUnavailable(t *testing.T) {
 	acc := store.Account{Provider: "copilot", Token: store.Token{RefreshToken: "ghu_token"}}
 	if _, err := p.Usage(context.Background(), acc); !errors.Is(err, provider.ErrUsageUnavailable) {
 		t.Fatalf("err = %v, want ErrUsageUnavailable", err)
+	} else if errors.Is(err, provider.ErrReloginRequired) {
+		t.Fatalf("quota endpoint error classified as relogin: %v", err)
 	}
 	if _, err := p.Usage(context.Background(), store.Account{}); !errors.Is(err, provider.ErrUsageUnavailable) {
 		t.Fatalf("err = %v, want ErrUsageUnavailable without a GitHub token", err)
+	}
+}
+
+func TestUsageAuthStatus(t *testing.T) {
+	status := http.StatusUnauthorized
+	stubEndpoints(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/copilot_internal/user" || r.Header.Get("Authorization") != "Bearer secret-access" {
+			t.Errorf("unexpected usage request: %s", r.URL.Path)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"private":"do-not-log"}`))
+	})
+	for _, s := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		status = s
+		_, err := New().Usage(context.Background(), store.Account{Token: store.Token{RefreshToken: "secret-access"}})
+		if !errors.Is(err, provider.ErrUsageUnavailable) || errors.Is(err, provider.ErrUsageAuthRequired) != (s == http.StatusUnauthorized) || errors.Is(err, provider.ErrReloginRequired) || strings.Contains(err.Error(), "do-not-log") || strings.Contains(err.Error(), "secret-access") {
+			t.Fatalf("status %d: unexpected usage error: %v", s, err)
+		}
 	}
 }
 

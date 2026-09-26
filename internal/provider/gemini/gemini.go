@@ -167,6 +167,10 @@ func (p *Provider) discoverProject(ctx context.Context, accessToken string) (str
 	return projectIDOf(id), nil
 }
 
+type cloudcodeHTTPError struct{ status int }
+
+func (e cloudcodeHTTPError) Error() string { return fmt.Sprintf("http %d", e.status) }
+
 // cloudcodePost posts one authenticated Cloud Code JSON request.
 func (p *Provider) cloudcodePost(ctx context.Context, accessToken, method string, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiBase+"/"+method, bytes.NewReader(body))
@@ -181,12 +185,12 @@ func (p *Provider) cloudcodePost(ctx context.Context, accessToken, method string
 		return fmt.Errorf("gemini %s: %w", method, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("gemini %s failed: %w", method, cloudcodeHTTPError{resp.StatusCode})
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("gemini %s: %w", method, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("gemini %s failed: http %d", method, resp.StatusCode)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("gemini %s response: %w", method, err)
@@ -251,11 +255,11 @@ func ProjectID(a store.Account) string {
 // clients on the refresh grant.
 func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	if a.Token.RefreshToken == "" {
-		return errors.New("no refresh token; sign in again")
+		return fmt.Errorf("gemini refresh: missing refresh token: %w", provider.ErrReloginRequired)
 	}
 	tok, err := googleauth.RefreshToken(ctx, ClientSecret, a.Token.RefreshToken, ClientID)
 	if err != nil {
-		return err
+		return fmt.Errorf("gemini refresh: %w", err)
 	}
 	a.Token.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
@@ -314,7 +318,11 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	}
 	if err := p.cloudcodePost(ctx, a.Token.AccessToken, version+":retrieveUserQuotaSummary",
 		[]byte(fmt.Sprintf(`{"project_id":%q}`, ProjectID(a))), &summary); err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
+		var statusErr cloudcodeHTTPError
+		if errors.As(err, &statusErr) {
+			return provider.Usage{}, fmt.Errorf("%w: %w", provider.UsageStatusError(statusErr.status), err)
+		}
+		return provider.Usage{}, fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
 	}
 	var windows []provider.UsageWindow
 	for _, g := range summary.Groups {

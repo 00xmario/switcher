@@ -45,17 +45,19 @@ func (s *Store) SetPassword(password string) error {
 	if _, err := rand.Read(salt); err != nil {
 		return err
 	}
-	st := s.Load()
-	st.AuthEnabled = true
-	st.PasswordSalt = hex.EncodeToString(salt)
-	st.PasswordHash = pbkdf2Hash(password, salt, Iterations)
-	st.Iterations = Iterations
+	hash := pbkdf2Hash(password, salt, Iterations)
 	csrf := make([]byte, 32)
 	if _, err := rand.Read(csrf); err != nil {
 		return err
 	}
-	st.CSRFToken = hex.EncodeToString(csrf)
-	if err := s.Save(st); err != nil {
+	if err := s.Update(func(st *Settings) error {
+		st.AuthEnabled = true
+		st.PasswordSalt = hex.EncodeToString(salt)
+		st.PasswordHash = hash
+		st.Iterations = Iterations
+		st.CSRFToken = hex.EncodeToString(csrf)
+		return nil
+	}); err != nil {
 		return err
 	}
 	s.ResetFailures()

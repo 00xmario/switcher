@@ -248,6 +248,12 @@ type copilotToken struct {
 	ExpiresAt unixSeconds `json:"expires_at"`
 }
 
+type tokenMintHTTPError struct{ status int }
+
+func (e tokenMintHTTPError) Error() string {
+	return fmt.Sprintf("copilot token request failed: http %d", e.status)
+}
+
 // unixSeconds decodes a unix timestamp that may arrive as a JSON number or
 // an RFC3339 string.
 type unixSeconds int64
@@ -298,7 +304,7 @@ func fetchCopilotToken(ctx context.Context, githubToken string) (copilotToken, e
 		return copilotToken{}, fmt.Errorf("copilot token: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return copilotToken{}, fmt.Errorf("copilot token request failed: http %d", resp.StatusCode)
+		return copilotToken{}, tokenMintHTTPError{status: resp.StatusCode}
 	}
 	var ct copilotToken
 	if err := json.Unmarshal(raw, &ct); err != nil {
@@ -330,15 +336,19 @@ func (p *Provider) AddByKey(ctx context.Context, key string) (store.Account, err
 }
 
 // Refresh re-mints the short-lived Copilot API token from the stored
-// GitHub OAuth token. A 401 here means the GitHub grant is dead: the
-// returned error parks the account.
+// GitHub OAuth token. A 401 from the token mint confirms rejection of the
+// stored GitHub credential; a 403 may instead mean no Copilot plan.
 func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	githubToken := a.Token.RefreshToken
 	if githubToken == "" {
-		return errors.New("no GitHub token; sign in again")
+		return fmt.Errorf("copilot refresh: missing GitHub token: %w", provider.ErrReloginRequired)
 	}
 	ct, err := fetchCopilotToken(ctx, githubToken)
 	if err != nil {
+		var statusErr tokenMintHTTPError
+		if errors.As(err, &statusErr) && statusErr.status == http.StatusUnauthorized {
+			return fmt.Errorf("copilot refresh: %w: %w", err, provider.ErrReloginRequired)
+		}
 		return err
 	}
 	a.Token.AccessToken = ct.Token
@@ -433,12 +443,12 @@ func fetchCopilotUsage(ctx context.Context, githubToken string) (copilotUsage, e
 		return copilotUsage{}, provider.ErrUsageUnavailable
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return copilotUsage{}, provider.UsageStatusError(resp.StatusCode)
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return copilotUsage{}, provider.ErrUsageUnavailable
-	}
-	if resp.StatusCode != http.StatusOK {
-		return copilotUsage{}, fmt.Errorf("%w: http %d", provider.ErrUsageUnavailable, resp.StatusCode)
 	}
 	var parsed copilotUsage
 	if err := json.Unmarshal(raw, &parsed); err != nil {

@@ -5,8 +5,11 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"switcher/internal/store"
@@ -29,6 +32,69 @@ type Usage struct {
 
 // ErrUsageUnavailable reports that usage could not be determined.
 var ErrUsageUnavailable = errors.New("usage unavailable")
+
+// ErrUsageAuthRequired means a usage request was rejected with HTTP 401.
+// Callers may refresh the access token and retry once. Usage errors also
+// match ErrUsageUnavailable, but never ErrReloginRequired.
+var ErrUsageAuthRequired = errors.New("usage authentication required")
+
+// UsageStatusError classifies a usage endpoint's non-200 HTTP status without
+// retaining its response body or credentials in the error.
+func UsageStatusError(status int) error {
+	if status == http.StatusUnauthorized {
+		return fmt.Errorf("%w: http %d: %w", ErrUsageUnavailable, status, ErrUsageAuthRequired)
+	}
+	return fmt.Errorf("%w: http %d", ErrUsageUnavailable, status)
+}
+
+// ErrReloginRequired means Refresh confirmed that the stored refresh
+// credential is missing or rejected. Callers should use errors.Is; the
+// surrounding error retains the provider and HTTP status for logs.
+var ErrReloginRequired = errors.New("relogin required")
+
+// RefreshCredentialRejected classifies token-endpoint responses, not usage
+// or upstream API responses. A 400 must carry a recognized OAuth error code;
+// a 401 with an explicit, unrecognized code is not evidence against an account.
+func RefreshCredentialRejected(status int, body []byte) bool {
+	if status != http.StatusUnauthorized && status != http.StatusBadRequest {
+		return false
+	}
+	// A large or truncated error document is not safe to classify as an
+	// individual credential rejection.
+	if len(body) > 8<<10 {
+		return false
+	}
+	var payload struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return status == http.StatusUnauthorized
+	}
+	var code string
+	if json.Unmarshal(payload.Error, &code) != nil {
+		var detail struct {
+			Code string `json:"code"`
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(payload.Error, &detail) != nil {
+			return status == http.StatusUnauthorized
+		}
+		code = detail.Code
+		if code == "" {
+			code = detail.Type
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "invalid_client", "invalid_client_error", "invalid_client_credentials", "invalid_client_secret", "unauthorized_client", "invalid_request", "client_authentication_failed", "client_authentication_error":
+		return false
+	case "invalid_grant", "invalid_grant_error", "invalid_refresh_token", "expired_token", "token_expired", "refresh_token_expired", "refresh_token_reused", "token_reused", "reused":
+		return true
+	}
+	if strings.TrimSpace(code) != "" {
+		return false
+	}
+	return status == http.StatusUnauthorized
+}
 
 // ErrUnsupported reports that a provider does not implement an optional
 // flow (e.g. an OAuth-only provider asked for device login).

@@ -61,7 +61,19 @@ round-robin, no plugins.
 - **No switch when there is nowhere to go**: if every account is out of
   usage, Switcher does not rotate; it passes the upstream error through.
 - **Per-account usage windows**: session / weekly / monthly limits with
-  reset countdowns, live in the web UI and the menu bar dropdown.
+  reset countdowns, live in the web UI and the menu bar dropdown. The menu
+  shows a compact remaining-quota bar beside each percentage by default;
+  turn it off in Settings if you prefer text only. Hover a future reset
+  countdown for the exact provider-reported time in your local time zone.
+- **Account health**: see when quota data was last current, when it has gone
+  stale for five minutes, or when a rejected refresh credential needs a
+  relogin. Recheck one account without waiting on the page or switching it.
+- **Reset alerts**: opt in under Settings → Menu bar to receive macOS
+  notifications at provider-reported usage-window reset times. Switcher
+  delivers them while the menu bar app is running and macOS has granted
+  notification permission. No alerts are queued after the app closes. An
+  alert marks the reported time, not a verified return of quota; denied
+  permission can be changed in System Settings.
 - **Cost and tokens**: a Usage tab that reads the provider CLIs' own
   session logs (like ccusage does) and prices them with LiteLLM rates:
   daily cost chart, per-provider and per-model breakdowns, cache savings.
@@ -75,6 +87,10 @@ round-robin, no plugins.
   shows every account's quota from one place.
 - **Menu bar app**: the macOS app supervises the server, shows every
   account's usage and plan, switches, refreshes, and updates itself.
+- **Codex setup check**: Settings shows whether Codex is actually pointing
+  at this Switcher listener. Connect Codex repairs its config with one click,
+  keeps a backup, and verifies the selected provider afterward. Other CLIs
+  are not included in this check.
 - **Single Go binary**: the frontend is embedded; there is no Node build.
   Dark and light themes, drag-to-reorder providers, hide providers you
   do not use.

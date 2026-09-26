@@ -136,7 +136,7 @@ func (p *Provider) LoginExchange(ctx context.Context, state, code string) (store
 // Refresh renews the account's tokens using the stored refresh token.
 func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	if a.Token.RefreshToken == "" {
-		return errors.New("no refresh token; sign in again")
+		return fmt.Errorf("codex refresh: missing refresh token: %w", provider.ErrReloginRequired)
 	}
 	tok, err := tokenRequest(ctx, url.Values{
 		"grant_type":    {"refresh_token"},
@@ -194,12 +194,12 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return provider.Usage{}, provider.UsageStatusError(resp.StatusCode)
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return provider.Usage{}, fmt.Errorf("%w: read body: %v", provider.ErrUsageUnavailable, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return provider.Usage{}, fmt.Errorf("%w: upstream status %d: %s", provider.ErrUsageUnavailable, resp.StatusCode, truncate(raw, 200))
 	}
 
 	var parsed struct {
@@ -432,6 +432,9 @@ func tokenRequest(ctx context.Context, form url.Values) (oauthToken, error) {
 		return oauthToken{}, fmt.Errorf("token request: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		if form.Get("grant_type") == "refresh_token" && provider.RefreshCredentialRejected(resp.StatusCode, raw) {
+			return oauthToken{}, fmt.Errorf("token request: http %d: %w", resp.StatusCode, provider.ErrReloginRequired)
+		}
 		return oauthToken{}, fmt.Errorf("token request: http %d", resp.StatusCode)
 	}
 	var tok oauthToken
@@ -518,12 +521,4 @@ func decodeJWTClaims(idToken string) (map[string]any, error) {
 func stringClaim(claims map[string]any, key string) string {
 	v, _ := claims[key].(string)
 	return strings.TrimSpace(v)
-}
-
-// truncate shortens upstream bodies for log lines.
-func truncate(b []byte, n int) string {
-	if len(b) <= n {
-		return string(b)
-	}
-	return string(b[:n]) + "..."
 }

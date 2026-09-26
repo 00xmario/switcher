@@ -137,7 +137,7 @@ func fetchUsage(ctx context.Context, key string) (usageSnapshot, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return usageSnapshot{}, provider.ErrUsageUnavailable
+		return usageSnapshot{}, provider.UsageStatusError(resp.StatusCode)
 	}
 	var snap struct {
 		Email    string `json:"email"`
@@ -168,7 +168,7 @@ func fetchUsage(ctx context.Context, key string) (usageSnapshot, error) {
 func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, error) {
 	snap, err := fetchUsage(ctx, a.Token.AccessToken)
 	if err != nil {
-		return provider.Usage{}, provider.ErrUsageUnavailable
+		return provider.Usage{}, err
 	}
 	windows := make([]provider.UsageWindow, 0, 3)
 	present := func(label string, w usageWindow) {

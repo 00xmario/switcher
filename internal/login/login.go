@@ -56,10 +56,7 @@ type result struct {
 
 // Manager tracks pending and recently-finished login flows across providers.
 type Manager struct {
-	persist func(store.Account) error
-	// lookup reads one stored account, used by relogin flows to adopt the
-	// existing account id instead of minting a duplicate.
-	lookup func(id string) (store.Account, error)
+	persist func(*store.Account, string) error
 
 	mu      sync.Mutex
 	pending map[string]*pending
@@ -68,10 +65,9 @@ type Manager struct {
 
 // New creates a login manager. persist is called exactly once per
 // successful login, from the goroutine that completes it.
-func New(persist func(store.Account) error, lookup func(id string) (store.Account, error)) *Manager {
+func New(persist func(*store.Account, string) error) *Manager {
 	return &Manager{
 		persist: persist,
-		lookup:  lookup,
 		pending: map[string]*pending{},
 		results: map[string]result{},
 	}
@@ -95,19 +91,11 @@ func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider, relog
 	if err != nil {
 		return Handle{}, fmt.Errorf("start device login: %w", err)
 	}
-	m.track(info.State, prov, reloginTarget)
+	p := m.track(info.State, prov, reloginTarget)
 	go func() {
 		account, err := poll(ctx)
-		if err == nil && m.lookup != nil && reloginTarget != "" {
-			// Relogin: adopt the existing account id so the tokens
-			// overwrite in place and the active slot survives.
-			if old, lerr := m.lookup(reloginTarget); lerr == nil &&
-				old.Provider == account.Provider && old.Email == account.Email {
-				account.ID = old.ID
-			}
-		}
 		if err == nil && m.persist != nil {
-			err = m.persist(account)
+			err = m.persist(&account, reloginTarget)
 		}
 		if err != nil {
 			log.Printf("login: device flow for %s failed: %v", prov.ID(), err)
@@ -119,6 +107,7 @@ func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider, relog
 		m.results[info.State] = result{account: account, err: err, at: time.Now()}
 		delete(m.pending, info.State)
 		m.mu.Unlock()
+		close(p.done)
 	}()
 	return Handle{State: info.State, Kind: info.Kind, VerificationURL: info.VerificationURL, UserCode: info.UserCode}, nil
 }
@@ -153,19 +142,8 @@ func (m *Manager) Complete(ctx context.Context, state, code string) error {
 	log.Printf("login: completing flow for %s (state %.8s...)", p.provider.ID(), state)
 
 	account, err := p.provider.LoginExchange(ctx, state, code)
-	if err == nil && p.reloginTarget != "" {
-		// Relogin: when the signed-in identity is the account being
-		// re-logged, adopt its id so the tokens overwrite in place and the
-		// active slot and windows survive.
-		if m.lookup != nil {
-			if old, lerr := m.lookup(p.reloginTarget); lerr == nil &&
-				old.Provider == account.Provider && old.Email == account.Email {
-				account.ID = old.ID
-			}
-		}
-	}
 	if err == nil && m.persist != nil {
-		err = m.persist(account)
+		err = m.persist(&account, p.reloginTarget)
 	}
 	if err != nil {
 		err = fmt.Errorf("login exchange: %w", err)
@@ -213,11 +191,13 @@ func (m *Manager) Outcome(state string, wait time.Duration) (account store.Accou
 }
 
 // track records a new pending flow.
-func (m *Manager) track(state string, prov provider.Provider, reloginTarget string) {
+func (m *Manager) track(state string, prov provider.Provider, reloginTarget string) *pending {
 	m.mu.Lock()
 	m.gcLocked()
-	m.pending[state] = &pending{provider: prov, reloginTarget: reloginTarget, done: make(chan struct{}), started: time.Now()}
+	p := &pending{provider: prov, reloginTarget: reloginTarget, done: make(chan struct{}), started: time.Now()}
+	m.pending[state] = p
 	m.mu.Unlock()
+	return p
 }
 
 // SinglePending returns the only tracked pending login state, or "" when

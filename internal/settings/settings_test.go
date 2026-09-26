@@ -30,6 +30,31 @@ func TestPasswordRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMenuUsageBarsDefaultOnAndPersistedOff(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	if !s.MenuUsageBars() {
+		t.Fatal("new installs must show menu usage bars by default")
+	}
+	st := s.Load()
+	off := false
+	st.MenuUsageBars = &off
+	if err := s.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	if New(dir).MenuUsageBars() {
+		t.Fatal("disabled menu usage bars did not survive a restart")
+	}
+	on := true
+	st.MenuUsageBars = &on
+	if err := s.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	if !New(dir).MenuUsageBars() {
+		t.Fatal("enabled menu usage bars did not survive a restart")
+	}
+}
+
 func TestPasswordTooShort(t *testing.T) {
 	s := New(t.TempDir())
 	if err := s.SetPassword("short"); err == nil {

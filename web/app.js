@@ -135,6 +135,18 @@ function fmtRemaining(untilUnix) {
   return `${d}d ${h % 24}h`;
 }
 
+function resetTime(untilUnix) {
+  if (!Number.isFinite(untilUnix) || untilUnix <= Date.now() / 1000) return null;
+  const date = new Date(untilUnix * 1000);
+  if (!Number.isFinite(date.getTime())) return null;
+  return {
+    iso: date.toISOString(),
+    title: `Provider-reported reset: ${new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'full', timeStyle: 'full',
+    }).format(date)}`,
+  };
+}
+
 function toast(message) {
   const el = document.createElement('div');
   el.className = 'toast';
@@ -146,9 +158,14 @@ function toast(message) {
 /* ---------- rendering ---------- */
 
 async function refreshState() {
+  const epoch = stateEpoch;
+  const request = ++stateRequestId;
   try {
     const next = await api('/api/state');
-    if (JSON.stringify(next) !== JSON.stringify(data)) {
+    if (epoch !== stateEpoch || request < lastAppliedStateRequestId) return;
+    lastAppliedStateRequestId = request;
+    const completed = settleRechecks(next.accounts);
+    if (completed || JSON.stringify(next) !== JSON.stringify(data)) {
       data = next;
       render();
       renderAddProviderMenu();
@@ -164,6 +181,54 @@ function statusOf(account) {
   }
   if (account.id === data.active?.[account.provider]) return { cls: 'active', label: 'Active' };
   return { cls: '', label: 'Idle' };
+}
+
+// A state response started before a Recheck request must not repaint the
+// account with old health after the queued check is accepted.
+let stateEpoch = 0;
+let stateRequestId = 0;
+let lastAppliedStateRequestId = 0;
+const pendingRechecks = new Map(); // account id -> { accepted: bool }
+const accountStatusAnnouncer = document.createElement('div');
+accountStatusAnnouncer.className = 'sr-only';
+accountStatusAnnouncer.setAttribute('aria-live', 'polite');
+accountStatusAnnouncer.setAttribute('aria-atomic', 'true');
+document.body.appendChild(accountStatusAnnouncer);
+
+function settleRechecks(accounts) {
+  let changed = false;
+  const announcements = [];
+  const present = new Set((accounts || []).map(account => account.id));
+  for (const id of pendingRechecks.keys()) {
+    if (!present.has(id)) {
+      pendingRechecks.delete(id);
+      changed = true;
+    }
+  }
+  for (const account of accounts || []) {
+    const pending = pendingRechecks.get(account.id);
+    if (pending?.accepted && account.health?.condition !== 'checking') {
+      pendingRechecks.delete(account.id);
+      announcements.push(`${PROVIDER_NAMES[account.provider] || account.provider} ${account.email}: ${healthText(account.health)}`);
+      changed = true;
+    }
+  }
+  if (announcements.length) accountStatusAnnouncer.textContent = announcements.join('. ');
+  return changed;
+}
+
+function healthText(health) {
+  const condition = health?.condition || 'checking';
+  switch (condition) {
+    case 'usage_current': return 'Usage current';
+    case 'needs_relogin': return 'Needs relogin';
+    case 'usage_unavailable': return 'Usage unavailable';
+    case 'usage_stale': {
+      const age = health.last_usage_success ? Math.max(1, Math.floor((Date.now() / 1000 - health.last_usage_success) / 60)) : 0;
+      return age > 0 ? `Usage stale · ${age}m` : 'Usage stale';
+    }
+    default: return 'Checking usage';
+  }
 }
 
 // PROVIDER_BAR_COLORS mirrors T3 Code's usageProviders.ts: the fill is the
@@ -183,16 +248,19 @@ function windowHTML(win, providerID) {
   const used = 100 - left;
   const name = PROVIDER_NAMES[providerID] || providerID;
   const remaining = fmtRemaining(win.resets_at);
+  const exact = remaining ? resetTime(win.resets_at) : null;
+  const exactTitle = exact ? ` title="${escapeHTML(exact.title)}"` : '';
+  const exactDate = exact ? ` datetime="${exact.iso}"` : '';
   // A window at 100% with no reported reset time has nothing to count
   // down: the badge would only say "soon", which is a guess, so hide it.
   const resetText = remaining ? `↻ ${remaining}` : (left < 100 ? '↻ soon' : '');
   const recovery = left < 100
-    ? `<div class="recover">↻ +${used}% in ${remaining || 'a moment'}</div>`
+    ? `<div class="recover"${exactTitle}>↻ +${used}% in ${remaining || 'a moment'}</div>`
     : '';
   const color = PROVIDER_BAR_COLORS[providerID] || 'var(--text)';
   const fill = left > 0 ? `<div class="fill" style="width:${left}%; background-color:${color}"></div>` : '';
   const hatch = used > 0 ? `<div class="hatch" style="width:${used}%; color:${color}"></div>` : '';
-  const bar = `<div class="bar">${fill}${hatch}<span class="bar-label"><span class="bar-name">${escapeHTML(name)}</span><span class="bar-pct">${left}%</span></span><span class="reset-badge">${resetText}</span></div>`;
+  const bar = `<div class="bar">${fill}${hatch}<span class="bar-label"><span class="bar-name">${escapeHTML(name)}</span><span class="bar-pct">${left}%</span></span>${exact ? `<time class="reset-badge"${exactDate}${exactTitle}>${resetText}</time>` : `<span class="reset-badge">${resetText}</span>`}</div>`;
   return `
     <div class="window">
       <div class="win-left">
@@ -209,6 +277,10 @@ function windowHTML(win, providerID) {
 function accountHTML(account) {
   const isActive = account.id === data.active?.[account.provider];
   const status = statusOf(account);
+  const recheckPending = pendingRechecks.has(account.id);
+  const health = recheckPending
+    ? { condition: 'checking' }
+    : (account.health || { condition: 'checking' });
   const plan = PLAN_NAMES[account.plan] || account.plan || '';
   let windows;
   if (account.usage && account.usage.windows && account.usage.windows.length) {
@@ -227,9 +299,13 @@ function accountHTML(account) {
             <span class="dot ${status.cls}"></span>${status.label}
             ${plan ? ` · ${escapeHTML(plan)}` : ''}
           </div>
+          <div class="account-health ${escapeHTML(health.condition)}"><span class="health-mark" aria-hidden="true"></span>${escapeHTML(healthText(health))}</div>
         </div>
         <div class="actions">
           ${account.reset_credits ? `<span class="reset-badge banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
+          <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-label="Recheck account usage" title="Recheck usage" aria-disabled="${recheckPending}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
+          </button>
           <button class="use" data-act="activate" ${isActive ? 'disabled' : ''}>
             ${isActive ? 'Active' : 'Use this account'}
           </button>
@@ -258,6 +334,8 @@ function updateBannerHTML() {
 }
 
 function render() {
+  const focusedRecheck = document.activeElement?.matches?.('button[data-act="recheck"]')
+    ? document.activeElement.closest('.account')?.dataset.id : null;
   const byProvider = new Map();
   for (const a of data.accounts) {
     if (!byProvider.has(a.provider)) byProvider.set(a.provider, []);
@@ -291,6 +369,10 @@ function render() {
       </section>`;
   });
   providersEl.innerHTML = html;
+  if (focusedRecheck) {
+    const card = [...providersEl.querySelectorAll('.account')].find(el => el.dataset.id === focusedRecheck);
+    card?.querySelector('.recheck-btn')?.focus({ preventScroll: true });
+  }
 }
 
 /* ---------- usage ---------- */
@@ -389,11 +471,20 @@ providersEl.addEventListener('click', async (event) => {
     return;
   }
   const button = event.target.closest('button[data-act]');
-  if (!button || button.disabled) return;
+  if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return;
   const id = button.closest('.account').dataset.id;
   try {
     if (button.dataset.act === 'activate') {
       await api(`/api/accounts/${id}/activate`, { method: 'POST' });
+      await refreshState();
+    } else if (button.dataset.act === 'recheck') {
+      pendingRechecks.set(id, { accepted: false });
+      const account = data.accounts.find(a => a.id === id);
+      accountStatusAnnouncer.textContent = `Checking usage for ${account?.email || 'this account'}`;
+      render(); // Show Checking usage and the spinner immediately.
+      await api(`/api/accounts/${id}/recheck`, { method: 'POST' });
+      pendingRechecks.get(id).accepted = true;
+      stateEpoch++;
       await refreshState();
     } else if (button.dataset.act === 'relogin') {
       // Relogin threads the account id through the flow: when the signed-in
@@ -427,9 +518,14 @@ providersEl.addEventListener('click', async (event) => {
       });
       if (!yes) return;
       await api(`/api/accounts/${id}`, { method: 'DELETE' });
+      pendingRechecks.delete(id);
       await refreshState();
     }
   } catch (err) {
+    if (button.dataset.act === 'recheck') {
+      pendingRechecks.delete(id);
+      if (data) render();
+    }
     toast(err.message);
   }
 });
@@ -481,14 +577,14 @@ providersEl.addEventListener('dragover', (event) => {
 // "Add account" and "Relogin".
 async function startProviderLogin(providerID, reloginOf) {
   try {
-    const res = await api('/api/login/import', {
+    const imported = await api('/api/login/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: providerID }),
+      body: JSON.stringify({ provider: providerID, relogin_of: reloginOf || undefined }),
     });
-    if (res.ok) {
-      const body = await res.json();
-      toast(`Imported the ${PROVIDER_NAMES[providerID] || providerID} CLI login: ${body.account.email}`);
+    if (imported.status === 'ok' && imported.account) {
+      if (reloginOf) pendingRechecks.delete(reloginOf);
+      toast(`Imported the ${PROVIDER_NAMES[providerID] || providerID} CLI login: ${imported.account.email}`);
       await refreshState();
       await refreshAllUsage();
       return;
@@ -512,7 +608,7 @@ async function startProviderLogin(providerID, reloginOf) {
       return;
     }
   }
-  pollLogin(login.state); // detached: the button stays usable for another attempt
+  pollLogin(login.state, reloginOf); // detached: the button stays usable for another attempt
 }
 
 providersEl.addEventListener('click', async (event) => {
@@ -529,6 +625,7 @@ providersEl.addEventListener('click', async (event) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: providerID, key }),
       });
+      pendingRechecks.delete(res.account.id);
       toast(`Account added: ${res.account.email}`);
       await refreshState();
       await refreshAllUsage();
@@ -564,13 +661,14 @@ document.addEventListener('click', (event) => {
 
 // Login polling runs detached so closing the popup never locks the button:
 // the user can always click "Add account" again immediately.
-async function pollLogin(state) {
+async function pollLogin(state, reloginOf) {
   const deadline = Date.now() + 5 * 60 * 1000;
   while (Date.now() < deadline) {
     try {
       const res = await api(`/api/login/${state}`);
       if (res.status === 'done') {
         document.querySelector('.device-overlay')?.remove();
+        if (reloginOf) pendingRechecks.delete(reloginOf);
         toast(`Account added: ${res.account.email}`);
         await refreshState();
         await refreshAllUsage();
@@ -578,6 +676,7 @@ async function pollLogin(state) {
       }
       if (res.status === 'failed') {
         document.querySelector('.device-overlay')?.remove();
+        if (reloginOf) pendingRechecks.delete(reloginOf);
         toast('Login failed: ' + (res.error || 'did not complete'));
         return;
       }
@@ -1335,6 +1434,14 @@ async function renderSettings() {
   settingsPage.innerHTML = `
     <div class="settings-grid">
       <div class="settings-card">
+        <h2>CLI setup</h2>
+        <p class="settings-sub">Check whether Codex sends requests through this Switcher server.</p>
+        <div class="settings-row"><div><strong>Codex</strong><span class="dim" id="codex-setup-status"> · Checking…</span></div>
+          <button id="codex-setup-install" type="button">Connect Codex</button></div>
+        <p class="settings-sub" id="codex-setup-detail"></p>
+        <button id="codex-setup-check" type="button">Check again</button>
+      </div>
+      <div class="settings-card">
         <h2>Security</h2>
         <p class="settings-sub">Authentication is off by default: Switcher only accepts local connections. Turn it on before exposing the server beyond this machine.</p>
         ${status.auth_enabled ? `
@@ -1366,7 +1473,85 @@ async function renderSettings() {
         <div class="settings-row"><div><strong>Device token</strong><span class="dim"> · menu bar app authenticates with it</span></div>
           <button id="rotate-token" type="button">Rotate</button></div>
       </div>
+      <div class="settings-card">
+        <h2>Menu bar</h2>
+        <div class="settings-row">
+          <div><strong>Usage bars</strong><span class="dim"> · remaining quota at a glance</span></div>
+          <label class="switch-wrap"><input type="checkbox" id="menu-usage-bars" aria-label="Show usage bars in the menu bar" ${status.menu_usage_bars !== false ? 'checked' : ''}><span class="switch-visual"></span></label>
+        </div>
+        <div class="settings-row">
+          <div><strong>Reset alerts</strong><span class="dim"> · at provider-reported usage reset times</span></div>
+          <label class="switch-wrap"><input type="checkbox" id="reset-notifications" aria-label="Notify when a usage window is due to reset" ${status.reset_notifications ? 'checked' : ''}><span class="switch-visual"></span></label>
+        </div>
+        <p class="settings-sub">Requires the Switcher menu bar app to be running and macOS notification permission. If permission was denied, allow Switcher in System Settings → Notifications. Alerts fire at the reported time only while the app is running.</p>
+      </div>
     </div>`;
+
+  const setupStatus = settingsPage.querySelector('#codex-setup-status');
+  const setupDetail = settingsPage.querySelector('#codex-setup-detail');
+  const setupButton = settingsPage.querySelector('#codex-setup-install');
+  const setupLabels = {
+    ready: 'Connected', missing: 'No Codex config', unreadable: 'Config unreadable',
+    invalid: 'Config invalid', not_selected: 'Switcher not selected',
+    other_provider: 'Another provider selected', misconfigured: 'Switcher config needs repair',
+  };
+  async function checkCLISetup() {
+    try {
+      const { codex } = await api('/api/cli-setup');
+      setupStatus.textContent = ` · ${setupLabels[codex.condition] || 'Unknown'}`;
+      setupDetail.textContent = codex.condition === 'ready'
+        ? `Codex is configured to use ${codex.expected_url}`
+        : `Connect Codex to ${codex.expected_url}. A backup is saved beside the config.`;
+      setupButton.hidden = codex.condition === 'ready';
+    } catch (err) {
+      setupStatus.textContent = ' · Could not check';
+      setupDetail.textContent = err.message;
+      setupButton.hidden = true;
+    }
+  }
+  settingsPage.querySelector('#codex-setup-check').addEventListener('click', checkCLISetup);
+  setupButton.addEventListener('click', async () => {
+    setupButton.disabled = true;
+    try {
+      await api('/api/cli-setup/codex/install', { method: 'POST' });
+      toast('Codex configuration saved and verified');
+    } catch (err) { toast(err.message); }
+    finally { setupButton.disabled = false; await checkCLISetup(); }
+  });
+  checkCLISetup();
+
+  const usageBars = settingsPage.querySelector('#menu-usage-bars');
+  usageBars?.addEventListener('change', async () => {
+    try {
+      const res = await fetchWithCSRF('/api/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ menu_usage_bars: usageBars.checked }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Could not save setting');
+      toast('Menu bar preference saved');
+    } catch (err) {
+      usageBars.checked = !usageBars.checked;
+      toast(err.message);
+    }
+  });
+
+  const resetNotifications = settingsPage.querySelector('#reset-notifications');
+  resetNotifications?.addEventListener('change', async () => {
+    resetNotifications.disabled = true;
+    try {
+      await api('/api/settings', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reset_notifications: resetNotifications.checked }),
+      });
+      toast('Reset alert preference saved');
+    } catch (err) {
+      resetNotifications.checked = !resetNotifications.checked;
+      toast(err.message);
+    } finally {
+      resetNotifications.disabled = false;
+    }
+  });
 
   const bindLan = settingsPage.querySelector('#bind-lan');
   bindLan?.addEventListener('change', async () => {
@@ -1446,3 +1631,5 @@ async function renderSettings() {
     await showLoginView('Password changed. Sign in again with the new password.');
   });
 }
+
+if (location.hash === '#settings') setPage('settings');

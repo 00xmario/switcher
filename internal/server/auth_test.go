@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -333,6 +334,114 @@ func TestSettingsPatchRequiresPassword(t *testing.T) {
 	res2.Body.Close()
 	if res2.StatusCode != http.StatusConflict {
 		t.Fatalf("LAN enable without password: %d, want 409", res2.StatusCode)
+	}
+}
+
+func TestMenuUsageBarsSettingDoesNotRestartOrChangeNetwork(t *testing.T) {
+	store := settings.New(t.TempDir())
+	st := store.Load()
+	st.AuthEnabled = true
+	st.PasswordHash = "existing-password-hash"
+	st.BindLAN = true
+	st.TLS = true
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	a := &API{Settings: store}
+	restarted := false
+	previous := restartForTest
+	restartForTest = func() { restarted = true }
+	defer func() { restartForTest = previous }()
+
+	patch := httptest.NewRequest(http.MethodPatch, "/api/settings",
+		bytes.NewBufferString(`{"menu_usage_bars":false}`))
+	patch.RemoteAddr = "127.0.0.1:1234"
+	patch.Host = "127.0.0.1:8787"
+	w := httptest.NewRecorder()
+	a.handleSettingsPatch(w, patch)
+	if w.Code != http.StatusOK {
+		t.Fatalf("patch status %d: %s", w.Code, w.Body.String())
+	}
+	if store.MenuUsageBars() || !store.Load().BindLAN || !store.Load().TLS {
+		t.Fatal("visual preference failed or modified network settings")
+	}
+	if restarted {
+		t.Fatal("a visual preference restarted the server")
+	}
+	get := httptest.NewRecorder()
+	a.handleSettingsGet(get, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	var response struct {
+		MenuUsageBars bool `json:"menu_usage_bars"`
+	}
+	if err := json.Unmarshal(get.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.MenuUsageBars {
+		t.Fatal("Settings GET did not reflect the saved value")
+	}
+}
+
+func TestResetNotificationsSettingDoesNotRestartOrOverwriteUsageBars(t *testing.T) {
+	store := settings.New(t.TempDir())
+	a := &API{Settings: store}
+	previous := restartForTest
+	restarted := false
+	restartForTest = func() { restarted = true }
+	defer func() { restartForTest = previous }()
+	for _, payload := range []string{`{"menu_usage_bars":false}`, `{"reset_notifications":true}`} {
+		request := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewBufferString(payload))
+		request.RemoteAddr = "127.0.0.1:1234"
+		request.Host = "127.0.0.1:8787"
+		response := httptest.NewRecorder()
+		a.handleSettingsPatch(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("PATCH %s: %d %s", payload, response.Code, response.Body.String())
+		}
+	}
+	if !store.Load().ResetNotifications || store.MenuUsageBars() || restarted {
+		t.Fatal("notification setting lost the usage bar preference or restarted listeners")
+	}
+	response := httptest.NewRecorder()
+	a.handleSettingsGet(response, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	var body struct {
+		ResetNotifications bool `json:"reset_notifications"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || !body.ResetNotifications {
+		t.Fatalf("GET settings did not report reset notifications: %v", err)
+	}
+}
+
+func TestCLISetupChecksAndConnectsOnlyLocally(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex", "config.toml")
+	a := &API{CodexConfigPath: path, Port: 9123}
+	mux := http.NewServeMux()
+	a.Register(mux)
+	request := func(method, remote string) *httptest.ResponseRecorder {
+		t.Helper()
+		url := "/api/cli-setup"
+		if method == http.MethodPost {
+			url += "/codex/install"
+		}
+		r := httptest.NewRequest(method, url, nil)
+		r.Host, r.RemoteAddr = "127.0.0.1:9123", remote
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		return w
+	}
+	if w := request(http.MethodPost, "192.168.1.20:1234"); w.Code != http.StatusForbidden {
+		t.Fatalf("LAN setup = %d, want 403", w.Code)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("LAN request wrote config")
+	}
+	if w := request(http.MethodGet, "127.0.0.1:1234"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"condition":"missing"`) {
+		t.Fatalf("initial check: %d %s", w.Code, w.Body.String())
+	}
+	if w := request(http.MethodPost, "127.0.0.1:1234"); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"condition":"ready"`) {
+		t.Fatalf("connect: %d %s", w.Code, w.Body.String())
+	}
+	if raw, err := os.ReadFile(path); err != nil || !strings.Contains(string(raw), "127.0.0.1:9123/codex/v1") {
+		t.Fatalf("custom port config: %v", err)
 	}
 }
 

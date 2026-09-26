@@ -16,6 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"switcher/internal/codexcfg"
+	"switcher/internal/config"
 	"switcher/internal/login"
 	"switcher/internal/provider"
 	"switcher/internal/proxy"
@@ -29,15 +31,17 @@ import (
 
 // API wraps the JSON API the web UI talks to.
 type API struct {
-	Store         *store.Store
-	Logins        *login.Manager
-	Proxy         *proxy.Manager
-	Providers     map[string]provider.Provider
-	ManagementKey string
-	Version       string
-	Updater       *update.Checker
-	Usage         *usage.Service
-	Settings      *settings.Store
+	Store           *store.Store
+	Logins          *login.Manager
+	Proxy           *proxy.Manager
+	Providers       map[string]provider.Provider
+	ManagementKey   string
+	Version         string
+	Updater         *update.Checker
+	Usage           *usage.Service
+	Settings        *settings.Store
+	Port            int
+	CodexConfigPath string // optional test override
 
 	creditsMu    sync.Mutex
 	creditsCache map[string]creditsEntry
@@ -56,12 +60,15 @@ func (a *API) Register(mux *http.ServeMux) {
 		a.creditsCache = map[string]creditsEntry{}
 	}
 	mux.HandleFunc("GET /api/state", a.handleState)
+	mux.HandleFunc("GET /api/cli-setup", a.handleCLISetup)
+	mux.HandleFunc("POST /api/cli-setup/codex/install", a.handleCLISetupInstall)
 	mux.HandleFunc("POST /api/login", a.handleLoginStart)
 	a.registerAuthRoutes(mux)
 	mux.HandleFunc("POST /api/login/import", a.handleLoginImport)
 	mux.HandleFunc("GET /api/login/{state}", a.handleLoginPoll)
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", a.handleRefreshUsage)
+	mux.HandleFunc("POST /api/accounts/{id}/recheck", a.handleRecheckAccount)
 	mux.HandleFunc("POST /api/usage/refresh", a.handleRefreshAll)
 	mux.HandleFunc("GET /api/tokens", a.handleUsage)
 	mux.HandleFunc("POST /api/tokens/refresh", a.handleUsageRefresh)
@@ -72,6 +79,43 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/providers/{id}/hide", a.handleProviderHide)
 	mux.HandleFunc("POST /api/providers/{id}/show", a.handleProviderShow)
 	mux.HandleFunc("DELETE /api/accounts/{id}", a.handleDelete)
+}
+
+func (a *API) cliSetupPath() string {
+	if a.CodexConfigPath != "" {
+		return a.CodexConfigPath
+	}
+	return config.CodexConfigPath()
+}
+
+func (a *API) cliSetupPort() int {
+	if a.Port > 0 {
+		return a.Port
+	}
+	return config.DefaultPort
+}
+
+func (a *API) handleCLISetup(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"codex": codexcfg.Check(a.cliSetupPath(), a.cliSetupPort())})
+}
+
+func (a *API) handleCLISetupInstall(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	if err := codexcfg.InstallAt(a.cliSetupPath(), a.cliSetupPort()); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not update Codex configuration"})
+		return
+	}
+	status := codexcfg.Check(a.cliSetupPath(), a.cliSetupPort())
+	if status.Condition != "ready" {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "Codex configuration did not verify", "codex": status})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"codex": status})
 }
 
 // LocalOnly guards the API against other websites: it rejects requests
@@ -154,6 +198,7 @@ type accountView struct {
 	ExhaustedUntil int64             `json:"exhausted_until,omitempty"`
 	LastRefresh    int64             `json:"last_refresh,omitempty"`
 	Usage          *provider.Usage   `json:"usage,omitempty"`
+	Health         proxy.Health      `json:"health"`
 	ResetCredits   *resetCreditsView `json:"reset_credits,omitempty"`
 }
 
@@ -212,6 +257,7 @@ func viewOfBase(a *API, acc store.Account) accountView {
 		Plan:        acc.Plan,
 		Active:      acc.ID == a.Proxy.ActiveID(acc.Provider),
 		LastRefresh: acc.LastRefresh,
+		Health:      a.Proxy.AccountHealth(acc.ID),
 	}
 	if until, ok := a.Proxy.Exhausted(acc.ID); ok {
 		v.ExhaustedUntil = until.Unix()
@@ -242,13 +288,15 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 	// tier as the local files, so it earns the state but not the key.
 	revealHubKey := AuthKind(r) != AuthDevice
 	state := map[string]any{
-		"active":   a.Proxy.ActiveAll(),
-		"accounts": views,
-		"order":    order,
-		"hidden":   hidden,
-		"hub_url":  "http://127.0.0.1:8787",
-		"version":  a.Version,
-		"update":   a.UpdateState(),
+		"active":              a.Proxy.ActiveAll(),
+		"accounts":            views,
+		"order":               order,
+		"hidden":              hidden,
+		"hub_url":             "http://127.0.0.1:8787",
+		"version":             a.Version,
+		"update":              a.UpdateState(),
+		"menu_usage_bars":     a.Settings == nil || a.Settings.MenuUsageBars(),
+		"reset_notifications": a.Settings != nil && a.Settings.Load().ResetNotifications,
 	}
 	if revealHubKey {
 		state["hub_management_key"] = a.ManagementKey
@@ -268,7 +316,8 @@ type importer interface {
 // web UI can fall back to the browser flow.
 func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Provider string `json:"provider"`
+		Provider  string `json:"provider"`
+		ReloginOf string `json:"relogin_of"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -289,7 +338,26 @@ func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := a.Store.Save(account); err != nil {
+	if body.ReloginOf != "" {
+		if !validID(body.ReloginOf) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid relogin account id"})
+			return
+		}
+	}
+	if body.ReloginOf != "" {
+		err = a.Proxy.ReplaceReloginAccount(&account, body.ReloginOf)
+	} else {
+		err = a.Proxy.ReplaceAccount(account)
+	}
+	if errors.Is(err, proxy.ErrReloginTargetUnavailable) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "relogin account not found"})
+		return
+	}
+	if errors.Is(err, proxy.ErrReloginIdentityMismatch) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "CLI login belongs to a different account"})
+		return
+	}
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "save account: " + err.Error()})
 		return
 	}
@@ -344,14 +412,16 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := map[string]any{
-		"auth_enabled":     a.Settings.Enabled(),
-		"password_set":     a.Settings.HasPassword(),
-		"bind_lan":         st.BindLAN,
-		"lan_active":       LANListenerActive(),
-		"tls":              st.TLS,
-		"lan_ip":           LANAddress(),
-		"sessions":         a.Settings.SessionCount(),
-		"device_token_set": a.Settings.HasDeviceToken(),
+		"auth_enabled":        a.Settings.Enabled(),
+		"password_set":        a.Settings.HasPassword(),
+		"menu_usage_bars":     a.Settings.MenuUsageBars(),
+		"reset_notifications": st.ResetNotifications,
+		"bind_lan":            st.BindLAN,
+		"lan_active":          LANListenerActive(),
+		"tls":                 st.TLS,
+		"lan_ip":              LANAddress(),
+		"sessions":            a.Settings.SessionCount(),
+		"device_token_set":    a.Settings.HasDeviceToken(),
 	}
 	// A valid session cookie re-learns its CSRF token (localStorage was
 	// cleared but the browser kept the cookie).
@@ -530,13 +600,15 @@ func (a *API) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	st := a.Settings.Load()
 	lanActive := LANListenerActive()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"auth_enabled": st.AuthEnabled,
-		"bind_lan":     lanActive,
-		"bind_pending": st.BindLAN && !lanActive,
-		"lan_active":   lanActive,
-		"tls":          st.TLS,
-		"lan_ip":       LANAddress(),
-		"password_set": st.PasswordHash != "",
+		"auth_enabled":        st.AuthEnabled,
+		"bind_lan":            lanActive,
+		"bind_pending":        st.BindLAN && !lanActive,
+		"lan_active":          lanActive,
+		"tls":                 st.TLS,
+		"lan_ip":              LANAddress(),
+		"password_set":        st.PasswordHash != "",
+		"menu_usage_bars":     a.Settings.MenuUsageBars(),
+		"reset_notifications": st.ResetNotifications,
 	})
 }
 
@@ -545,33 +617,56 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		BindLAN bool `json:"bind_lan"`
-		TLS     bool `json:"tls"`
+		BindLAN            *bool `json:"bind_lan"`
+		TLS                *bool `json:"tls"`
+		MenuUsageBars      *bool `json:"menu_usage_bars"`
+		ResetNotifications *bool `json:"reset_notifications"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	st := a.Settings.Load()
-	if body.BindLAN && (!st.AuthEnabled || !a.Settings.HasPassword()) {
+	var restartRequired bool
+	err := a.Settings.Update(func(st *settings.Settings) error {
+		bindLAN := st.BindLAN
+		if body.BindLAN != nil {
+			bindLAN = *body.BindLAN
+		}
+		if bindLAN && (!st.AuthEnabled || st.PasswordHash == "") {
+			return errors.New("set a password before binding the LAN")
+		}
+		tlsEnabled := st.TLS
+		if body.TLS != nil {
+			tlsEnabled = *body.TLS
+		}
+		if bindLAN {
+			tlsEnabled = true
+		}
+		restartRequired = st.BindLAN != bindLAN || st.TLS != tlsEnabled
+		st.BindLAN, st.TLS = bindLAN, tlsEnabled
+		if body.MenuUsageBars != nil {
+			st.MenuUsageBars = body.MenuUsageBars
+		}
+		if body.ResetNotifications != nil {
+			st.ResetNotifications = *body.ResetNotifications
+		}
+		return nil
+	})
+	if err != nil && err.Error() == "set a password before binding the LAN" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "set a password before binding the LAN"})
 		return
 	}
-	if body.BindLAN {
-		body.TLS = true // LAN is TLS-only, enforced server-side
-	}
-	st.BindLAN = body.BindLAN
-	st.TLS = body.TLS
-	if err := a.Settings.Save(st); err != nil {
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	// The listeners live in main.go: re-exec in place so the new topology
-	// (LAN + TLS) takes effect immediately.
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		restartSelf()
-	}()
+	if restartRequired {
+		// Network changes need new listeners; visual preferences do not.
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			restartSelf()
+		}()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
@@ -630,7 +725,7 @@ func (a *API) handleAddKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "that key did not work: " + err.Error()})
 		return
 	}
-	if err := a.Store.Save(account); err != nil {
+	if err := a.Proxy.ReplaceAccount(account); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not store account"})
 		return
 	}
@@ -653,6 +748,18 @@ func (a *API) handleLoginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		if errors.Is(err, proxy.ErrReloginIdentityMismatch) {
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status": "failed", "error": "Signed in to a different account. Use the selected account to relogin.",
+			})
+			return
+		}
+		if errors.Is(err, proxy.ErrReloginTargetUnavailable) {
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status": "failed", "error": "The selected account no longer exists.",
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": "login did not complete"})
 		return
 	}
@@ -745,7 +852,26 @@ func (a *API) handleRefreshUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usage := a.Proxy.RefreshUsage(r.Context(), account)
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "usage": usage})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "usage": usage, "health": a.Proxy.AccountHealth(id)})
+}
+
+// handleRecheckAccount queues a coalesced usage check. The existing state
+// poll delivers the result without holding an HTTP request through OAuth.
+func (a *API) handleRecheckAccount(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid account id"})
+		return
+	}
+	if err := a.Proxy.QueueRecheck(id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such account"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not queue account check"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "checking", "health": a.Proxy.AccountHealth(id)})
 }
 
 func (a *API) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -754,11 +880,10 @@ func (a *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid account id", http.StatusBadRequest)
 		return
 	}
-	if err := a.Store.Delete(id); err != nil {
+	if err := a.Proxy.DeleteAccount(id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not delete account"})
 		return
 	}
-	a.Proxy.Remove(id)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

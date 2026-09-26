@@ -58,7 +58,7 @@ func main() {
 	args := flag.Args()
 	switch {
 	case len(args) > 0 && args[0] == "install":
-		if err := codexcfg.Install(config.CodexConfigPath()); err != nil {
+		if err := codexcfg.InstallAt(config.CodexConfigPath(), *port); err != nil {
 			log.Fatalf("switcher install: %v", err)
 		}
 		fmt.Println("Switcher installed into the codex config (backup: ~/.codex/config.toml.switcher-backup).")
@@ -127,15 +127,21 @@ func run(port int) {
 	}
 	// Successful logins persist immediately from the callback goroutine;
 	// the first account of a provider automatically becomes active.
-	logins := login.New(func(a store.Account) error {
-		if err := st.Save(a); err != nil {
+	logins := login.New(func(a *store.Account, reloginTarget string) error {
+		var err error
+		if reloginTarget != "" {
+			err = proxyManager.ReplaceReloginAccount(a, reloginTarget)
+		} else {
+			err = proxyManager.ReplaceAccount(*a)
+		}
+		if err != nil {
 			return err
 		}
 		if proxyManager.ActiveID(a.Provider) == "" {
 			return proxyManager.Activate(a.ID)
 		}
 		return nil
-	}, st.Get)
+	})
 	mgmtAPI := &mgmtapi.API{Store: st, Proxy: proxyManager, Logins: logins, ManagementKey: managementKey}
 
 	updater := update.New(version)
@@ -167,7 +173,7 @@ func run(port int) {
 	api := &server.API{
 		Store: st, Logins: logins, Proxy: proxyManager, Providers: providers,
 		ManagementKey: managementKey, Version: version, Updater: updater, Usage: usageService,
-		Settings: settingsStore,
+		Settings: settingsStore, Port: port,
 	}
 
 	// Each provider with a browser redirect has its own callback listener;

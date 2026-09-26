@@ -162,6 +162,18 @@ func (p *Provider) discoverProject(ctx context.Context, accessToken string) (str
 	return projectIDOf(id), nil
 }
 
+type cloudcodeHTTPError struct{ status int }
+
+func (e cloudcodeHTTPError) Error() string { return fmt.Sprintf("http %d", e.status) }
+
+func usageQueryError(err error) error {
+	var statusErr cloudcodeHTTPError
+	if errors.As(err, &statusErr) {
+		return fmt.Errorf("%w: %w", provider.UsageStatusError(statusErr.status), err)
+	}
+	return fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
+}
+
 // cloudcodePost posts one authenticated Cloud Code JSON request.
 func (p *Provider) cloudcodePost(ctx context.Context, accessToken, base, method string, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/"+method, bytes.NewReader(body))
@@ -177,12 +189,12 @@ func (p *Provider) cloudcodePost(ctx context.Context, accessToken, base, method 
 		return fmt.Errorf("antigravity %s: %w", method, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("antigravity %s failed: %w", method, cloudcodeHTTPError{resp.StatusCode})
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return fmt.Errorf("antigravity %s: %w", method, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("antigravity %s failed: http %d", method, resp.StatusCode)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("antigravity %s response: %w", method, err)
@@ -247,11 +259,11 @@ func ProjectID(a store.Account) string {
 // clients on the refresh grant.
 func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	if a.Token.RefreshToken == "" {
-		return errors.New("no refresh token; sign in again")
+		return fmt.Errorf("antigravity refresh: missing refresh token: %w", provider.ErrReloginRequired)
 	}
 	tok, err := googleauth.RefreshToken(ctx, ClientSecret, a.Token.RefreshToken, ClientID)
 	if err != nil {
-		return err
+		return fmt.Errorf("antigravity refresh: %w", err)
 	}
 	a.Token.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
@@ -362,9 +374,9 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	if ferr := p.cloudcodePost(ctx, a.Token.AccessToken, apiBase, version+":fetchAvailableModels",
 		[]byte(`{}`), &models); ferr != nil {
 		if err != nil {
-			return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
+			return provider.Usage{}, errors.Join(usageQueryError(err), usageQueryError(ferr))
 		}
-		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, ferr)
+		return provider.Usage{}, usageQueryError(ferr)
 	}
 	var windows []provider.UsageWindow
 	for name, m := range models.Models {

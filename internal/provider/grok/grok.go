@@ -163,7 +163,7 @@ func postFormLenient(ctx context.Context, target string, form url.Values) (int, 
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := provider.OAuthHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("grok token request: %w", err)
 	}
@@ -183,10 +183,10 @@ func (p *Provider) AddByKey(ctx context.Context, key string) (store.Account, err
 // Refresh renews the account's tokens using the OIDC token endpoint.
 func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	if a.Token.RefreshToken == "" {
-		return errors.New("no refresh token; sign in again")
+		return fmt.Errorf("grok refresh: missing refresh token: %w", provider.ErrReloginRequired)
 	}
 	// Resolve the token endpoint fresh; xAI rotates it through discovery.
-	discovery, err := discover(context.WithoutCancel(ctx))
+	discovery, err := discover(ctx)
 	if err != nil {
 		return err
 	}
@@ -195,9 +195,15 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 		"client_id":     {clientID},
 		"refresh_token": {a.Token.RefreshToken},
 	}
-	body, err := postForm(ctx, discovery.TokenEndpoint, form)
+	status, body, err := postFormLenient(ctx, discovery.TokenEndpoint, form)
 	if err != nil {
 		return err
+	}
+	if status != http.StatusOK {
+		if provider.RefreshCredentialRejected(status, body) {
+			return fmt.Errorf("grok refresh: http %d: %w", status, provider.ErrReloginRequired)
+		}
+		return fmt.Errorf("grok refresh: http %d", status)
 	}
 	var tok struct {
 		AccessToken  string `json:"access_token"`
@@ -260,12 +266,12 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return provider.Usage{}, provider.UsageStatusError(resp.StatusCode)
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return provider.Usage{}, fmt.Errorf("%w: read body: %v", provider.ErrUsageUnavailable, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return provider.Usage{}, fmt.Errorf("%w: upstream status %d: %s", provider.ErrUsageUnavailable, resp.StatusCode, truncForLog(raw))
 	}
 
 	var parsed struct {
@@ -342,7 +348,7 @@ func discover(ctx context.Context) (*struct {
 		return nil, fmt.Errorf("grok discovery: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := provider.OAuthHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("grok discovery: %w", err)
 	}
@@ -374,7 +380,7 @@ func postForm(ctx context.Context, target string, form url.Values) ([]byte, erro
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := provider.OAuthHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("grok token request: %w", err)
 	}
@@ -437,13 +443,4 @@ func accountFromToken(tok oauthToken) (store.Account, error) {
 	sum := sha256.Sum256([]byte(acc.Provider + "|" + email + "|" + subject))
 	acc.ID = fmt.Sprintf("%s-%x", acc.Provider, sum[:4])
 	return acc, nil
-}
-
-// truncForLog shortens an upstream body for log lines.
-func truncForLog(b []byte) string {
-	const n = 200
-	if len(b) <= n {
-		return string(b)
-	}
-	return string(b[:n]) + "..."
 }

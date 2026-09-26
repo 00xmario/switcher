@@ -17,11 +17,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"switcher/internal/provider"
 	"switcher/internal/store"
-	"sync/atomic"
 )
 
 // maxBodyBytes caps how much of a request body is buffered so a retry can
@@ -30,6 +30,27 @@ const maxBodyBytes = 64 << 20
 
 // errNoAccount is the message returned when nothing can serve a request.
 var errNoAccount = errors.New("no usable account is active; add one in the Switcher UI")
+
+// Relogin errors describe only the local account match, never provider tokens.
+var (
+	ErrReloginIdentityMismatch  = errors.New("signed in to a different account")
+	ErrReloginTargetUnavailable = errors.New("relogin account no longer exists")
+)
+
+// Health is a coarse usage and credential status. Timestamps are Unix seconds.
+type Health struct {
+	Condition        string `json:"condition"`
+	LastChecked      int64  `json:"last_checked,omitempty"`
+	LastUsageSuccess int64  `json:"last_usage_success,omitempty"`
+}
+
+type healthState struct {
+	lastChecked time.Time
+	lastSuccess time.Time
+	relogin     bool
+	checking    int
+	queued      bool
+}
 
 // Upstream result of a request that hit an exhausted account.
 type usageLimitBody struct {
@@ -47,6 +68,8 @@ type Manager struct {
 	active        map[string]string // provider -> active account id
 	exhausted     map[string]time.Time
 	lastUsage     map[string]provider.Usage
+	health        map[string]*healthState
+	generation    map[string]uint64 // retained across deletion and replacement
 	syncing       atomic.Bool
 	refreshing    map[string]*sync.Mutex
 	order         []string // display order of provider sections
@@ -103,6 +126,8 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		active:        active,
 		exhausted:     exhausted,
 		lastUsage:     map[string]provider.Usage{},
+		health:        map[string]*healthState{},
+		generation:    map[string]uint64{},
 		order:         order,
 		hidden:        hidden,
 		managementKey: state.ManagementKey,
@@ -227,14 +252,89 @@ func (m *Manager) Activate(id string) error {
 func (m *Manager) Remove(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.generation[id]++
+	m.removeLocked(id)
+}
+
+func (m *Manager) removeLocked(id string) {
 	delete(m.exhausted, id)
 	delete(m.lastUsage, id)
+	delete(m.health, id)
 	for providerID, activeID := range m.active {
 		if activeID == id {
 			delete(m.active, providerID)
 			_ = m.persistLocked()
 		}
 	}
+}
+
+// DeleteAccount serializes deletion with token refresh and invalidates queued
+// usage results. Callers should use this instead of Store.Delete plus Remove.
+func (m *Manager) DeleteAccount(id string) error {
+	lock := m.refreshLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := m.store.Delete(id); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.generation[id]++
+	m.removeLocked(id)
+	return nil
+}
+
+// ResetAccount clears cached usage and health after an external account
+// overwrite. External writers must serialize token writes with refreshes;
+// use ReplaceAccount when replacing credentials for an existing ID.
+func (m *Manager) ResetAccount(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.generation[id]++
+	delete(m.health, id)
+	delete(m.lastUsage, id)
+}
+
+// ReplaceAccount saves credentials under the same per-account lock used by
+// refreshes. Callers may Activate the account afterward if it is new.
+func (m *Manager) ReplaceAccount(a store.Account) error {
+	lock := m.refreshLock(a.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.saveAccount(a)
+}
+
+// ReplaceReloginAccount checks identity and saves under the same account lock
+// used by deletion and refresh. The selected account cannot be recreated if
+// it was deleted while the provider sign-in was in flight.
+func (m *Manager) ReplaceReloginAccount(a *store.Account, target string) error {
+	lock := m.refreshLock(target)
+	lock.Lock()
+	defer lock.Unlock()
+	existing, err := m.store.Get(target)
+	if err != nil {
+		return ErrReloginTargetUnavailable
+	}
+	if existing.Provider != a.Provider || !strings.EqualFold(existing.Email, a.Email) {
+		return ErrReloginIdentityMismatch
+	}
+	a.ID = existing.ID
+	return m.saveAccount(*a)
+}
+
+func (m *Manager) saveAccount(a store.Account) error {
+	// QueueRecheck admits work under m.mu. Keep the disk save and generation
+	// change in one critical section so it cannot accept a check for the new
+	// file with the old generation in between them.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.store.Save(a); err != nil {
+		return err
+	}
+	m.generation[a.ID]++
+	delete(m.health, a.ID)
+	delete(m.lastUsage, a.ID)
+	return nil
 }
 
 // ClearExhausted lifts a parked/exhausted mark on an account (e.g. after
@@ -262,6 +362,80 @@ func (m *Manager) LastUsage(id string) (provider.Usage, bool) {
 	return u, ok
 }
 
+// AccountHealth derives staleness without querying the provider.
+func (m *Manager) AccountHealth(id string) Health {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h := m.health[id]
+	if h == nil {
+		return Health{Condition: "checking"}
+	}
+	out := Health{}
+	if !h.lastChecked.IsZero() {
+		out.LastChecked = h.lastChecked.Unix()
+	}
+	if !h.lastSuccess.IsZero() {
+		out.LastUsageSuccess = h.lastSuccess.Unix()
+	}
+	switch {
+	case h.checking > 0 || h.queued:
+		out.Condition = "checking"
+	case h.relogin:
+		out.Condition = "needs_relogin"
+	case h.lastChecked.IsZero():
+		out.Condition = "checking"
+	case h.lastSuccess.IsZero(), !m.lastUsage[id].Available:
+		out.Condition = "usage_unavailable"
+	case time.Since(h.lastSuccess) >= 5*time.Minute:
+		out.Condition = "usage_stale"
+	default:
+		out.Condition = "usage_current"
+	}
+	return out
+}
+
+func (m *Manager) healthLocked(id string) *healthState {
+	h := m.health[id]
+	if h == nil {
+		h = &healthState{}
+		m.health[id] = h
+	}
+	return h
+}
+
+// QueueRecheck schedules at most one outstanding forced poll per account.
+func (m *Manager) QueueRecheck(id string) error {
+	m.mu.Lock()
+	account, err := m.store.Get(id)
+	if err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	if _, ok := m.providers[account.Provider]; !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("unknown provider %q", account.Provider)
+	}
+	h := m.healthLocked(id)
+	if h.queued {
+		m.mu.Unlock()
+		return nil
+	}
+	h.queued = true
+	gen := m.generation[id]
+	m.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		m.refreshAccount(ctx, id, gen, true)
+		m.mu.Lock()
+		if m.generation[id] == gen {
+			m.healthLocked(id).queued = false
+		}
+		m.mu.Unlock()
+	}()
+	return nil
+}
+
 // RefreshUsageAll refreshes usage for every stored account (used by the
 // background sync so the UI and menu bar always read fresh data without
 // depending on a client to trigger refreshes).
@@ -277,13 +451,15 @@ func (m *Manager) RefreshUsageAll(ctx context.Context) {
 		return
 	}
 	type job struct {
-		prov    provider.Provider
-		account store.Account
+		id  string
+		gen uint64
 	}
 	jobs := []job{}
 	for _, account := range accounts {
-		if prov, ok := m.providers[account.Provider]; ok {
-			jobs = append(jobs, job{prov: prov, account: account})
+		if _, ok := m.providers[account.Provider]; ok {
+			m.mu.Lock()
+			jobs = append(jobs, job{id: account.ID, gen: m.generation[account.ID]})
+			m.mu.Unlock()
 		}
 	}
 	// Parallel with a small pool: each account is one upstream call.
@@ -295,7 +471,7 @@ func (m *Manager) RefreshUsageAll(ctx context.Context) {
 		go func(j job) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			m.refreshAccount(ctx, j.prov, j.account)
+			m.refreshAccount(ctx, j.id, j.gen, false)
 		}(j)
 	}
 	wg.Wait()
@@ -305,42 +481,114 @@ func (m *Manager) RefreshUsageAll(ctx context.Context) {
 // account. Serialised per account: the 60s background sync, the proxy's
 // 401 path, and a manual refresh can otherwise interleave and persist a
 // stale rotating refresh token, bricking the account.
-func (m *Manager) refreshAccount(ctx context.Context, prov provider.Provider, account store.Account) {
-	perAccount := m.refreshLock(account.ID)
-	perAccount.Lock()
-	defer perAccount.Unlock()
-
-	// Re-read: another path may have refreshed the token meanwhile.
-	if fresh, err := m.store.Get(account.ID); err == nil {
-		account = fresh
+func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, force bool) provider.Usage {
+	lock := m.refreshLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	m.mu.Lock()
+	valid := m.generation[id] == gen
+	m.mu.Unlock()
+	if !valid {
+		return provider.Usage{}
 	}
-	if prov.IsExpired(account) {
-		if err := prov.Refresh(ctx, &account); err == nil {
-			if err := m.store.Save(account); err != nil {
-				log.Printf("proxy: save refreshed token for %s: %v", account.Email, err)
-			}
-		}
+	a, err := m.store.Get(id)
+	if err != nil {
+		return provider.Usage{}
 	}
-	usage, uerr := prov.Usage(ctx, account)
-	if uerr != nil {
-		// Keep the last good snapshot: a single failed poll must not
-		// blank out usage the UI was showing a minute ago. But when the
-		// snapshot's own reset time has passed, it is provably stale
-		// (the window rolled during the outage): clearing it tells the
-		// UI the truth instead of showing numbers from last week.
-		if staleSnapshot(m.lastUsage[account.ID]) {
-			m.mu.Lock()
-			delete(m.lastUsage, account.ID)
-			m.mu.Unlock()
-			log.Printf("proxy: usage sync for %s (%s) failed and the cached window already reset; clearing", account.Email, account.Provider)
-			return
-		}
-		log.Printf("proxy: usage sync for %s (%s) failed, keeping last value: %v", account.Email, account.Provider, uerr)
-		return
+	prov, ok := m.providers[a.Provider]
+	if !ok {
+		return provider.Usage{}
 	}
 	m.mu.Lock()
-	m.lastUsage[account.ID] = usage
+	h := m.healthLocked(id)
+	forceRefresh := force && h.relogin
+	h.checking++
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		if m.generation[id] == gen {
+			m.healthLocked(id).checking--
+		}
+		m.mu.Unlock()
+	}()
+	refresh := func() bool {
+		if err := prov.Refresh(ctx, &a); err != nil {
+			m.recordRefresh(id, gen, err)
+			log.Printf("proxy: usage refresh for %s failed: %v", a.Email, err)
+			return false
+		}
+		if err := m.store.Save(a); err != nil {
+			log.Printf("proxy: save refreshed token: %v", err)
+			m.recordRefresh(id, gen, err)
+			return false
+		}
+		m.recordRefresh(id, gen, nil)
+		return true
+	}
+	refreshed := prov.IsExpired(a) || forceRefresh
+	if refreshed {
+		if !refresh() {
+			return m.recordUsage(id, gen, provider.Usage{}, false)
+		}
+	}
+	usage, err := prov.Usage(ctx, a)
+	if !refreshed && usageAuthenticationFailed(err) {
+		if refresh() {
+			usage, err = prov.Usage(ctx, a)
+		} else {
+			return m.recordUsage(id, gen, provider.Usage{}, false)
+		}
+	}
+	if err != nil || !usage.Available {
+		if err != nil {
+			log.Printf("proxy: usage unavailable for %s (%s): %v", a.Email, a.Provider, err)
+		}
+		return m.recordUsage(id, gen, provider.Usage{}, false)
+	}
+	return m.recordUsage(id, gen, usage, true)
+}
+
+// Only the usage endpoint's known HTTP 401 errors indicate a stale access
+// token. In particular, a quota response body mentioning "401" is not auth.
+func usageAuthenticationFailed(err error) bool {
+	return errors.Is(err, provider.ErrUsageAuthRequired)
+}
+
+func (m *Manager) recordRefresh(id string, gen uint64, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.generation[id] != gen {
+		return
+	}
+	h := m.healthLocked(id)
+	if err == nil {
+		h.relogin = false
+	} else if errors.Is(err, provider.ErrReloginRequired) {
+		h.relogin = true
+	}
+}
+
+func (m *Manager) recordUsage(id string, gen uint64, usage provider.Usage, success bool) provider.Usage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.generation[id] != gen {
+		return provider.Usage{}
+	}
+	h := m.healthLocked(id)
+	h.lastChecked = time.Now()
+	if success {
+		h.lastSuccess = h.lastChecked
+		m.lastUsage[id] = usage
+		return usage
+	}
+	if last, ok := m.lastUsage[id]; ok {
+		if staleSnapshot(last) {
+			delete(m.lastUsage, id)
+		} else if last.Available {
+			return last
+		}
+	}
+	return provider.Usage{}
 }
 
 // staleSnapshot reports whether a usage snapshot's every reset time has
@@ -375,52 +623,12 @@ func (m *Manager) refreshLock(id string) *sync.Mutex {
 
 // RefreshUsage queries upstream usage for one account, best effort, and
 // remembers the result for the UI. The token is refreshed first when the
-// expiry says so, and once more on any usage failure: stored expiry
-// timestamps can go stale after credential rotation, so a failing Usage
-// call must never be trusted as final.
+// expiry says so, or once after the usage endpoint rejects authentication.
 func (m *Manager) RefreshUsage(ctx context.Context, a store.Account) provider.Usage {
-	prov, ok := m.providers[a.Provider]
-	if !ok {
-		return provider.Usage{}
-	}
-	// Serialise per account so a manual refresh cannot interleave with the
-	// background sync and persist a stale rotating refresh token.
-	perAccount := m.refreshLock(a.ID)
-	perAccount.Lock()
-	defer perAccount.Unlock()
-	if fresh, err := m.store.Get(a.ID); err == nil {
-		a = fresh
-	}
-	refresh := func() bool {
-		if err := prov.Refresh(ctx, &a); err != nil {
-			log.Printf("proxy: usage refresh for %s failed: %v", a.Email, err)
-			return false
-		}
-		if err := m.store.Save(a); err != nil {
-			log.Printf("proxy: save refreshed token: %v", err)
-		}
-		return true
-	}
-	if prov.IsExpired(a) && !refresh() {
-		return provider.Usage{}
-	}
-	usage, err := prov.Usage(ctx, a)
-	if err != nil && refresh() {
-		// Stored expiry timestamps can go stale after credential rotation:
-		// retry once with a fresh token before giving up.
-		usage, err = prov.Usage(ctx, a)
-	}
-	if err != nil {
-		log.Printf("proxy: usage unavailable for %s (%s): %v", a.Email, a.Provider, err)
-		if last, ok := m.LastUsage(a.ID); ok && last.Available {
-			return last
-		}
-		usage = provider.Usage{}
-	}
 	m.mu.Lock()
-	m.lastUsage[a.ID] = usage
+	gen := m.generation[a.ID]
 	m.mu.Unlock()
-	return usage
+	return m.refreshAccount(ctx, a.ID, gen, false)
 }
 
 // pick returns the account that should serve the next request for a
@@ -529,13 +737,10 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if prov.IsExpired(account) && !refreshed[account.ID] {
 			refreshed[account.ID] = true
-			if refreshErr := prov.Refresh(r.Context(), &account); refreshErr != nil {
-				log.Printf("proxy: refresh %s failed: %v", account.Email, refreshErr)
-				m.deactivate(account.ID)
+			account, err = m.refreshForProxy(r.Context(), prov, account, false)
+			if err != nil {
+				log.Printf("proxy: refresh %s failed: %v", account.Email, err)
 				continue // pick() selects another account
-			}
-			if err := m.store.Save(account); err != nil {
-				log.Printf("proxy: save refreshed token: %v", err)
 			}
 		}
 
@@ -549,13 +754,10 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case resp.StatusCode == http.StatusUnauthorized && !refreshed[account.ID]:
 			refreshed[account.ID] = true
 			drain(resp)
-			if refreshErr := prov.Refresh(r.Context(), &account); refreshErr != nil {
-				log.Printf("proxy: refresh %s after 401 failed: %v", account.Email, refreshErr)
-				m.deactivate(account.ID)
+			account, err = m.refreshForProxy(r.Context(), prov, account, true)
+			if err != nil {
+				log.Printf("proxy: refresh %s after 401 failed: %v", account.Email, err)
 				continue
-			}
-			if err := m.store.Save(account); err != nil {
-				log.Printf("proxy: save refreshed token: %v", err)
 			}
 			continue // retry the same account with fresh tokens
 
@@ -587,6 +789,37 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeError(w, http.StatusServiceUnavailable, "upstream kept failing; see Switcher logs")
+}
+
+// refreshForProxy shares the token lock with usage checks and account writes.
+// If another request already rotated the token after a 401, use that token.
+func (m *Manager) refreshForProxy(ctx context.Context, prov provider.Provider, picked store.Account, force bool) (store.Account, error) {
+	lock := m.refreshLock(picked.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	a, err := m.store.Get(picked.ID)
+	if err != nil {
+		return picked, err
+	}
+	if (force && a.Token.AccessToken != picked.Token.AccessToken) || (!force && !prov.IsExpired(a)) {
+		return a, nil
+	}
+	m.mu.Lock()
+	gen := m.generation[a.ID]
+	m.mu.Unlock()
+	if err := prov.Refresh(ctx, &a); err != nil {
+		m.recordRefresh(a.ID, gen, err)
+		m.deactivate(a.ID)
+		return a, err
+	}
+	if err := m.store.Save(a); err != nil {
+		log.Printf("proxy: save refreshed token: %v", err)
+		m.recordRefresh(a.ID, gen, err)
+		m.deactivate(a.ID)
+		return picked, fmt.Errorf("save refreshed token: %w", err)
+	}
+	m.recordRefresh(a.ID, gen, nil)
+	return a, nil
 }
 
 // forward performs one upstream request with the account's credentials.
@@ -621,6 +854,11 @@ func (m *Manager) forward(prov provider.Provider, account store.Account, path st
 func (m *Manager) nextAvailable(exclude, providerID string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.nextAvailableLocked(exclude, providerID)
+}
+
+// nextAvailableLocked requires m.mu.
+func (m *Manager) nextAvailableLocked(exclude, providerID string) string {
 	accounts, err := m.store.List()
 	if err != nil {
 		return ""
@@ -667,7 +905,7 @@ func (m *Manager) deactivate(id string) {
 	}
 	for providerID, activeID := range m.active {
 		if activeID == id {
-			if next := m.nextAvailable(id, providerID); next != "" {
+			if next := m.nextAvailableLocked(id, providerID); next != "" {
 				m.active[providerID] = next
 			} else {
 				delete(m.active, providerID)

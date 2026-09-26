@@ -20,7 +20,16 @@ jobs:
           go-version-file: go.mod
 
       - name: Test
-        run: go test ./...
+        run: |
+          go test ./...
+          node --check web/app.js
+          node web/app_state_test.mjs
+
+      - name: Check menu bar layout
+        run: |
+          swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
+            build/macos/menubar_layout_test.swift -o /tmp/switcher-layout-test
+          /tmp/switcher-layout-test
 
       - name: Build plain binaries
         run: |
@@ -52,7 +61,7 @@ jobs:
           GOOS=darwin GOARCH=arm64 \
             go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o "$APP/Contents/MacOS/SwitcherServer" .
-          swiftc -O -o "$APP/Contents/MacOS/Switcher" build/macos/menubar.swift
+          swiftc -parse-as-library -O -o "$APP/Contents/MacOS/Switcher" build/macos/menubar.swift
           # Ad-hoc signing: without it Apple Silicon reports quarantined
           # builds as "damaged".
           codesign --force --deep -s - "$APP"

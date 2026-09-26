@@ -2,16 +2,26 @@
 // per-account usage in a custom-drawn dropdown (cards, toggles, logos).
 // Single-file Swift, compiled with swiftc (no Xcode project).
 import AppKit
+import UserNotifications
 
 let hubURL = URL(string: "http://127.0.0.1:8787")!
 
-// deviceToken is read once per session: the local-token file (0600) holds
-// the secret the server issues when authentication is enabled.
-let deviceToken: String? = {
+// The server can rotate this device token while the app is running.
+func currentDeviceToken() -> String? {
     guard let raw = try? String(contentsOfFile: NSHomeDirectory() + "/.switcher/local-token", encoding: .utf8) else { return nil }
-    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.count == 64 ? trimmed : nil
-}()
+    let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return token.count == 64 ? token : nil
+}
+
+// The menu app and server share this local preference file. Consult it at
+// delivery time as well as the cached state so a web toggle takes effect
+// without waiting for the menu app's next state poll.
+func resetAlertsEnabledOnDisk() -> Bool {
+    let path = NSHomeDirectory() + "/.switcher/settings.json"
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+    return object["reset_notifications"] as? Bool == true
+}
 let launchAgentLabel = "sh.switcher.app"
 let launchAgentPath = NSHomeDirectory() + "/Library/LaunchAgents/" + launchAgentLabel + ".plist"
 let menuWidth: CGFloat = 340
@@ -50,6 +60,33 @@ struct AppState: Codable {
     let hidden: [String]?
     let version: String?
     let update: UpdateInfo?
+    let menu_usage_bars: Bool?
+    let reset_notifications: Bool?
+}
+
+private let resetPrefix = "sh.switcher.reset."
+
+struct ResetAlert {
+    let id: String
+    let provider: String
+    let window: String
+    let date: Date
+}
+
+func desiredResetAlerts(_ state: AppState, now: Date = Date()) -> [ResetAlert] {
+    guard state.reset_notifications == true else { return [] }
+    let end = now.addingTimeInterval(30 * 86400)
+    var alerts: [ResetAlert] = []
+    for account in state.accounts where account.usage?.available == true {
+        for (index, window) in (account.usage?.windows ?? []).enumerated() {
+            guard window.used_percent > 0, let seconds = window.resets_at else { continue }
+            let date = Date(timeIntervalSince1970: seconds)
+            guard date > now && date <= end else { continue }
+            alerts.append(ResetAlert(id: resetPrefix + account.id + ".\(index).\(Int(seconds))",
+                provider: providerNames[account.provider] ?? account.provider, window: window.label, date: date))
+        }
+    }
+    return Array(alerts.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }.prefix(32))
 }
 
 let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode",
@@ -188,6 +225,22 @@ func resetRemaining(_ untilUnix: Double?) -> String? {
     return "\(d)d \(h % 24)h"
 }
 
+func exactResetTime(_ untilUnix: Double?) -> String? {
+    guard let untilUnix = untilUnix, untilUnix.isFinite,
+          untilUnix > Date().timeIntervalSince1970 else { return nil }
+    let formatter = DateFormatter()
+    formatter.dateStyle = .full
+    formatter.timeStyle = .full
+    formatter.timeZone = .current
+    let date = Date(timeIntervalSince1970: untilUnix)
+    let offset = TimeZone.current.secondsFromGMT(for: date)
+    let sign = offset >= 0 ? "+" : "-"
+    let hours = abs(offset) / 3600
+    let minutes = abs(offset) % 3600 / 60
+    return "Provider-reported reset: " + formatter.string(from: date) +
+        String(format: " (UTC%@%02d:%02d)", sign, hours, minutes)
+}
+
 // textWidth measures the frame width a label needs for a string, using a
 // real NSTextField so the field's own padding is included.
 func textWidth(_ text: String, font: NSFont) -> CGFloat {
@@ -195,6 +248,67 @@ func textWidth(_ text: String, font: NSFont) -> CGFloat {
     probe.font = font
     probe.sizeToFit()
     return ceil(probe.frame.width) + 2
+}
+
+struct UsageLineLayout {
+    let label: NSRect
+    let value: NSRect
+    let reset: NSRect?
+    let resetText: String?
+    let bar: NSRect?
+}
+
+struct UsageLayout {
+    let lines: [UsageLineLayout]
+    let checkmark: NSRect
+}
+
+// Layout is shared by rendering and a geometry check. All frames use the
+// account row's coordinates so title actions and usage lines can be checked
+// for collisions before views are created.
+func usageLayout(windows: [UsageWindow], titleY: CGFloat,
+                 lineWidth: CGFloat, contentWidth: CGFloat, textX: CGFloat,
+                 cardInset: CGFloat, lineHeight: CGFloat, titleGap: CGFloat,
+                 showBars: Bool) -> UsageLayout {
+    let usageFont = NSFont.systemFont(ofSize: 11)
+    let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    let resetFont = NSFont.systemFont(ofSize: 10.5)
+    let resetTexts = windows.map { resetRemaining($0.resets_at).map { "↻ " + $0 } }
+    let resetColumn = resetTexts.compactMap { $0 }
+        .map { textWidth($0, font: resetFont) }.max() ?? 0
+    let resetSpace = resetColumn > 0 ? resetColumn + 12 : 0
+    let minValueWidth = textWidth("100% left", font: valueFont)
+    let maxLabelWidth = max(0, lineWidth - 5 - resetSpace - minValueWidth)
+    let labelColumn = min(windows.map { textWidth($0.label + ":", font: usageFont) }.max() ?? 0,
+                          maxLabelWidth)
+    // A tiny indicator fits before the percentage without increasing row
+    // height. If a provider supplies a longer window label, keep the text
+    // legible and omit the bar for that account instead of squeezing it.
+    let barWidth: CGFloat = 38
+    let barGap: CGFloat = 8
+    let valueSpace = lineWidth - labelColumn - 5 - resetSpace
+    let barsFit = showBars && valueSpace >= barWidth + barGap + minValueWidth
+    var usageY = titleY - titleGap - lineHeight
+    let lines = resetTexts.map { reset -> UsageLineLayout in
+        let valueX = textX + labelColumn + 5 + (barsFit ? barWidth + barGap : 0)
+        let line = UsageLineLayout(
+            label: NSRect(x: textX, y: usageY, width: labelColumn, height: lineHeight),
+            value: NSRect(x: valueX, y: usageY,
+                          width: valueSpace - (barsFit ? barWidth + barGap : 0),
+                          height: lineHeight),
+            reset: reset.map { _ in NSRect(x: contentWidth - cardInset - resetColumn,
+                                          y: usageY + 0.5, width: resetColumn, height: lineHeight) },
+            resetText: reset,
+            bar: barsFit ? NSRect(x: textX + labelColumn + 5, y: usageY + (lineHeight - 3) / 2,
+                                  width: barWidth, height: 3) : nil)
+        usageY -= lineHeight
+        return line
+    }
+    // Keep the active mark on the account title line, above every usage
+    // row, rather than centering it over a countdown.
+    let checkmark = NSRect(x: contentWidth - cardInset - 14, y: titleY + 0.5,
+                           width: 14, height: 14)
+    return UsageLayout(lines: lines, checkmark: checkmark)
 }
 
 // ClickableRow is one account line. Hover state is driven by the card
@@ -399,7 +513,7 @@ final class SpinnerButton: NSView {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
     var serverProcess: Process?
@@ -408,8 +522,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var hoverCards: [HoverCard] = []
     var hoverTimer: Timer?
     var menuOpen = false
+    private var stateRequest = 0
+    private var resetAlerts: [ResetAlert] = []
+    private var deliveredResetIDs = Set<String>()
+    private var sendingResetIDs = Set<String>()
+    private var permissionRequested = false
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
         ensureServerRunning()
         statusItem.button?.title = "⇄"
         statusItem.button?.toolTip = "Switcher"
@@ -421,6 +546,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Keep the cache warm so the menu opens instantly with recent data.
         let warm = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.fetchStateAsync() }
         RunLoop.main.add(warm, forMode: .common)
+        let alerts = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.deliverDueResetAlerts() }
+        RunLoop.main.add(alerts, forMode: .common)
     }
 
     // Opening draws from the cache immediately (no network on the main
@@ -451,19 +578,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // fetchStateAsync refreshes the cache off the main thread. The menu is
     // rebuilt only when the JSON differs from what is currently shown.
     func fetchStateAsync() {
+        stateRequest += 1
+        let serial = stateRequest
         var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
         request.timeoutInterval = 5
-        if let token = deviceToken { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+        let token = currentDeviceToken()
+        if let token = token { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            if (response as? HTTPURLResponse)?.statusCode == 401 && currentDeviceToken() != token {
+                DispatchQueue.main.async { self?.fetchStateAsync() }
+                return
+            }
             guard let self = self, let data = data,
+                  (response as? HTTPURLResponse)?.statusCode == 200,
                   let decoded = try? JSONDecoder().decode(AppState.self, from: data) else { return }
             DispatchQueue.main.async {
+                guard serial >= self.stateRequest else { return }
                 let changed = self.cachedRaw != data
                 self.cachedState = decoded
                 self.cachedRaw = data
                 if changed { self.rebuildMenu() }
+                self.updateResetAlerts()
             }
         }.resume()
+    }
+
+    // Keep only upcoming windows in memory. Nothing remains queued in macOS
+    // after the app closes or the web preference is turned off.
+    func updateResetAlerts() {
+        guard let state = cachedState else { return }
+        if state.reset_notifications != true {
+            resetAlerts = []
+            deliveredResetIDs.removeAll()
+            return
+        }
+        let now = Date()
+        let upcoming = desiredResetAlerts(state, now: now)
+        // Preserve a just-due window until the delivery timer gets to it,
+        // unless its account or window vanished from the newest snapshot.
+        let currentIDs = Set(state.accounts.flatMap { account in
+            (account.usage?.windows ?? []).enumerated().compactMap { index, window -> String? in
+                guard account.usage?.available == true, window.used_percent > 0,
+                      let seconds = window.resets_at else { return nil }
+                return resetPrefix + account.id + ".\(index).\(Int(seconds))"
+            }
+        })
+        let due = resetAlerts.filter { $0.date <= now && now.timeIntervalSince($0.date) < 75 && currentIDs.contains($0.id) }
+        resetAlerts = due + upcoming
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { [weak self] settings in
+            guard settings.authorizationStatus == .notDetermined else { return }
+            DispatchQueue.main.async {
+                guard let self = self, self.cachedState?.reset_notifications == true,
+                      !self.permissionRequested else { return }
+                self.permissionRequested = true
+                center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            }
+        }
+    }
+
+    func deliverDueResetAlerts() {
+        guard cachedState?.reset_notifications == true, resetAlertsEnabledOnDisk() else { resetAlerts = []; return }
+        let now = Date()
+        let due = resetAlerts.filter { $0.date <= now && now.timeIntervalSince($0.date) < 75 && !deliveredResetIDs.contains($0.id) && !sendingResetIDs.contains($0.id) }
+        guard !due.isEmpty else { return }
+        // Read the server's current preference immediately before delivery.
+        // If it is unavailable, skip the alert rather than risk showing one
+        // after the user turned the setting off in the web app.
+        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
+        request.timeoutInterval = 5
+        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            guard let data = data, (response as? HTTPURLResponse)?.statusCode == 200,
+                  let state = try? JSONDecoder().decode(AppState.self, from: data) else { return }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.cachedState = state
+                self.updateResetAlerts()
+                guard state.reset_notifications == true, resetAlertsEnabledOnDisk() else { return }
+                let valid = Set(self.resetAlerts.map(\.id))
+                let ready = due.filter { valid.contains($0.id) && !self.deliveredResetIDs.contains($0.id) && !self.sendingResetIDs.contains($0.id) }
+                guard !ready.isEmpty else { return }
+                for alert in ready { self.sendingResetIDs.insert(alert.id) }
+                self.presentResetAlerts(ready)
+            }
+        }.resume()
+    }
+
+    private func presentResetAlerts(_ due: [ResetAlert]) {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
+                      self.cachedState?.reset_notifications == true, resetAlertsEnabledOnDisk() else {
+                    for alert in due { self.sendingResetIDs.remove(alert.id) }
+                    return
+                }
+                for alert in due {
+                    let content = UNMutableNotificationContent()
+                    content.title = "\(alert.provider) usage window"
+                    content.body = "Provider-reported reset time reached for \(alert.window)."
+                    content.sound = .default
+                    guard resetAlertsEnabledOnDisk() else { self.sendingResetIDs.remove(alert.id); continue }
+                    UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: alert.id,
+                        content: content, trigger: nil)) { [weak self] error in
+                        DispatchQueue.main.async {
+                            self?.sendingResetIDs.remove(alert.id)
+                            if error == nil { self?.deliveredResetIDs.insert(alert.id) }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // serverReachable is the one synchronous probe, used once at launch to
@@ -471,7 +697,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func serverReachable(timeout: Double) -> Bool {
         var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
         request.timeoutInterval = timeout
-        if let token = deviceToken { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
         let semaphore = DispatchSemaphore(value: 0)
         var ok = false
         URLSession.shared.dataTask(with: request) { _, response, _ in
@@ -512,7 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func post(path: String, completion: (() -> Void)? = nil) {
         var request = URLRequest(url: hubURL.appendingPathComponent(path))
         request.httpMethod = "POST"
-        if let token = deviceToken { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
         URLSession.shared.dataTask(with: request) { _, _, _ in completion?() }.resume()
     }
 
@@ -569,7 +795,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 let accounts = (state?.accounts ?? []).filter { $0.provider == providerID }
                 menu.addItem(menuItemWithView(sectionHead(providerID, contentWidth: contentWidth)))
-                menu.addItem(menuItemWithView(centered(providerCard(providerID: providerID, accounts: accounts, contentWidth: contentWidth))))
+                let card = providerCard(providerID: providerID, accounts: accounts,
+                    contentWidth: contentWidth, showUsageBars: state?.menu_usage_bars ?? true)
+                menu.addItem(menuItemWithView(centered(card)))
             }
         }
 
@@ -630,7 +858,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let usageLineHeight: CGFloat = 15
     let rowBottomPad: CGFloat = 8
 
-    func providerCard(providerID: String, accounts: [Account], contentWidth: CGFloat) -> NSView {
+    func providerCard(providerID: String, accounts: [Account], contentWidth: CGFloat,
+                      showUsageBars: Bool) -> NSView {
         let height = accounts.reduce(CGFloat(0)) { $0 + rowHeight(for: $1) }
         let card = cardView(width: contentWidth, height: height)
         if let hover = card as? HoverCard { hoverCards.append(hover) }
@@ -674,38 +903,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 row.addSubview(plan)
             }
 
-            // Usage lines in two columns so the percentages line up even
-            // when labels differ in length (Weekly vs Session).
+            // Stable label and percentage columns, with resets trailing.
             let usageFont = NSFont.systemFont(ofSize: 11)
             let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
             let resetFont = NSFont.systemFont(ofSize: 10.5)
             let windows = account.usage?.windows ?? []
-            let labelColumn = windows.map { textWidth($0.label + ":", font: usageFont) }.max() ?? 0
-            // The reset suffix column is right-aligned against the row's
-            // right edge; reserve its width so values never collide with it.
-            let resetColumn = windows.reduce(0) { partial, window in
-                max(partial, textWidth(resetRemaining(window.resets_at) ?? "", font: resetFont))
-            }
-            var usageY = titleY - titleUsageGap - usageLineHeight
-            for window in windows {
+            let layout = usageLayout(windows: windows, titleY: titleY,
+                lineWidth: contentWidth - textX - cardInset, contentWidth: contentWidth, textX: textX,
+                cardInset: cardInset, lineHeight: usageLineHeight, titleGap: titleUsageGap,
+                showBars: showUsageBars)
+            for (window, line) in zip(windows, layout.lines) {
                 let left = max(0, min(100, 100 - window.used_percent))
+                if let barFrame = line.bar {
+                    let track = NSView(frame: barFrame)
+                    track.wantsLayer = true
+                    track.layer?.backgroundColor = dimColor.withAlphaComponent(0.24).cgColor
+                    track.layer?.cornerRadius = 1.5
+                    track.layer?.masksToBounds = true
+                    if left > 0 {
+                        let fill = NSView(frame: NSRect(x: 0, y: 0,
+                            width: barFrame.width * CGFloat(left) / 100, height: barFrame.height))
+                        fill.wantsLayer = true
+                        fill.layer?.backgroundColor = accentColor.cgColor
+                        fill.layer?.cornerRadius = 1.5
+                        track.addSubview(fill)
+                    }
+                    row.addSubview(track)
+                }
                 let name = label(window.label + ":", font: usageFont, color: dimColor)
-                name.frame = NSRect(x: textX, y: usageY, width: labelColumn, height: usageLineHeight)
+                name.frame = line.label
                 row.addSubview(name)
                 let value = label("\(left)% left", font: valueFont, color: dimColor)
-                value.frame = NSRect(x: textX + labelColumn + 5, y: usageY, width: titleWidth - labelColumn - 5 - (resetColumn > 0 ? resetColumn + 12 : 0), height: usageLineHeight)
+                value.frame = line.value
                 row.addSubview(value)
-                if let reset = resetRemaining(window.resets_at) {
-                    let resetLabel = label("↻ " + reset, font: resetFont, color: dimColor)
+                if let reset = line.resetText, let frame = line.reset {
+                    let resetLabel = label(reset, font: resetFont, color: dimColor)
+                    resetLabel.toolTip = exactResetTime(window.resets_at)
                     resetLabel.alignment = .right
-                    resetLabel.frame = NSRect(x: contentWidth - cardInset - resetColumn, y: usageY + 0.5, width: resetColumn, height: usageLineHeight)
+                    resetLabel.frame = frame
                     row.addSubview(resetLabel)
                 }
-                usageY -= usageLineHeight
             }
 
             if account.active {
-                let check = NSImageView(frame: NSRect(x: contentWidth - cardInset - 14, y: rowH / 2 - 6, width: 14, height: 14))
+                let check = NSImageView(frame: layout.checkmark)
                 check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
                 check.contentTintColor = accentColor
                 row.addSubview(check)
@@ -803,8 +1044,15 @@ func centered(_ card: NSView, verticalPadding: CGFloat = 0) -> NSView {
     return container
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory) // menu bar app: no Dock icon
-app.run()
+#if !SWITCHER_LAYOUT_TEST
+@main
+struct SwitcherApp {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory) // menu bar app: no Dock icon
+        app.run()
+    }
+}
+#endif
