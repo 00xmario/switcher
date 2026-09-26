@@ -51,7 +51,7 @@ func TestRefreshCredentialRejected(t *testing.T) {
 func TestUsageStatusError(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError} {
 		err := UsageStatusError(status)
-		if !errors.Is(err, ErrUsageUnavailable) || errors.Is(err, ErrUsageAuthRequired) != (status == http.StatusUnauthorized) || errors.Is(err, ErrReloginRequired) {
+		if !errors.Is(err, ErrUsageUnavailable) || errors.Is(err, ErrUsageAuthRequired) != (status == http.StatusUnauthorized) || errors.Is(err, ErrUsageRateLimited) != (status == http.StatusTooManyRequests) || errors.Is(err, ErrReloginRequired) {
 			t.Fatalf("http %d: unexpected error classification: %v", status, err)
 		}
 	}

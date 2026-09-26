@@ -159,6 +159,12 @@ func (p *Provider) UpstreamURL(path string) string {
 // ApplyAuth sets the headers Codex's backend expects for OAuth requests.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", codexUserAgent)
+	}
+	if req.Header.Get("originator") == "" {
+		req.Header.Set("originator", "codex_cli_rs")
+	}
 	if a.Token.AccountID != "" {
 		req.Header.Set("ChatGPT-Account-Id", a.Token.AccountID)
 	}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"switcher/internal/provider"
@@ -87,11 +88,20 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 
 // UpstreamURL maps a Switcher path to the Zen Go endpoint.
 func (p *Provider) UpstreamURL(path string) string {
+	// Both /opencode/responses and /opencode/v1/responses name the same
+	// upstream endpoint. The Go base already contains /v1.
+	if path == "/v1" {
+		return upstreamBase
+	}
+	if strings.HasPrefix(path, "/v1/") {
+		path = strings.TrimPrefix(path, "/v1")
+	}
 	return upstreamBase + path
 }
 
 // ApplyAuth sets the Bearer authentication the Zen API expects.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
+	req.Header.Del("X-Api-Key")
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
 	return nil
 }

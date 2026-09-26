@@ -90,14 +90,15 @@ async function api(path, options = {}) {
   return body;
 }
 
-// authLocked swaps the page to the login view and stops the background
-// polling until the user signs in.
+// Once a session expires, leave the app document entirely. A removable DOM
+// overlay must never be the boundary protecting account information.
 function authLocked() {
   if (authState.locked) return;
   authState.locked = true;
   clearInterval(stateTimer);
   usageTimer && clearTimeout(usageTimer);
-  showLoginView();
+  localStorage.removeItem('switcher-csrf');
+  location.replace('/login');
 }
 
 // fetchWithCSRF attaches the CSRF token to state-changing requests when a
@@ -135,15 +136,18 @@ function fmtRemaining(untilUnix) {
   return `${d}d ${h % 24}h`;
 }
 
-function resetTime(untilUnix) {
+function resetTime(untilUnix, description = 'Provider-reported reset') {
   if (!Number.isFinite(untilUnix) || untilUnix <= Date.now() / 1000) return null;
   const date = new Date(untilUnix * 1000);
   if (!Number.isFinite(date.getTime())) return null;
   return {
     iso: date.toISOString(),
-    title: `Provider-reported reset: ${new Intl.DateTimeFormat(undefined, {
+    title: `${description}: ${new Intl.DateTimeFormat(undefined, {
       dateStyle: 'full', timeStyle: 'full',
     }).format(date)}`,
+    short: new Intl.DateTimeFormat(undefined, {
+      month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).format(date),
   };
 }
 
@@ -189,6 +193,7 @@ let stateEpoch = 0;
 let stateRequestId = 0;
 let lastAppliedStateRequestId = 0;
 const pendingRechecks = new Map(); // account id -> { accepted: bool }
+let activeAccountMenu = null;
 const accountStatusAnnouncer = document.createElement('div');
 accountStatusAnnouncer.className = 'sr-only';
 accountStatusAnnouncer.setAttribute('aria-live', 'polite');
@@ -298,24 +303,90 @@ function accountHTML(account) {
           <div class="meta">
             <span class="dot ${status.cls}"></span>${status.label}
             ${plan ? ` · ${escapeHTML(plan)}` : ''}
+            ${account.reset_credits?.count > 0 ? `<span class="banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
           </div>
           <div class="account-health ${escapeHTML(health.condition)}"><span class="health-mark" aria-hidden="true"></span>${escapeHTML(healthText(health))}</div>
         </div>
         <div class="actions">
-          ${account.reset_credits ? `<span class="reset-badge banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
           <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-label="Recheck account usage" title="Recheck usage" aria-disabled="${recheckPending}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
           </button>
           <button class="use" data-act="activate" ${isActive ? 'disabled' : ''}>
             ${isActive ? 'Active' : 'Use this account'}
           </button>
-          ${account.reset_credits ? `<button data-act="use-reset" title="Spend one banked reset: clears this account's out-of-usage state">Use reset</button>` : ''}
-          ${ADD_METHOD[account.provider] === 'key' ? '' : `<button data-act="relogin" data-provider="${escapeHTML(account.provider)}" title="Sign in again to refresh this account's tokens in place">Relogin</button>`}
-          <button data-act="delete" title="Remove account">Remove</button>
+          <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
         </div>
       </div>
       ${windows}
     </div>`;
+}
+
+function compactWindowHTML(win) {
+  const left = Math.max(0, Math.min(100, 100 - win.used_percent));
+  const remaining = fmtRemaining(win.resets_at);
+  const exact = remaining ? resetTime(win.resets_at) : null;
+  return `
+    <div class="compact-window">
+      <div class="compact-window-head">
+        <span class="compact-window-name">${escapeHTML(win.label)}</span>
+        <strong>${left}% <span>left</span></strong>
+        ${exact ? `<time datetime="${exact.iso}" title="${escapeHTML(exact.title)}">${escapeHTML(exact.short)}</time><span class="compact-reset-relative">· in ${remaining}</span>` : ''}
+      </div>
+      <div class="compact-track" role="progressbar" aria-label="${escapeHTML(win.label)} quota remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${left}">
+        <span class="compact-fill ${left <= 20 ? 'low' : ''}" style="width:${left}%"></span>
+      </div>
+    </div>`;
+}
+
+function compactCreditsHTML(credits) {
+  const expiries = credits?.expires_at || (credits?.next_expires_at ? [credits.next_expires_at] : []);
+  const rows = expiries.map((timestamp, index) => {
+    const exact = resetTime(timestamp, 'Banked reset expires');
+    if (!exact) return '';
+    return `<div class="compact-credit"><span>Reset ${index + 1}</span><time datetime="${exact.iso}" title="${escapeHTML(exact.title)}">${escapeHTML(exact.short)}</time><span>· in ${fmtRemaining(timestamp)}</span></div>`;
+  }).filter(Boolean);
+  if (!rows.length) return '';
+  return `<div class="compact-credits"><h4>Banked reset expiry</h4>${rows.join('')}</div>`;
+}
+
+function compactAccountHTML(account) {
+  const isActive = account.id === data.active?.[account.provider];
+  const status = statusOf(account);
+  const recheckPending = pendingRechecks.has(account.id);
+  const health = recheckPending ? { condition: 'checking' } : (account.health || { condition: 'checking' });
+  const plan = PLAN_NAMES[account.plan] || account.plan || 'Unknown';
+  const windows = account.usage?.windows?.length
+    ? account.usage.windows.map(compactWindowHTML).join('')
+    : `<p class="compact-unknown">${health.condition === 'checking' ? 'Checking usage…' : health.condition === 'needs_relogin' ? 'Relogin needed to check usage.' : 'Usage unavailable right now.'}</p>`;
+  return `
+    <div class="account compact-card ${isActive ? 'active' : ''}" data-id="${escapeHTML(account.id)}">
+      <div class="compact-card-head">
+        <span class="compact-provider-logo" aria-hidden="true">${LOGOS[account.provider] || ''}</span>
+        <div class="who compact-identity">
+          <div class="email" tabindex="0">${escapeHTML(account.email)}</div>
+          <div class="meta"><span class="dot ${status.cls}"></span>${status.label}</div>
+        </div>
+        <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
+      </div>
+      <div class="compact-plan"><span>Plan</span><strong>${escapeHTML(plan)}</strong>
+        ${account.reset_credits?.count > 0 ? `<span class="banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
+      </div>
+      <div class="account-health ${escapeHTML(health.condition)}"><span class="health-mark" aria-hidden="true"></span>${escapeHTML(healthText(health))}</div>
+      <div class="compact-windows">${windows}${compactCreditsHTML(account.reset_credits)}</div>
+      <div class="compact-actions">
+        <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-disabled="${recheckPending}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>Refresh quota
+        </button>
+        <button class="use" data-act="activate" ${isActive ? 'disabled' : ''}>${isActive ? 'Active' : 'Use this account'}</button>
+      </div>
+    </div>`;
+}
+
+function accountMenuHTML(account) {
+  return `
+    ${account.reset_credits?.count > 0 ? `<button type="button" role="menuitem" data-act="use-reset" data-account-id="${escapeHTML(account.id)}">Use reset</button>` : ''}
+    ${ADD_METHOD[account.provider] === 'key' ? '' : `<button type="button" role="menuitem" data-act="relogin" data-provider="${escapeHTML(account.provider)}" data-account-id="${escapeHTML(account.id)}">Relogin</button>`}
+    <button type="button" role="menuitem" data-act="delete" data-account-id="${escapeHTML(account.id)}">Remove</button>`;
 }
 
 // Update banner: shown above the provider sections when a release is
@@ -334,8 +405,14 @@ function updateBannerHTML() {
 }
 
 function render() {
+  const compact = data.compact_accounts === true;
+  document.body.classList.toggle('compact-account-view', compact);
   const focusedRecheck = document.activeElement?.matches?.('button[data-act="recheck"]')
     ? document.activeElement.closest('.account')?.dataset.id : null;
+  const focusedMenu = document.activeElement?.matches?.('button[data-account-menu]')
+    ? document.activeElement.closest('.account')?.dataset.id
+    : activeAccountMenu?.anchor.closest('.account')?.dataset.id;
+  closeAccountMenu();
   const byProvider = new Map();
   for (const a of data.accounts) {
     if (!byProvider.has(a.provider)) byProvider.set(a.provider, []);
@@ -350,7 +427,7 @@ function render() {
   order.forEach((providerID) => {
     const accounts = byProvider.get(providerID) || [];
     html += `
-      <section class="provider" data-provider="${providerID}" id="provider-${providerID}">
+      <section class="provider ${compact ? 'compact-provider' : ''}" data-provider="${providerID}" id="provider-${providerID}">
         <div class="provider-head" draggable="true">
           <span class="drag-grip" title="Drag to reorder">
             <svg viewBox="0 0 12 18" aria-hidden="true"><circle cx="4" cy="3" r="1.5"/><circle cx="10" cy="3" r="1.5"/><circle cx="4" cy="9" r="1.5"/><circle cx="10" cy="9" r="1.5"/><circle cx="4" cy="15" r="1.5"/><circle cx="10" cy="15" r="1.5"/></svg>
@@ -363,8 +440,8 @@ function render() {
             <button data-menu="${providerID}" title="Provider options">⋯</button>
           </span>
         </div>
-        <div class="account-list">
-          ${accounts.length ? accounts.map(accountHTML).join('') : `<div class="unknown">No accounts yet.</div>`}
+        <div class="account-list ${compact && accounts.length ? 'compact-grid' : ''}">
+          ${accounts.length ? accounts.map(compact ? compactAccountHTML : accountHTML).join('') : `<div class="unknown">No accounts yet.</div>`}
         </div>
       </section>`;
   });
@@ -372,6 +449,10 @@ function render() {
   if (focusedRecheck) {
     const card = [...providersEl.querySelectorAll('.account')].find(el => el.dataset.id === focusedRecheck);
     card?.querySelector('.recheck-btn')?.focus({ preventScroll: true });
+  }
+  if (focusedMenu) {
+    const card = [...providersEl.querySelectorAll('.account')].find(el => el.dataset.id === focusedMenu);
+    card?.querySelector('[data-account-menu]')?.focus({ preventScroll: true });
   }
 }
 
@@ -431,6 +512,65 @@ function openProviderMenu(anchor, providerID) {
   });
 }
 
+function closeAccountMenu(restoreFocus = false) {
+  if (!activeAccountMenu) return;
+  const { menu, anchor, listeners } = activeAccountMenu;
+  activeAccountMenu = null;
+  listeners.abort();
+  menu.remove();
+  anchor.setAttribute('aria-expanded', 'false');
+  if (restoreFocus && anchor.isConnected) anchor.focus({ preventScroll: true });
+}
+
+function openAccountMenu(anchor, account) {
+  closeAccountMenu();
+  document.querySelector('.prov-menu')?.remove();
+  const menu = document.createElement('div');
+  menu.className = 'account-menu';
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-label', `Actions for ${account.email}`);
+  menu.innerHTML = accountMenuHTML(account);
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  const width = menu.offsetWidth;
+  const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+  const below = rect.bottom + 6;
+  const top = below + menu.offsetHeight <= window.innerHeight - 8
+    ? below : Math.max(8, rect.top - menu.offsetHeight - 6);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+  anchor.setAttribute('aria-expanded', 'true');
+  const listeners = new AbortController();
+  activeAccountMenu = { menu, anchor, listeners };
+  menu.querySelector('button')?.focus({ preventScroll: true });
+  menu.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-act]');
+    if (!button) return;
+    closeAccountMenu(true);
+    runAccountAction(button);
+  }, { signal: listeners.signal });
+  document.addEventListener('pointerdown', (event) => {
+    if (!menu.contains(event.target) && !anchor.contains(event.target)) closeAccountMenu();
+  }, { signal: listeners.signal });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeAccountMenu(true);
+    } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      const items = [...menu.querySelectorAll('button')];
+      const current = items.indexOf(document.activeElement);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+        : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items[next]?.focus({ preventScroll: true });
+    } else if (event.key === 'Tab') {
+      setTimeout(() => { if (activeAccountMenu?.menu === menu) closeAccountMenu(); }, 0);
+    }
+  }, { signal: listeners.signal });
+  window.addEventListener('resize', () => closeAccountMenu(), { signal: listeners.signal });
+  window.addEventListener('scroll', () => closeAccountMenu(), { signal: listeners.signal, capture: true });
+}
+
 // "Add provider" button in the header: lists removed providers.
 function renderAddProviderMenu() {
   const host = document.getElementById('add-provider-slot');
@@ -470,9 +610,25 @@ providersEl.addEventListener('click', async (event) => {
     openProviderMenu(menuBtn, menuBtn.dataset.menu);
     return;
   }
+  const accountMenuBtn = event.target.closest('button[data-account-menu]');
+  if (accountMenuBtn) {
+    if (activeAccountMenu?.anchor === accountMenuBtn) {
+      closeAccountMenu(true);
+    } else {
+      const account = data.accounts.find(a => a.id === accountMenuBtn.closest('.account')?.dataset.id);
+      if (account) openAccountMenu(accountMenuBtn, account);
+    }
+    return;
+  }
   const button = event.target.closest('button[data-act]');
   if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return;
-  const id = button.closest('.account').dataset.id;
+  runAccountAction(button);
+});
+
+async function runAccountAction(button) {
+  if (button.disabled || button.getAttribute('aria-disabled') === 'true') return;
+  const id = button.dataset.accountId || button.closest('.account')?.dataset.id;
+  if (!id) return;
   try {
     if (button.dataset.act === 'activate') {
       await api(`/api/accounts/${id}/activate`, { method: 'POST' });
@@ -509,7 +665,7 @@ providersEl.addEventListener('click', async (event) => {
       toast(outcomes[res.outcome] || 'Done');
       await refreshState();
     } else if (button.dataset.act === 'delete') {
-      const mail = button.closest('.account').querySelector('.email').textContent;
+      const mail = data.accounts.find(a => a.id === id)?.email || 'This account';
       const yes = await confirmDialog({
         title: 'Remove account?',
         message: `${mail} will be removed. You can always add it back.`,
@@ -528,7 +684,7 @@ providersEl.addEventListener('click', async (event) => {
     }
     toast(err.message);
   }
-});
+}
 
 /* ---------- drag-and-drop provider ordering ---------- */
 
@@ -893,6 +1049,9 @@ async function runUpdateFlow(button) {
 refreshState().then(refreshAllUsage);
 scheduleUsage();
 let stateTimer = setInterval(refreshState, 4000);
+window.addEventListener('pageshow', (event) => {
+  if (event.persisted) location.reload();
+});
 
 
 /* ================= Usage page (cost + tokens) ================= */
@@ -1329,69 +1488,6 @@ if (themeParam === 'dark' || themeParam === 'light' || themeParam === 'system') 
   applyTheme(themeParam);
 }
 
-/* ================= Optional authentication ================= */
-
-// showLoginView replaces the page with the sign-in card. Same design
-// tokens as the rest of the app; no refresh needed afterwards.
-function showLoginView(message) {
-  const overlay = document.createElement('div');
-  overlay.className = 'login-overlay';
-  overlay.innerHTML = `
-    <div class="login-card">
-      <span class="brand-mark"><svg viewBox="0 0 48 48" aria-hidden="true">
-        <rect width="48" height="48" rx="11" fill="currentColor"/>
-        <g stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" fill="none">
-          <path d="M13.5 19.5h21"/><path d="M29.5 14.5l5 5-5 5"/>
-          <path d="M34.5 28.5h-21"/><path d="M18.5 23.5l-5 5 5 5"/>
-        </g>
-      </svg></span>
-      <h1>Switcher is locked</h1>
-      <p class="login-sub">${escapeHTML(message || 'Enter your password to continue.')}</p>
-      <form id="login-form">
-        <input type="password" id="login-password" autocomplete="current-password" placeholder="Password" required>
-        <button type="submit" id="login-submit">Unlock</button>
-      </form>
-      <p class="login-error" id="login-error"></p>
-    </div>`;
-  document.body.appendChild(overlay);
-  const form = overlay.querySelector('#login-form');
-  const input = overlay.querySelector('#login-password');
-  const submit = overlay.querySelector('#login-submit');
-  const error = overlay.querySelector('#login-error');
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    submit.disabled = true;
-    submit.textContent = 'Checking...';
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: input.value }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        error.textContent = body.error || 'Wrong password';
-        submit.disabled = false;
-        submit.textContent = 'Unlock';
-        return;
-      }
-      if (body.csrf) localStorage.setItem('switcher-csrf', body.csrf);
-      overlay.remove();
-      authState.locked = false;
-      await refreshState();
-      refreshAllUsage();
-      clearInterval(stateTimer);
-      stateTimer = setInterval(refreshState, 4000);
-      scheduleUsage();
-    } catch (err) {
-      error.textContent = err.message;
-      submit.disabled = false;
-      submit.textContent = 'Unlock';
-    }
-  });
-  input.focus();
-}
-
 /* ================= Settings page ================= */
 
 const settingsPage = document.createElement('section');
@@ -1409,6 +1505,7 @@ document.querySelector('.page-tabs').appendChild(settingsTab);
 setPage = function (page) {
   document.querySelectorAll('.page-tab').forEach(b => b.classList.toggle('active', b.id === `tab-${page}`));
   document.getElementById('providers').hidden = page !== 'accounts';
+  document.body.classList.toggle('compact-account-view', data.compact_accounts === true);
   document.querySelector('footer.footnote').hidden = page !== 'accounts';
   usagePage.hidden = page !== 'usage';
   settingsPage.hidden = page !== 'settings';
@@ -1424,6 +1521,93 @@ function lanStateText(status) {
   return ip;
 }
 
+function cliSetupRowHTML(client) {
+  const codex = client.id === 'codex' && client.capability === 'configure_user_file';
+  const condition = client.configuration?.condition;
+  const descriptions = {
+    ready: 'Configured in inspected user file',
+    missing: 'No Switcher selection in inspected Codex config',
+    unreadable: 'Inspected config unreadable',
+    invalid: 'Inspected config invalid',
+    not_selected: 'Switcher entry not selected in file',
+    other_provider: 'Another provider selected in file',
+    misconfigured: 'Switcher entry differs from this server',
+  };
+  const summary = codex ? (descriptions[condition] || 'Config status unknown')
+    : client.stage === 'protocol_validation_pending' ? 'Setup under validation' : 'Setup research';
+  const readinessLabels = {
+    oauth_coexistence_unverified: 'Native OAuth coexistence unverified',
+    v2_account_model_transport_unverified: 'OpenCode v2 account, model, and transport unverified',
+    entitlement_and_relay_unverified: 'Grok entitlement and WebSocket relay unverified',
+    byok_is_different_billing: 'Copilot CLI BYOK is a separate billing path',
+    subscription_route_unverified: 'Gemini CLI subscription route unverified',
+    agy_protocol_unverified: 'Antigravity CLI protocol unverified',
+  };
+  const readiness = !codex && Object.hasOwn(readinessLabels, client.reason_code)
+    ? `${readinessLabels[client.reason_code]}. ${client.next_step || ''}`
+    : 'Native setup is not verified. Keep this CLI’s settings unchanged.';
+  const count = client.accounts?.evidence === 'known' && Number.isInteger(client.accounts.count)
+    ? `${client.accounts.count} Switcher account${client.accounts.count === 1 ? '' : 's'} stored`
+    : 'Switcher account count unavailable';
+  let detail = 'Native CLI configuration has not been checked.';
+  const verification = client.verification || { condition: 'not_tested' };
+  let routeTest = 'Switcher route not tested; native CLI request not tested.';
+  if (['last_success', 'historical'].includes(verification.condition) && Number.isFinite(verification.last_success)) {
+    const when = new Date(verification.last_success * 1000);
+    if (Number.isFinite(when.getTime())) {
+      routeTest = `${verification.condition === 'historical' ? 'Historical' : 'Last successful'} Switcher route test: ${when.toLocaleString()} · ${verification.model || 'Codex model'}. Native CLI request not tested.`;
+    }
+  } else if (verification.condition === 'unavailable') {
+    routeTest = 'Saved route-test result unavailable; native CLI request not tested.';
+  }
+  const actions = [];
+  if (codex) {
+    if (condition === 'ready') {
+      detail = `The inspected user file points to ${client.configuration.expected_url}. Native login and request routing have not been tested.`;
+    } else if (condition === 'invalid' || condition === 'unreadable') {
+      detail = 'Fix the inspected config manually, then check again.';
+    } else if (condition === 'missing') {
+      detail = 'Configure Codex user settings for this Switcher listener.';
+    } else if (['not_selected', 'other_provider', 'misconfigured'].includes(condition)) {
+      detail = 'The inspected user file does not currently select this Switcher listener.';
+    } else if (condition === 'pending') {
+      detail = 'An interrupted config change needs recovery. This status check did not modify the file.';
+    } else if (condition === 'conflict') {
+      detail = 'This config cannot be changed safely. Inspect it manually before retrying.';
+    }
+    if (client.configuration.ownership === 'legacy_candidate') {
+      detail += ' This older Switcher entry has no recorded previous selection.';
+    }
+    const actionLabels = {
+      configure: 'Configure Codex', update: 'Update Codex config',
+      reselect: 'Select Switcher again',
+    };
+    const installAction = client.configuration.install_action;
+    if (actionLabels[installAction]) {
+      actions.push(`<button type="button" data-cli-action="${installAction}">${actionLabels[installAction]}</button>`);
+    }
+    if (condition === 'pending') {
+      const resumeAction = client.configuration.pending_operation === 'restore' ? 'restore'
+        : client.configuration.pending_operation === 'reselect' ? 'reselect' : 'install';
+      actions.push(`<button type="button" data-cli-action="${resumeAction}">Resume Codex change</button>`);
+    } else if (client.configuration.restore_action === 'restore') {
+      actions.push('<button type="button" data-cli-action="restore">Restore previous setup</button>');
+    } else if (client.configuration.restore_action === 'remove_legacy') {
+      actions.push('<button type="button" data-cli-action="remove-legacy">Remove legacy entry</button>');
+    }
+    if (client.accounts?.evidence === 'known' && client.accounts.count > 0) {
+      actions.push('<button type="button" data-cli-action="test">Test Switcher route (uses quota)</button>');
+    }
+  }
+  return `<div class="settings-row cli-setup-row" data-cli-target="${escapeHTML(client.id)}">
+    <div><strong>${escapeHTML(client.name)}</strong><span class="dim"> · ${escapeHTML(summary)}</span>
+      <p class="cli-setup-evidence">${escapeHTML(count)} · ${escapeHTML(detail)}</p>
+      ${!codex ? `<p class="cli-setup-reason">${escapeHTML(readiness)}</p>` : ''}
+      ${codex ? `<p class="cli-setup-evidence">${escapeHTML(routeTest)}</p>` : ''}</div>
+    ${actions.length ? `<div class="cli-setup-actions">${actions.join('')}</div>` : ''}
+  </div>`;
+}
+
 async function renderSettings() {
   let status;
   try {
@@ -1435,11 +1619,19 @@ async function renderSettings() {
     <div class="settings-grid">
       <div class="settings-card">
         <h2>CLI setup</h2>
-        <p class="settings-sub">Check whether Codex sends requests through this Switcher server.</p>
-        <div class="settings-row"><div><strong>Codex</strong><span class="dim" id="codex-setup-status"> · Checking…</span></div>
-          <button id="codex-setup-install" type="button">Connect Codex</button></div>
-        <p class="settings-sub" id="codex-setup-detail"></p>
+        <p class="settings-sub">A Switcher account is separate from a CLI's login and configuration. Automatic status checks only read local files; the optional Codex route test uses quota and does not run the native CLI.</p>
+        <div id="cli-setup-list"><p class="settings-sub">Checking local configuration…</p></div>
+        <div class="sr-only" id="cli-setup-announcer" role="status"></div>
+        <p class="settings-sub">CLI installation and native requests are not checked here. Other clients get a setup action only after their routing is validated.</p>
         <button id="codex-setup-check" type="button">Check again</button>
+      </div>
+      <div class="settings-card">
+        <h2>Display</h2>
+        <div class="settings-row">
+          <div><strong>Compact account view</strong><span class="dim"> · side-by-side cards with every quota window</span></div>
+          <label class="switch-wrap"><input type="checkbox" id="compact-accounts" aria-label="Show compact account cards" ${status.compact_accounts ? 'checked' : ''}><span class="switch-visual"></span></label>
+        </div>
+        <p class="settings-sub">Providers with several accounts show cards in two columns when space allows. Reset times and account actions stay available; single accounts fill the row.</p>
       </div>
       <div class="settings-card">
         <h2>Security</h2>
@@ -1487,38 +1679,75 @@ async function renderSettings() {
       </div>
     </div>`;
 
-  const setupStatus = settingsPage.querySelector('#codex-setup-status');
-  const setupDetail = settingsPage.querySelector('#codex-setup-detail');
-  const setupButton = settingsPage.querySelector('#codex-setup-install');
-  const setupLabels = {
-    ready: 'Connected', missing: 'No Codex config', unreadable: 'Config unreadable',
-    invalid: 'Config invalid', not_selected: 'Switcher not selected',
-    other_provider: 'Another provider selected', misconfigured: 'Switcher config needs repair',
-  };
+  const setupList = settingsPage.querySelector('#cli-setup-list');
+  const setupAnnouncer = settingsPage.querySelector('#cli-setup-announcer');
   async function checkCLISetup() {
     try {
-      const { codex } = await api('/api/cli-setup');
-      setupStatus.textContent = ` · ${setupLabels[codex.condition] || 'Unknown'}`;
-      setupDetail.textContent = codex.condition === 'ready'
-        ? `Codex is configured to use ${codex.expected_url}`
-        : `Connect Codex to ${codex.expected_url}. A backup is saved beside the config.`;
-      setupButton.hidden = codex.condition === 'ready';
+      const { clients } = await api('/api/cli-setup');
+      if (!Array.isArray(clients)) throw new Error('This Switcher server cannot inspect other CLIs yet');
+      setupList.innerHTML = clients.map(cliSetupRowHTML).join('');
+      setupAnnouncer.textContent = 'CLI setup checked';
     } catch (err) {
-      setupStatus.textContent = ' · Could not check';
-      setupDetail.textContent = err.message;
-      setupButton.hidden = true;
+      setupList.textContent = `Could not check CLI setup: ${err.message}`;
+      setupAnnouncer.textContent = 'Could not check CLI setup';
     }
   }
   settingsPage.querySelector('#codex-setup-check').addEventListener('click', checkCLISetup);
-  setupButton.addEventListener('click', async () => {
-    setupButton.disabled = true;
+  setupList.addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-cli-action]');
+    if (!button || button.disabled) return;
+    const routes = { configure: 'install', update: 'install', install: 'install',
+      reselect: 'reselect', restore: 'restore', 'remove-legacy': 'remove-legacy', test: 'test' };
+    const route = routes[button.dataset.cliAction];
+    if (!route) return;
+    if (route === 'remove-legacy') {
+      const yes = await confirmDialog({
+        title: 'Remove legacy Codex setup?',
+        message: 'Switcher cannot recover the provider selected before this older setup. Only the recognized Switcher entry will be removed.',
+        confirmLabel: 'Remove legacy entry', danger: true,
+      });
+      if (!yes) return;
+    }
+    button.disabled = true;
     try {
-      await api('/api/cli-setup/codex/install', { method: 'POST' });
-      toast('Codex configuration saved and verified');
+      const result = await api(`/api/cli-setup/codex/${route}`, { method: 'POST' });
+      if (route === 'test') {
+        const outcomes = {
+          success: 'Switcher Codex route responded; native Codex CLI not tested',
+          no_active_account: 'Select an active Codex account first',
+          quota_or_rate_limit: 'Route test inconclusive: upstream quota or rate limit',
+          upstream_unauthorized: 'Route test inconclusive: upstream rejected this token',
+          model_or_request_rejected: 'Route test inconclusive: fixed model or request rejected',
+          selection_changed: 'Route test inconclusive: active account changed',
+          timeout_or_cancelled: 'Route test timed out or was cancelled',
+        };
+        toast(outcomes[result.outcome] || 'Switcher route test inconclusive; native CLI not tested');
+      } else {
+        toast('Codex user config updated and checked; native requests are not tested');
+      }
     } catch (err) { toast(err.message); }
-    finally { setupButton.disabled = false; await checkCLISetup(); }
+    finally { button.disabled = false; await checkCLISetup(); }
   });
   checkCLISetup();
+
+  const compactAccounts = settingsPage.querySelector('#compact-accounts');
+  compactAccounts.addEventListener('change', async () => {
+    const enabled = compactAccounts.checked;
+    compactAccounts.disabled = true;
+    try {
+      await api('/api/settings', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ compact_accounts: enabled }),
+      });
+      await refreshState();
+      toast('Account view preference saved');
+    } catch (err) {
+      compactAccounts.checked = !enabled;
+      toast(err.message);
+    } finally {
+      compactAccounts.disabled = false;
+    }
+  });
 
   const usageBars = settingsPage.querySelector('#menu-usage-bars');
   usageBars?.addEventListener('change', async () => {
@@ -1581,9 +1810,8 @@ async function renderSettings() {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) { toast(body.error || 'Could not set password'); return; }
-    localStorage.setItem('switcher-csrf', body.csrf);
-    toast('Password set');
-    renderSettings();
+    localStorage.removeItem('switcher-csrf');
+    location.replace('/login');
   });
 
   settingsPage.querySelector('#disable-auth')?.addEventListener('click', async () => {
@@ -1606,12 +1834,12 @@ async function renderSettings() {
 
   settingsPage.querySelector('#logout-all')?.addEventListener('click', async () => {
     const res = await fetchWithCSRF('/api/auth/sessions', { method: 'DELETE' });
-    if (res.ok) { localStorage.removeItem('switcher-csrf'); location.reload(); }
+    if (res.ok) { localStorage.removeItem('switcher-csrf'); location.replace('/login'); }
   });
 
   settingsPage.querySelector('#logout-here')?.addEventListener('click', async () => {
     const res = await fetchWithCSRF('/api/auth/logout', { method: 'POST' });
-    if (res.ok) { localStorage.removeItem('switcher-csrf'); location.reload(); }
+    if (res.ok) { localStorage.removeItem('switcher-csrf'); location.replace('/login'); }
   });
 
   settingsPage.querySelector('#change-password-btn')?.addEventListener('click', async () => {
@@ -1626,9 +1854,8 @@ async function renderSettings() {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) { toast(body.error || 'Could not change password'); return; }
-    localStorage.setItem('switcher-csrf', body.csrf);
-    toast('Password changed');
-    await showLoginView('Password changed. Sign in again with the new password.');
+    localStorage.removeItem('switcher-csrf');
+    location.replace('/login');
   });
 }
 

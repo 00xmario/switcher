@@ -39,6 +39,9 @@ func Dir() string {
 
 // CodexConfigPath returns the user's codex CLI configuration file.
 func CodexConfigPath() string {
+	if root := os.Getenv("CODEX_HOME"); root != "" {
+		return filepath.Join(root, "config.toml")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		panic("switcher: cannot determine home directory: " + err.Error())

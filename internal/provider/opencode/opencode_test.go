@@ -43,3 +43,29 @@ func TestUsageAuthStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestGoProxyPathAndChosenKey(t *testing.T) {
+	p := New()
+	for _, tc := range []struct{ path, want string }{
+		{"/responses", "https://opencode.ai/zen/go/v1/responses"},
+		{"/v1/responses", "https://opencode.ai/zen/go/v1/responses"},
+		{"/v1/chat/completions", "https://opencode.ai/zen/go/v1/chat/completions"},
+		{"/v1/messages", "https://opencode.ai/zen/go/v1/messages"},
+		{"/v1/models", "https://opencode.ai/zen/go/v1/models"},
+		{"/v1x/responses", "https://opencode.ai/zen/go/v1/v1x/responses"},
+	} {
+		if got := p.UpstreamURL(tc.path); got != tc.want {
+			t.Fatalf("UpstreamURL(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+	r, _ := http.NewRequest(http.MethodPost, "https://example.test/responses", nil)
+	r.Header.Set("Authorization", "Bearer old-go-key")
+	r.Header.Set("X-Api-Key", "old-go-api-key")
+	r.Header.Set("X-OpenCode-Feature", "preserve")
+	if err := p.ApplyAuth(r, store.Account{Token: store.Token{AccessToken: "chosen-go-key"}}); err != nil {
+		t.Fatal(err)
+	}
+	if r.Header.Get("Authorization") != "Bearer chosen-go-key" || r.Header.Get("X-Api-Key") != "" || r.Header.Get("X-OpenCode-Feature") != "preserve" {
+		t.Fatal("OpenCode proxy retained client credentials or removed a feature header")
+	}
+}

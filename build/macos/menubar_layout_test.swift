@@ -101,7 +101,12 @@ struct MenuBarLayoutTest {
                 UsageWindow(label: "Weekly", used_percent: 0, resets_at: now + 7200),
                 UsageWindow(label: "Past", used_percent: 50, resets_at: now - 5),
                 UsageWindow(label: "Unknown", used_percent: 50, resets_at: nil),
-            ]))
+            ]), reset_credits: ResetCredits(count: 1))
+        guard bankedResetText(base.reset_credits) == "⚡ 1 banked",
+              bankedResetText(nil) == nil,
+              bankedResetText(ResetCredits(count: 0)) == nil else {
+            fail("Banked reset count missing or shown for an empty balance")
+        }
         func state(_ accounts: [Account], _ enabled: Bool) -> AppState {
             AppState(accounts: accounts, order: nil, hidden: nil, version: nil,
                 update: nil, menu_usage_bars: nil, reset_notifications: enabled)
@@ -112,7 +117,7 @@ struct MenuBarLayoutTest {
         }
         let shifted = Account(id: "a", provider: "codex", email: base.email, plan: nil,
             active: true, exhausted_until: nil, usage: Usage(available: true,
-                windows: [UsageWindow(label: "Session", used_percent: 25, resets_at: now + 3700)]))
+                windows: [UsageWindow(label: "Session", used_percent: 25, resets_at: now + 3700)]), reset_credits: nil)
         let newAlerts = desiredResetAlerts(state([shifted], true), now: Date(timeIntervalSince1970: now))
         guard newAlerts.count == 1, newAlerts[0].id != alerts[0].id,
               desiredResetAlerts(state([], true)).isEmpty,
@@ -122,12 +127,38 @@ struct MenuBarLayoutTest {
         let many = (0..<40).map { i in
             Account(id: "account-\(i)", provider: "codex", email: "", plan: nil,
                 active: false, exhausted_until: nil, usage: Usage(available: true,
-                    windows: [UsageWindow(label: "Session", used_percent: 1, resets_at: now + Double(40-i)*60)]))
+                    windows: [UsageWindow(label: "Session", used_percent: 1, resets_at: now + Double(40-i)*60)]), reset_credits: nil)
         }
         let capped = desiredResetAlerts(state(many, true), now: Date(timeIntervalSince1970: now))
         guard capped.count == 32, capped[0].id.contains("account-39") else {
             fail("Reset planner did not choose the earliest 32 windows")
         }
-        print("Menu bar layout: full resets, on/off bars fit, long labels preserve percentages")
+        guard logoUsesTemplate("copilot"), logoUsesTemplate("grok"), !logoUsesTemplate("gemini"),
+              let copilot = NSImage(contentsOfFile: "build/macos/logos/copilot.svg") else {
+            fail("Copilot logo must load as a tintable template")
+        }
+        copilot.isTemplate = logoUsesTemplate("copilot")
+        func logoBrightness(_ tint: NSColor) -> CGFloat {
+            let view = NSImageView(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
+            view.image = copilot
+            view.contentTintColor = tint
+            guard let rep = renderBitmap(view) else { fail("Copilot mark did not render") }
+            var total: CGFloat = 0
+            var pixels = 0
+            for y in 0..<rep.pixelsHigh {
+                for x in 0..<rep.pixelsWide {
+                    guard let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                          color.alphaComponent > 0.5 else { continue }
+                    total += (color.redComponent + color.greenComponent + color.blueComponent) / 3
+                    pixels += 1
+                }
+            }
+            guard pixels > 0 else { fail("Copilot mark has no visible pixels") }
+            return total / CGFloat(pixels)
+        }
+        guard logoBrightness(Palette.dark.ink) > logoBrightness(Palette.light.ink) + 0.35 else {
+            fail("Copilot mark did not follow light and dark menu colours")
+        }
+        print("Menu bar layout and Copilot theme tint: OK")
     }
 }

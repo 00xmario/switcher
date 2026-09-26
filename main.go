@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"html"
@@ -58,16 +59,39 @@ func main() {
 	args := flag.Args()
 	switch {
 	case len(args) > 0 && args[0] == "install":
-		if err := codexcfg.InstallAt(config.CodexConfigPath(), *port); err != nil {
+		if len(args) > 2 || (len(args) == 2 && args[1] != "--reselect") {
+			log.Fatal("usage: switcher [-port N] install [--reselect]")
+		}
+		path := config.CodexConfigPath()
+		var err error
+		if len(args) == 2 {
+			err = codexcfg.ReselectAt(path, *port)
+		} else {
+			err = codexcfg.InstallAt(path, *port)
+		}
+		if err != nil {
 			log.Fatalf("switcher install: %v", err)
 		}
-		fmt.Println("Switcher installed into the codex config (backup: ~/.codex/config.toml.switcher-backup).")
+		fmt.Printf("Codex user config checked at %s; native requests not tested.\n", path)
 
 	case len(args) > 0 && args[0] == "uninstall":
-		if err := codexcfg.Uninstall(config.CodexConfigPath()); err != nil {
+		if len(args) > 2 || (len(args) == 2 && args[1] != "--legacy-remove") {
+			log.Fatal("usage: switcher uninstall [--legacy-remove]")
+		}
+		path := config.CodexConfigPath()
+		var err error
+		if len(args) == 2 {
+			err = codexcfg.UninstallLegacy(path)
+		} else {
+			err = codexcfg.Uninstall(path)
+		}
+		if errors.Is(err, codexcfg.ErrLegacyOwnershipUnknown) {
+			log.Fatal("Switcher cannot recover the previous provider from this legacy config; use switcher uninstall --legacy-remove to remove only the known Switcher entry")
+		}
+		if err != nil {
 			log.Fatalf("switcher uninstall: %v", err)
 		}
-		fmt.Println("Switcher removed from the codex config.")
+		fmt.Printf("Switcher-owned Codex settings removed from %s.\n", path)
 
 	case len(args) > 0 && args[0] == "version":
 		fmt.Println("switcher " + version)
@@ -216,13 +240,7 @@ func run(port int) {
 			log.Fatalf("embed web assets: %v", err)
 		}
 	}
-	// Cache-busting: always revalidate the frontend assets so a rebuilt
-	// binary (or a dev-mode edit) shows up on a normal refresh.
-	staticHandler := http.FileServerFS(static)
-	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-cache")
-		staticHandler.ServeHTTP(w, r)
-	}))
+	registerWebRoutes(mux, static, settingsStore)
 
 	// Hardening headers on every response from the main listeners. The UI
 	// has no inline scripts (the theme init lives in app.js), so the CSP
@@ -263,6 +281,41 @@ func run(port int) {
 	if err := server.ServeAll(listeners); err != nil {
 		log.Fatalf("server: %v", err)
 	}
+}
+
+// registerWebRoutes serves a standalone login without exposing index.html or
+// app.js. AuthGate decides whether the app and its assets may be requested.
+func registerWebRoutes(mux *http.ServeMux, static fs.FS, preferences *settings.Store) {
+	loginFile := func(name, contentType string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if name == "login.html" && (preferences == nil || !preferences.Enabled()) {
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			}
+			content, err := fs.ReadFile(static, name)
+			if err != nil {
+				http.Error(w, "login page unavailable", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", contentType)
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write(content)
+		}
+	}
+	mux.HandleFunc("GET /login", loginFile("login.html", "text/html; charset=utf-8"))
+	mux.HandleFunc("GET /login.css", loginFile("login.css", "text/css; charset=utf-8"))
+	mux.HandleFunc("GET /login.js", loginFile("login.js", "text/javascript; charset=utf-8"))
+	staticHandler := http.FileServerFS(static)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Authenticated HTML must not linger as a back/forward cached page
+		// after logout. Without a password, keep the historic revalidation.
+		if preferences != nil && preferences.Enabled() {
+			w.Header().Set("Cache-Control", "no-store")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		staticHandler.ServeHTTP(w, r)
+	}))
 }
 
 // hardenedHeaders sets the static-UI hardening headers on every response:

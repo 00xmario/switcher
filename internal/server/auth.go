@@ -9,10 +9,9 @@ import (
 )
 
 // authGate is the optional authentication middleware. When auth is
-// disabled it passes everything through unchanged, so the historic
-// behavior is bit-identical. When enabled it requires a browser session
-// cookie or the local device token on every /api and static request,
-// except the paths listed below.
+// disabled it passes everything through unchanged. When enabled, neither
+// the app shell nor its assets are served without a session. Login assets
+// and the independently authenticated CLI proxy/hub routes remain reachable.
 type authGate struct {
 	store *settings.Store
 }
@@ -33,7 +32,12 @@ const csrfHeader = "X-Switcher-CSRF"
 // gate is the middleware.
 func (a *authGate) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !a.store.Enabled() || exempt(r) {
+		if !a.store.Enabled() || nativeRoute(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		if exempt(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -61,21 +65,47 @@ func (a *authGate) gate(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
+		if r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="switcher"`)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"auth_required": true})
 	})
 }
 
-// exempt reports whether this request never requires authentication.
-// The gate guards only /api/*: the static UI must load so the login view
-// can render, and the CLI proxy + hub paths have their own story.
+// exempt lets the standalone login load without shipping the app's HTML or
+// JavaScript. Credential endpoints that require a password or device token
+// retain their per-handler checks. Logout and session deletion go through
+// the gate, including its cookie CSRF check.
 func exempt(r *http.Request) bool {
 	path := r.URL.Path
-	if strings.HasPrefix(path, "/api/auth/") {
+	switch path {
+	case "/api/auth/status":
+		return r.Method == http.MethodGet || r.Method == http.MethodHead
+	case "/api/auth/login", "/api/auth/password", "/api/auth/disable", "/api/auth/rotate-device-token":
+		return r.Method == http.MethodPost
+	}
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		switch path {
+		case "/login", "/login.js", "/login.css":
+			return true
+		}
+	}
+	return false
+}
+
+// Native routes have their own provider or management-key authentication.
+// Changing the browser gate must not make CLI traffic require a cookie.
+func nativeRoute(path string) bool {
+	switch path {
+	case "/v0/management/auth-files", "/v0/management/api-call", "/v0/management/reset-quota":
 		return true
 	}
-	if !strings.HasPrefix(path, "/api/") {
-		return true
+	for _, provider := range []string{"codex", "claude", "grok", "opencode", "antigravity", "gemini", "copilot"} {
+		if strings.HasPrefix(path, "/"+provider+"/") {
+			return true
+		}
 	}
 	return false
 }

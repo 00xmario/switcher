@@ -1,7 +1,7 @@
 // Package copilot implements the provider.Provider interface for GitHub
 // Copilot (Copilot Pro/Business/Enterprise subscription logins). Login uses
 // the GitHub OAuth device flow; requests forward to the Copilot API with a
-// short-lived Copilot token minted from the long-lived GitHub OAuth token.
+// short-lived Copilot token minted on demand from the GitHub OAuth token.
 package copilot
 
 import (
@@ -92,7 +92,7 @@ func (p *Provider) LoginExchange(ctx context.Context, state, code string) (store
 // DeviceStart begins the GitHub device authorization grant: request a
 // device code, show the user the verification URL and code, and return a
 // poll function that resolves once GitHub issues the OAuth token. The
-// poller then chains into the Copilot token endpoint.
+// poller stores the GitHub OAuth identity; Copilot tokens are minted on use.
 func (p *Provider) DeviceStart(ctx context.Context) (provider.LoginInfo, func(ctx context.Context) (store.Account, error), error) {
 	form := url.Values{
 		"client_id": {clientID},
@@ -182,8 +182,9 @@ func (p *Provider) pollForToken(ctx context.Context, deviceCode string, interval
 	return store.Account{}, errors.New("device flow timed out")
 }
 
-// accountFromGithubToken chains the GitHub OAuth token into a short-lived
-// Copilot API token and resolves the GitHub login.
+// accountFromGithubToken resolves the GitHub login independently of the
+// Copilot token endpoint. A temporary mint failure must not discard a
+// successfully authorized account.
 func (p *Provider) accountFromGithubToken(ctx context.Context, githubToken string) (store.Account, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
 	if err != nil {
@@ -213,21 +214,13 @@ func (p *Provider) accountFromGithubToken(ctx context.Context, githubToken strin
 		return store.Account{}, errors.New("github user response has no login")
 	}
 
-	ct, err := fetchCopilotToken(ctx, githubToken)
-	if err != nil {
-		return store.Account{}, err
-	}
-
 	acc := store.Account{
 		Provider:  "copilot",
 		Email:     user.Login + "@copilot",
 		CreatedAt: time.Now().Unix(),
 		Token: store.Token{
-			AccessToken:  ct.Token,
 			RefreshToken: githubToken,
 			AccountID:    user.Login,
-			ExpiresAt:    int64(ct.ExpiresAt),
-			Extra:        map[string]any{extraCopilotExpires: int64(ct.ExpiresAt)},
 		},
 	}
 	// Plan is prefixed ("copilot_pro") so it cannot collide with the plan
@@ -291,9 +284,12 @@ func fetchCopilotToken(ctx context.Context, githubToken string) (copilotToken, e
 	if err != nil {
 		return copilotToken{}, fmt.Errorf("copilot token: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+githubToken)
-	req.Header.Set("X-GitHub-Api-Version", apiVersion)
-	req.Header.Set("Accept", "application/json")
+	// Match GitHub's Copilot token exchange. The device OAuth token itself
+	// works for /user, but the mint endpoint expects the GitHub token scheme.
+	req.Header.Set("Authorization", "token "+githubToken)
+	req.Header.Set("X-GitHub-Api-Version", "2025-04-01")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "Switcher/0.5")
 	resp, err := provider.OAuthHTTPClient.Do(req)
 	if err != nil {
 		return copilotToken{}, fmt.Errorf("copilot token: %w", err)
@@ -380,6 +376,9 @@ func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
 // IsExpired implements provider.Provider: refresh 5 minutes before the
 // Copilot token dies.
 func (p *Provider) IsExpired(a store.Account) bool {
+	if a.Token.AccessToken == "" {
+		return true
+	}
 	expiry := copilotExpiry(a)
 	return expiry > 0 && time.Now().Unix() >= expiry-5*60
 }

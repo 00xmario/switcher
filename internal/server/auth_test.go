@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"switcher/internal/proxy"
 	"switcher/internal/settings"
+	"switcher/internal/store"
 )
 
 // gateHarness wires a mux with the auth gate exactly like main.go does.
@@ -84,6 +86,59 @@ func TestGatePassesWithDeviceToken(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status %d with device token, want 200", res.StatusCode)
+	}
+}
+
+func TestUnauthenticatedBrowserCannotReceiveAppShellOrAssets(t *testing.T) {
+	preferences := settings.New(t.TempDir())
+	if err := preferences.SetPassword("hunter22"); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /login", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("standalone login")) })
+	mux.HandleFunc("GET /login.js", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("login script")) })
+	mux.HandleFunc("GET /login.css", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("login styles")) })
+	mux.HandleFunc("GET /codex/v1/responses", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("CLI proxy")) })
+	mux.HandleFunc("GET /v0/management/auth-files", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("management guard")) })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("PRIVATE ACCOUNTS APP SHELL")) })
+	gate := (&AuthGate{Store: preferences}).Wrap(mux)
+	request := func(path, cookie string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+		}
+		w := httptest.NewRecorder()
+		gate.ServeHTTP(w, r)
+		return w
+	}
+	if w := request("/", ""); w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/login" || strings.Contains(w.Body.String(), "PRIVATE") {
+		t.Fatalf("unauthenticated root exposed app: %d %s", w.Code, w.Body.String())
+	}
+	for _, path := range []string{"/index.html", "/app.js", "/style.css", "/favicon.png"} {
+		w := request(path, "")
+		if w.Code != http.StatusUnauthorized || strings.Contains(w.Body.String(), "PRIVATE") {
+			t.Fatalf("unauthenticated %s exposed app: %d %s", path, w.Code, w.Body.String())
+		}
+	}
+	for _, path := range []string{"/login", "/login.js", "/login.css"} {
+		if w := request(path, ""); w.Code != http.StatusOK || strings.Contains(w.Body.String(), "PRIVATE") {
+			t.Fatalf("login asset %s unavailable: %d", path, w.Code)
+		}
+	}
+	for _, path := range []string{"/codex/v1/responses", "/v0/management/auth-files"} {
+		if w := request(path, ""); w.Code != http.StatusOK {
+			t.Fatalf("non-browser route %s was gated: %d", path, w.Code)
+		}
+	}
+	session, err := preferences.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/", "/app.js"} {
+		if w := request(path, session); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "PRIVATE ACCOUNTS APP SHELL") {
+			t.Fatalf("authenticated app path %s unavailable: %d", path, w.Code)
+		}
 	}
 }
 
@@ -193,20 +248,33 @@ func TestExemptPathsStayOpen(t *testing.T) {
 	// and unchanged by the auth work.
 }
 
-func TestStaticServedUnauthenticated(t *testing.T) {
+func TestStaticRequiresSession(t *testing.T) {
 	h := newHarness(t, t.TempDir())
-	// An index-less mux still serves other handlers; the gate must not 401
-	// the static UI (registered here as a plain page).
 	h.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { //nolint
 		_, _ = w.Write([]byte("<html>ui</html>"))
 	})
-	res, err := http.Get(h.server.URL + "/")
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := client.Get(h.server.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther || res.Header.Get("Location") != "/login" {
+		t.Fatalf("unauthenticated static UI: %d, want redirect to login", res.StatusCode)
+	}
+	token, err := h.store.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, h.server.URL+"/", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
+	res, err = client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("static UI under auth: %d, want 200", res.StatusCode)
+		t.Fatalf("authenticated static UI: %d, want 200", res.StatusCode)
 	}
 }
 
@@ -408,6 +476,63 @@ func TestResetNotificationsSettingDoesNotRestartOrOverwriteUsageBars(t *testing.
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || !body.ResetNotifications {
 		t.Fatalf("GET settings did not report reset notifications: %v", err)
+	}
+}
+
+func TestCompactAccountViewPersistsWithoutChangingNetworkSettings(t *testing.T) {
+	dir := t.TempDir()
+	preferences := settings.New(dir)
+	accountStore := store.New(t.TempDir())
+	proxyManager, err := proxy.New(accountStore, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := preferences.Load()
+	if st.CompactAccounts {
+		t.Fatal("compact view should be off by default")
+	}
+	st.AuthEnabled, st.PasswordHash, st.BindLAN, st.TLS = true, "existing-hash", true, true
+	if err := preferences.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	a := &API{Settings: preferences, Store: accountStore, Proxy: proxyManager}
+	previous := restartForTest
+	restarted := false
+	restartForTest = func() { restarted = true }
+	defer func() { restartForTest = previous }()
+	for _, enabled := range []bool{true, false} {
+		payload, _ := json.Marshal(map[string]bool{"compact_accounts": enabled})
+		request := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader(payload))
+		request.RemoteAddr, request.Host = "127.0.0.1:1234", "127.0.0.1:8787"
+		response := httptest.NewRecorder()
+		a.handleSettingsPatch(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("PATCH compact=%t: %d %s", enabled, response.Code, response.Body.String())
+		}
+		fresh := settings.New(dir).Load()
+		if fresh.CompactAccounts != enabled || !fresh.BindLAN || !fresh.TLS || restarted {
+			t.Fatalf("compact=%t was not persisted or changed listeners: %+v", enabled, fresh)
+		}
+		get := httptest.NewRecorder()
+		a.handleSettingsGet(get, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+		var value struct {
+			CompactAccounts bool `json:"compact_accounts"`
+		}
+		if err := json.Unmarshal(get.Body.Bytes(), &value); err != nil || value.CompactAccounts != enabled {
+			t.Fatalf("GET compact=%t: %+v, %v", enabled, value, err)
+		}
+		state := httptest.NewRecorder()
+		a.handleState(state, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+		if err := json.Unmarshal(state.Body.Bytes(), &value); err != nil || value.CompactAccounts != enabled {
+			t.Fatalf("State compact=%t: %+v, %v", enabled, value, err)
+		}
+		authRequest := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
+		authRequest.Host = "127.0.0.1:8787"
+		authStatus := httptest.NewRecorder()
+		a.handleAuthStatus(authStatus, authRequest)
+		if err := json.Unmarshal(authStatus.Body.Bytes(), &value); err != nil || value.CompactAccounts != enabled {
+			t.Fatalf("Auth status compact=%t: %+v, %v", enabled, value, err)
+		}
 	}
 }
 

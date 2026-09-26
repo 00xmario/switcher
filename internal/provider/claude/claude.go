@@ -213,13 +213,36 @@ func (p *Provider) AddByKey(ctx context.Context, key string) (store.Account, err
 
 // UpstreamURL maps a Switcher path (e.g. "/v1/messages") to the Anthropic API.
 func (p *Provider) UpstreamURL(path string) string {
-	return "https://api.anthropic.com" + strings.TrimPrefix(path, "/v1")
+	return upstreamBase + path
 }
 
 // ApplyAuth sets the headers Claude's API expects for OAuth requests.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
+	// A client API key must not accompany the active subscription's OAuth
+	// bearer token. Preserve the client's feature betas and add only the
+	// OAuth capability if it was not already present.
+	req.Header.Del("X-Api-Key")
+	seen := map[string]bool{}
+	betas := make([]string, 0, 4)
+	for _, value := range req.Header.Values("Anthropic-Beta") {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" || seen[strings.ToLower(part)] {
+				continue
+			}
+			seen[strings.ToLower(part)] = true
+			betas = append(betas, part)
+		}
+	}
+	if !seen[oauthBeta] {
+		betas = append(betas, oauthBeta)
+	}
+	joined := strings.Join(betas, ",")
+	if len(joined) > 8<<10 {
+		return errors.New("claude beta header too large")
+	}
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
-	req.Header.Set("anthropic-beta", oauthBeta)
+	req.Header.Set("anthropic-beta", joined)
 	return nil
 }
 

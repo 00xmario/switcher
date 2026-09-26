@@ -9,6 +9,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +29,10 @@ import (
 // maxBodyBytes caps how much of a request body is buffered so a retry can
 // resend it. Codex request payloads are well under this.
 const maxBodyBytes = 64 << 20
+
+// Avoid repeating an upstream quota request each minute after it returns
+// 429. A user-initiated Recheck may still try immediately.
+const usageRateLimitCooldown = 5 * time.Minute
 
 // errNoAccount is the message returned when nothing can serve a request.
 var errNoAccount = errors.New("no usable account is active; add one in the Switcher UI")
@@ -50,6 +56,7 @@ type healthState struct {
 	relogin     bool
 	checking    int
 	queued      bool
+	retryAt     time.Time
 }
 
 // Upstream result of a request that hit an exhausted account.
@@ -62,19 +69,24 @@ type usageLimitBody struct {
 
 // Manager owns the routing state and the forwarding handler.
 type Manager struct {
-	mu            sync.Mutex
-	store         *store.Store
-	providers     map[string]provider.Provider
-	active        map[string]string // provider -> active account id
-	exhausted     map[string]time.Time
-	lastUsage     map[string]provider.Usage
-	health        map[string]*healthState
-	generation    map[string]uint64 // retained across deletion and replacement
-	syncing       atomic.Bool
-	refreshing    map[string]*sync.Mutex
-	order         []string // display order of provider sections
-	hidden        []string // providers dismissed from the UI
-	managementKey string   // hub management key, kept in state.json
+	mu                sync.Mutex
+	store             *store.Store
+	providers         map[string]provider.Provider
+	active            map[string]string // provider -> active account id
+	exhausted         map[string]time.Time
+	lastUsage         map[string]provider.Usage
+	health            map[string]*healthState
+	generation        map[string]uint64 // retained across deletion and replacement
+	accountRevision   map[string]uint64 // credential writes, independent of queued-check generations
+	selectionRevision map[string]uint64 // manual and automatic active-account changes
+	syncing           atomic.Bool
+	probeBusy         atomic.Bool
+	probeBootID       string
+	probeClient       *http.Client // optional internal test seam; production uses a fresh direct client
+	refreshing        map[string]*sync.Mutex
+	order             []string // display order of provider sections
+	hidden            []string // providers dismissed from the UI
+	managementKey     string   // hub management key, kept in state.json
 }
 
 // New loads persisted state and returns the proxy manager. registration is
@@ -82,6 +94,10 @@ type Manager struct {
 // never-ordered providers append in that order instead of map order, so
 // the default display order is deterministic.
 func New(st *store.Store, providers map[string]provider.Provider, registration []string) (*Manager, error) {
+	var boot [16]byte
+	if _, err := rand.Read(boot[:]); err != nil {
+		return nil, fmt.Errorf("probe boot identity: %w", err)
+	}
 	state, err := st.LoadState()
 	if err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
@@ -121,16 +137,19 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		}
 	}
 	return &Manager{
-		store:         st,
-		providers:     providers,
-		active:        active,
-		exhausted:     exhausted,
-		lastUsage:     map[string]provider.Usage{},
-		health:        map[string]*healthState{},
-		generation:    map[string]uint64{},
-		order:         order,
-		hidden:        hidden,
-		managementKey: state.ManagementKey,
+		store:             st,
+		providers:         providers,
+		active:            active,
+		exhausted:         exhausted,
+		lastUsage:         map[string]provider.Usage{},
+		health:            map[string]*healthState{},
+		generation:        map[string]uint64{},
+		accountRevision:   map[string]uint64{},
+		selectionRevision: map[string]uint64{},
+		probeBootID:       hex.EncodeToString(boot[:]),
+		order:             order,
+		hidden:            hidden,
+		managementKey:     state.ManagementKey,
 	}, nil
 }
 
@@ -244,6 +263,7 @@ func (m *Manager) Activate(id string) error {
 		return err
 	}
 	m.active[account.Provider] = id
+	m.selectionRevision[account.Provider]++
 	delete(m.exhausted, id)
 	return m.persistLocked()
 }
@@ -253,6 +273,7 @@ func (m *Manager) Remove(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.generation[id]++
+	m.accountRevision[id]++
 	m.removeLocked(id)
 }
 
@@ -263,6 +284,7 @@ func (m *Manager) removeLocked(id string) {
 	for providerID, activeID := range m.active {
 		if activeID == id {
 			delete(m.active, providerID)
+			m.selectionRevision[providerID]++
 			_ = m.persistLocked()
 		}
 	}
@@ -280,6 +302,7 @@ func (m *Manager) DeleteAccount(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.generation[id]++
+	m.accountRevision[id]++
 	m.removeLocked(id)
 	return nil
 }
@@ -291,6 +314,7 @@ func (m *Manager) ResetAccount(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.generation[id]++
+	m.accountRevision[id]++
 	delete(m.health, id)
 	delete(m.lastUsage, id)
 }
@@ -332,6 +356,7 @@ func (m *Manager) saveAccount(a store.Account) error {
 		return err
 	}
 	m.generation[a.ID]++
+	m.accountRevision[a.ID]++
 	delete(m.health, a.ID)
 	delete(m.lastUsage, a.ID)
 	return nil
@@ -501,6 +526,14 @@ func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, for
 	}
 	m.mu.Lock()
 	h := m.healthLocked(id)
+	if !force && time.Now().Before(h.retryAt) {
+		if staleSnapshot(m.lastUsage[id]) {
+			delete(m.lastUsage, id)
+		}
+		cached := m.lastUsage[id]
+		m.mu.Unlock()
+		return cached
+	}
 	forceRefresh := force && h.relogin
 	h.checking++
 	m.mu.Unlock()
@@ -522,13 +555,16 @@ func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, for
 			m.recordRefresh(id, gen, err)
 			return false
 		}
+		m.mu.Lock()
+		m.accountRevision[id]++
+		m.mu.Unlock()
 		m.recordRefresh(id, gen, nil)
 		return true
 	}
 	refreshed := prov.IsExpired(a) || forceRefresh
 	if refreshed {
 		if !refresh() {
-			return m.recordUsage(id, gen, provider.Usage{}, false)
+			return m.recordUsage(id, gen, provider.Usage{}, false, nil)
 		}
 	}
 	usage, err := prov.Usage(ctx, a)
@@ -536,16 +572,16 @@ func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, for
 		if refresh() {
 			usage, err = prov.Usage(ctx, a)
 		} else {
-			return m.recordUsage(id, gen, provider.Usage{}, false)
+			return m.recordUsage(id, gen, provider.Usage{}, false, nil)
 		}
 	}
 	if err != nil || !usage.Available {
 		if err != nil {
 			log.Printf("proxy: usage unavailable for %s (%s): %v", a.Email, a.Provider, err)
 		}
-		return m.recordUsage(id, gen, provider.Usage{}, false)
+		return m.recordUsage(id, gen, provider.Usage{}, false, err)
 	}
-	return m.recordUsage(id, gen, usage, true)
+	return m.recordUsage(id, gen, usage, true, nil)
 }
 
 // Only the usage endpoint's known HTTP 401 errors indicate a stale access
@@ -568,7 +604,7 @@ func (m *Manager) recordRefresh(id string, gen uint64, err error) {
 	}
 }
 
-func (m *Manager) recordUsage(id string, gen uint64, usage provider.Usage, success bool) provider.Usage {
+func (m *Manager) recordUsage(id string, gen uint64, usage provider.Usage, success bool, err error) provider.Usage {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.generation[id] != gen {
@@ -577,9 +613,13 @@ func (m *Manager) recordUsage(id string, gen uint64, usage provider.Usage, succe
 	h := m.healthLocked(id)
 	h.lastChecked = time.Now()
 	if success {
+		h.retryAt = time.Time{}
 		h.lastSuccess = h.lastChecked
 		m.lastUsage[id] = usage
 		return usage
+	}
+	if errors.Is(err, provider.ErrUsageRateLimited) {
+		h.retryAt = h.lastChecked.Add(usageRateLimitCooldown)
 	}
 	if last, ok := m.lastUsage[id]; ok {
 		if staleSnapshot(last) {
@@ -667,6 +707,7 @@ func (m *Manager) pick(providerID string) (store.Account, error) {
 		a := accounts[i]
 		if a.Provider == providerID && a.Token.AccessToken != "" && !m.exhaustedNow(a.ID) {
 			m.active[providerID] = a.ID
+			m.selectionRevision[providerID]++
 			_ = m.persistLocked()
 			return a, nil
 		}
@@ -762,8 +803,12 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue // retry the same account with fresh tokens
 
 		case resp.StatusCode >= 400:
-			body429, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			body429, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
 			drain(resp)
+			if readErr != nil || len(body429) > 1<<20 {
+				writeError(w, http.StatusBadGateway, "upstream error response too large or unreadable")
+				return
+			}
 			until, exhausted := prov.ParseRateLimit(r.Context(), account, resp.StatusCode, body429)
 			if !exhausted {
 				copyResponseStatus(w, resp.StatusCode, body429, resp.Header)
@@ -818,6 +863,9 @@ func (m *Manager) refreshForProxy(ctx context.Context, prov provider.Provider, p
 		m.deactivate(a.ID)
 		return picked, fmt.Errorf("save refreshed token: %w", err)
 	}
+	m.mu.Lock()
+	m.accountRevision[a.ID]++
+	m.mu.Unlock()
 	m.recordRefresh(a.ID, gen, nil)
 	return a, nil
 }
@@ -836,7 +884,8 @@ func (m *Manager) forward(prov provider.Provider, account store.Account, path st
 	// headers that must reflect the switched account instead of the CLI's
 	// own login.
 	for key, vals := range r.Header {
-		if isHopByHop(key) || isConnectionToken(r.Header.Get("Connection"), key) {
+		if isHopByHop(key) || isConnectionToken(r.Header.Get("Connection"), key) ||
+			strings.EqualFold(key, "Cookie") || strings.EqualFold(key, "X-Switcher-CSRF") {
 			continue
 		}
 		for _, v := range vals {
@@ -879,6 +928,7 @@ func (m *Manager) setActive(providerID, id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.active[providerID] = id
+	m.selectionRevision[providerID]++
 	if err := m.persistLocked(); err != nil {
 		log.Printf("proxy: persist active account: %v", err)
 	}
@@ -910,6 +960,7 @@ func (m *Manager) deactivate(id string) {
 			} else {
 				delete(m.active, providerID)
 			}
+			m.selectionRevision[providerID]++
 		}
 	}
 	_ = m.persistLocked()
@@ -930,7 +981,7 @@ func (m *Manager) splitPrefix(path string) (providerID, rest string, ok bool) {
 // copyResponseStatus relays an upstream error body we already buffered.
 func copyResponseStatus(w http.ResponseWriter, status int, body []byte, header http.Header) {
 	for key, vals := range header {
-		if isHopByHop(key) || key == "Set-Cookie" {
+		if isHopByHop(key) || key == "Set-Cookie" || key == "Content-Length" {
 			continue
 		}
 		for _, v := range vals {

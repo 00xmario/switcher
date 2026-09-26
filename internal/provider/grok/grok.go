@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -233,12 +234,20 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 
 // UpstreamURL maps a Switcher path to the Grok CLI chat proxy.
 func (p *Provider) UpstreamURL(path string) string {
-	return upstreamBase + strings.TrimPrefix(path, "/v1")
+	if path == "/v1" {
+		return upstreamBase
+	}
+	if strings.HasPrefix(path, "/v1/") {
+		path = strings.TrimPrefix(path, "/v1")
+	}
+	return upstreamBase + path
 }
 
 // ApplyAuth sets the headers the Grok chat proxy expects.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
+	req.Header.Del("X-Api-Key")
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
+	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 	return nil
 }
 
@@ -286,12 +295,15 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return provider.Usage{}, fmt.Errorf("%w: decode: %v", provider.ErrUsageUnavailable, err)
 	}
-	if parsed.Config.CreditUsagePercent == nil {
+	if parsed.Config.CreditUsagePercent == nil || math.IsNaN(*parsed.Config.CreditUsagePercent) || math.IsInf(*parsed.Config.CreditUsagePercent, 0) {
 		return provider.Usage{}, fmt.Errorf("%w: no creditUsagePercent in response", provider.ErrUsageUnavailable)
 	}
 
 	label := "Subscription"
-	kind := strings.TrimPrefix(parsed.Config.CurrentPeriod.Type, "USAGE_PERIOD_TYPE_")
+	kind := ""
+	if parsed.Config.CurrentPeriod != nil {
+		kind = strings.TrimPrefix(parsed.Config.CurrentPeriod.Type, "USAGE_PERIOD_TYPE_")
+	}
 	switch strings.ToLower(kind) {
 	case "weekly":
 		label = "Weekly"
@@ -300,7 +312,7 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	}
 	window := provider.UsageWindow{
 		Label:       label,
-		UsedPercent: int(*parsed.Config.CreditUsagePercent),
+		UsedPercent: max(0, min(100, int(*parsed.Config.CreditUsagePercent))),
 	}
 	if parsed.Config.CurrentPeriod != nil && parsed.Config.CurrentPeriod.End != "" {
 		if t, err := time.Parse(time.RFC3339, parsed.Config.CurrentPeriod.End); err == nil {
@@ -310,32 +322,11 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	return provider.Usage{Available: true, Windows: []provider.UsageWindow{window}}, nil
 }
 
-// ParseRateLimit implements provider.Provider. Grok's subscription exhaustion
-// surfaces as a non-200 from the chat proxy; the billing snapshot decides
-// whether the account is really out of usage and until when.
-func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
-	if status < 400 || status == http.StatusUnauthorized || status == http.StatusForbidden {
-		// 401/403 can also be token expiry; the refresh path handles those.
-		if !strings.Contains(strings.ToLower(string(body)), "usage") {
-			return time.Time{}, false
-		}
-	}
-	usage, err := p.Usage(ctx, a)
-	if err != nil {
-		return time.Now().Add(time.Hour), true
-	}
-	var latest time.Time
-	for _, w := range usage.Windows {
-		if w.UsedPercent >= 100 && w.ResetsAt > 0 {
-			if t := time.Unix(w.ResetsAt, 0); t.After(latest) {
-				latest = t
-			}
-		}
-	}
-	if latest.IsZero() {
-		return time.Now().Add(time.Hour), true
-	}
-	return latest, true
+// ParseRateLimit is deliberately conservative. Grok has not documented a
+// distinct account-exhaustion error, so a 429 or billing failure is not
+// evidence to park an account or switch a request to another identity.
+func (p *Provider) ParseRateLimit(_ context.Context, _ store.Account, _ int, _ []byte) (time.Time, bool) {
+	return time.Time{}, false
 }
 
 // discovery resolves xAI's OAuth endpoints.

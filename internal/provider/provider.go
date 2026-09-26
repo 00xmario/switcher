@@ -38,11 +38,18 @@ var ErrUsageUnavailable = errors.New("usage unavailable")
 // match ErrUsageUnavailable, but never ErrReloginRequired.
 var ErrUsageAuthRequired = errors.New("usage authentication required")
 
+// ErrUsageRateLimited means the quota endpoint returned HTTP 429. Callers
+// may back off usage polling without changing request routing or credentials.
+var ErrUsageRateLimited = errors.New("usage rate limited")
+
 // UsageStatusError classifies a usage endpoint's non-200 HTTP status without
 // retaining its response body or credentials in the error.
 func UsageStatusError(status int) error {
 	if status == http.StatusUnauthorized {
 		return fmt.Errorf("%w: http %d: %w", ErrUsageUnavailable, status, ErrUsageAuthRequired)
+	}
+	if status == http.StatusTooManyRequests {
+		return fmt.Errorf("%w: http %d: %w", ErrUsageUnavailable, status, ErrUsageRateLimited)
 	}
 	return fmt.Errorf("%w: http %d", ErrUsageUnavailable, status)
 }

@@ -1,6 +1,7 @@
 package codexcfg
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,27 +131,23 @@ func TestCheckStatusesAndRepair(t *testing.T) {
 		{`[projects."/tmp"]` + "\n" + `model_provider = "switcher"`, "missing"},
 		{`model_provider = "other"` + "\n\n" + block, "not_selected"},
 		{`model_provider = "switcher"` + "\n\n" + block, "misconfigured"},
-		{`model_provider = "switcher"` + "\n\n" + strings.Replace(block, `wire_api = "responses"`, `wire_api = "chat"`, 1), "misconfigured"},
+		{`model_provider = "switcher"` + "\n\n" + strings.Replace(block, `wire_api = "responses"`, `wire_api = "chat"`, 1), "conflict"},
 		{`model_provider = "switcher"` + "\n\n" + block + "\n" + `base_url = "duplicate"`, "invalid"},
 		{`model_provider = "switcher"` + "\n\n[broken", "invalid"},
 	} {
-		if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if got := Check(path, 9123).Condition; got != tc.want {
+		casePath := writeFile(t, tc.content)
+		if got := Check(casePath, 9123).Condition; got != tc.want {
 			t.Fatalf("check %q = %s, want %s", tc.content, got, tc.want)
 		}
 	}
-	if err := os.WriteFile(path, []byte("[projects.\"/tmp\"]\nmodel_provider = \"other\"\n"), 0o600); err != nil {
+	nestedPath := writeFile(t, "[projects.\"/tmp\"]\nmodel_provider = \"other\"\n")
+	if err := InstallAt(nestedPath, 9123); err != nil {
 		t.Fatal(err)
 	}
-	if err := InstallAt(path, 9123); err != nil {
-		t.Fatal(err)
-	}
-	if got := Check(path, 9123).Condition; got != "ready" {
+	if got := Check(nestedPath, 9123).Condition; got != "ready" {
 		t.Fatalf("nested key repair: %s", got)
 	}
-	if !strings.Contains(read(t, path), `[projects."/tmp"]`+"\n"+`model_provider = "other"`) {
+	if !strings.Contains(read(t, nestedPath), `[projects."/tmp"]`+"\n"+`model_provider = "other"`) {
 		t.Fatal("installer overwrote nested model_provider")
 	}
 }
@@ -191,17 +188,14 @@ func TestInstallRejectsInvalidConfigAndKeepsOriginalBackup(t *testing.T) {
 	}
 }
 
-func TestInstallReplacesNestedSwitcherProviderTables(t *testing.T) {
+func TestInstallRejectsNestedSwitcherProviderTables(t *testing.T) {
 	path := writeFile(t, `model_provider = "switcher"`+"\n\n"+block+
 		"\n[model_providers.switcher.http_headers]\nX-Old = \"value\"\n\n[projects.\"/tmp\"]\ntrust_level = \"trusted\"\n")
-	if err := InstallAt(path, 9123); err != nil {
-		t.Fatal(err)
+	before := read(t, path)
+	if err := InstallAt(path, 9123); !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("nested Switcher table should be left untouched: %v", err)
 	}
-	if got := Check(path, 9123).Condition; got != "ready" {
-		t.Fatalf("nested repair status: %s", got)
-	}
-	out := read(t, path)
-	if strings.Contains(out, "X-Old") || !strings.Contains(out, `[projects."/tmp"]`) {
-		t.Fatalf("nested provider not removed or unrelated table lost: %s", out)
+	if out := read(t, path); out != before {
+		t.Fatal("conflicting Switcher table was modified")
 	}
 }

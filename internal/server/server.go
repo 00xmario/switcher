@@ -31,17 +31,18 @@ import (
 
 // API wraps the JSON API the web UI talks to.
 type API struct {
-	Store           *store.Store
-	Logins          *login.Manager
-	Proxy           *proxy.Manager
-	Providers       map[string]provider.Provider
-	ManagementKey   string
-	Version         string
-	Updater         *update.Checker
-	Usage           *usage.Service
-	Settings        *settings.Store
-	Port            int
-	CodexConfigPath string // optional test override
+	Store             *store.Store
+	Logins            *login.Manager
+	Proxy             *proxy.Manager
+	Providers         map[string]provider.Provider
+	ManagementKey     string
+	Version           string
+	Updater           *update.Checker
+	Usage             *usage.Service
+	Settings          *settings.Store
+	Port              int
+	CodexConfigPath   string // optional test override
+	probeCodexForTest func(context.Context) proxy.ProbeCodexResult
 
 	creditsMu    sync.Mutex
 	creditsCache map[string]creditsEntry
@@ -62,6 +63,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/state", a.handleState)
 	mux.HandleFunc("GET /api/cli-setup", a.handleCLISetup)
 	mux.HandleFunc("POST /api/cli-setup/codex/install", a.handleCLISetupInstall)
+	mux.HandleFunc("POST /api/cli-setup/codex/reselect", a.handleCLISetupReselect)
+	mux.HandleFunc("POST /api/cli-setup/codex/restore", a.handleCLISetupRestore)
+	mux.HandleFunc("POST /api/cli-setup/codex/remove-legacy", a.handleCLISetupRemoveLegacy)
+	mux.HandleFunc("POST /api/cli-setup/codex/test", a.handleCodexRouteTest)
 	mux.HandleFunc("POST /api/login", a.handleLoginStart)
 	a.registerAuthRoutes(mux)
 	mux.HandleFunc("POST /api/login/import", a.handleLoginImport)
@@ -95,11 +100,102 @@ func (a *API) cliSetupPort() int {
 	return config.DefaultPort
 }
 
+// CLI setup describes native clients, not provider logins. Only Codex has
+// a configuration adapter today; the other rows are informational until
+// their native protocol and configuration precedence have been verified.
+type cliSetupClient struct {
+	ID            string               `json:"id"`
+	Name          string               `json:"name"`
+	Provider      string               `json:"provider"`
+	Capability    string               `json:"capability"`
+	Stage         string               `json:"stage"`
+	ReasonCode    string               `json:"reason_code,omitempty"`
+	NextStep      string               `json:"next_step,omitempty"`
+	Installation  cliSetupInstallation `json:"installation"`
+	Configuration cliSetupConfig       `json:"configuration"`
+	Accounts      cliSetupAccounts     `json:"accounts"`
+	Verification  cliSetupVerification `json:"verification"`
+}
+
+type cliSetupInstallation struct {
+	Evidence string `json:"evidence"`
+}
+
+type cliSetupConfig struct {
+	Condition        string `json:"condition"`
+	Scope            string `json:"scope"`
+	ExpectedURL      string `json:"expected_url,omitempty"`
+	Ownership        string `json:"ownership,omitempty"`
+	InstallAction    string `json:"install_action,omitempty"`
+	RestoreAction    string `json:"restore_action,omitempty"`
+	PendingOperation string `json:"pending_operation,omitempty"`
+}
+
+type cliSetupAccounts struct {
+	Evidence string `json:"evidence"`
+	Count    *int   `json:"count"`
+}
+
+var cliSetupTargets = []struct {
+	id, name, provider, stage, reason, nextStep string
+}{
+	{"codex", "Codex CLI", "codex", "available", "", ""},
+	{"claude-code", "Claude Code", "claude", "protocol_validation_pending", "oauth_coexistence_unverified",
+		"Keep Claude Code's native login. Independent OAuth refresh and effective CLI routing need an isolated test before setup is offered."},
+	{"opencode-go-v2", "OpenCode Go (v2)", "opencode", "protocol_validation_pending", "v2_account_model_transport_unverified",
+		"Use OpenCode Go directly until its native account, selected model, background server, and HTTP or WebSocket transport are verified."},
+	{"grok-build", "Grok Build", "grok", "research", "entitlement_and_relay_unverified",
+		"Keep Grok's native settings. An active plan is needed to validate entitlement and the separate WebSocket relay later."},
+	{"copilot-cli", "GitHub Copilot CLI", "copilot", "research", "byok_is_different_billing",
+		"Keep native Copilot CLI authentication. Its custom-provider BYOK mode is not proven to use the same Copilot subscription."},
+	{"gemini-cli", "Gemini CLI", "gemini", "research", "subscription_route_unverified",
+		"Keep Gemini CLI settings unchanged. Account eligibility and a subscription-preserving endpoint need native verification."},
+	{"antigravity-cli", "Antigravity CLI (agy)", "antigravity", "research", "agy_protocol_unverified",
+		"Keep Antigravity CLI settings unchanged. Its CLI protocol and account-plan mapping need native verification."},
+}
+
 func (a *API) handleCLISetup(w http.ResponseWriter, r *http.Request) {
 	if !loopbackOnly(w, r) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"codex": codexcfg.Check(a.cliSetupPath(), a.cliSetupPort())})
+	codex := codexcfg.Check(a.cliSetupPath(), a.cliSetupPort())
+	counts := map[string]int{}
+	accountsKnown := false
+	if a.Store != nil {
+		if accounts, err := a.Store.List(); err == nil {
+			accountsKnown = true
+			for _, account := range accounts {
+				counts[account.Provider]++
+			}
+		}
+	}
+	clients := make([]cliSetupClient, 0, len(cliSetupTargets))
+	for _, target := range cliSetupTargets {
+		client := cliSetupClient{
+			ID: target.id, Name: target.name, Provider: target.provider,
+			Capability: "information_only", Stage: target.stage,
+			ReasonCode: target.reason, NextStep: target.nextStep,
+			Installation:  cliSetupInstallation{Evidence: "not_checked"},
+			Configuration: cliSetupConfig{Condition: "not_checked", Scope: "not_inspected"},
+			Accounts:      cliSetupAccounts{Evidence: "unknown"},
+			Verification:  cliSetupVerification{Condition: "not_tested"},
+		}
+		if target.id == "codex" {
+			client.Capability = "configure_user_file"
+			client.Configuration = cliSetupConfig{
+				Condition: codex.Condition, Scope: "inspected_user_file", ExpectedURL: codex.ExpectedURL,
+				Ownership: codex.Ownership, InstallAction: codex.InstallAction,
+				RestoreAction: codex.RestoreAction, PendingOperation: codex.PendingOperation,
+			}
+			client.Verification = a.codexProbeStatus()
+		}
+		if accountsKnown {
+			count := counts[target.provider]
+			client.Accounts = cliSetupAccounts{Evidence: "known", Count: &count}
+		}
+		clients = append(clients, client)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"codex": codex, "clients": clients})
 }
 
 func (a *API) handleCLISetupInstall(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +203,7 @@ func (a *API) handleCLISetupInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := codexcfg.InstallAt(a.cliSetupPath(), a.cliSetupPort()); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not update Codex configuration"})
+		writeCodexSetupError(w, err)
 		return
 	}
 	status := codexcfg.Check(a.cliSetupPath(), a.cliSetupPort())
@@ -116,6 +212,50 @@ func (a *API) handleCLISetupInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"codex": status})
+}
+
+func writeCodexSetupError(w http.ResponseWriter, err error) {
+	code, message := http.StatusInternalServerError, "Could not update Codex configuration"
+	switch {
+	case errors.Is(err, codexcfg.ErrSelectionChanged):
+		code, message = http.StatusConflict, "Codex selected another provider; reselect Switcher explicitly"
+	case errors.Is(err, codexcfg.ErrLegacyOwnershipUnknown):
+		code, message = http.StatusConflict, "Legacy Switcher setup has no recoverable previous selection"
+	case errors.Is(err, codexcfg.ErrInvalidConfig):
+		code, message = http.StatusConflict, "Fix the existing Codex configuration before configuring Switcher"
+	case errors.Is(err, codexcfg.ErrConfigConflict):
+		code, message = http.StatusConflict, "Codex configuration changed or cannot be safely edited"
+	}
+	writeJSON(w, code, map[string]string{"error": message})
+}
+
+func (a *API) codexSetupResult(w http.ResponseWriter, err error) {
+	if err != nil {
+		writeCodexSetupError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"codex": codexcfg.Check(a.cliSetupPath(), a.cliSetupPort())})
+}
+
+func (a *API) handleCLISetupReselect(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	a.codexSetupResult(w, codexcfg.ReselectAt(a.cliSetupPath(), a.cliSetupPort()))
+}
+
+func (a *API) handleCLISetupRestore(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	a.codexSetupResult(w, codexcfg.Uninstall(a.cliSetupPath()))
+}
+
+func (a *API) handleCLISetupRemoveLegacy(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
+	a.codexSetupResult(w, codexcfg.UninstallLegacy(a.cliSetupPath()))
 }
 
 // LocalOnly guards the API against other websites: it rejects requests
@@ -204,9 +344,10 @@ type accountView struct {
 
 // resetCreditsView surfaces banked usage-limit resets (codex).
 type resetCreditsView struct {
-	Count         int    `json:"count"`
-	NextID        string `json:"next_id,omitempty"`
-	NextExpiresAt int64  `json:"next_expires_at,omitempty"`
+	Count         int     `json:"count"`
+	NextID        string  `json:"next_id,omitempty"`
+	NextExpiresAt int64   `json:"next_expires_at,omitempty"`
+	ExpiresAt     []int64 `json:"expires_at,omitempty"`
 }
 
 func (a *API) viewOf(acc store.Account) accountView {
@@ -217,10 +358,17 @@ func (a *API) viewOf(acc store.Account) accountView {
 	// wait on chatgpt.com.
 	if rc, ok := a.Providers[acc.Provider].(provider.ResetCreditProvider); ok {
 		if credits, ok := a.cachedResetCredits(rc, acc); ok && len(credits) > 0 {
+			expiries := make([]int64, 0, len(credits))
+			for _, credit := range credits {
+				if credit.ExpiresAt > 0 {
+					expiries = append(expiries, credit.ExpiresAt)
+				}
+			}
 			v.ResetCredits = &resetCreditsView{
 				Count:         len(credits),
 				NextID:        credits[0].ID,
 				NextExpiresAt: credits[0].ExpiresAt,
+				ExpiresAt:     expiries,
 			}
 		}
 	}
@@ -297,6 +445,7 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"update":              a.UpdateState(),
 		"menu_usage_bars":     a.Settings == nil || a.Settings.MenuUsageBars(),
 		"reset_notifications": a.Settings != nil && a.Settings.Load().ResetNotifications,
+		"compact_accounts":    a.Settings != nil && a.Settings.Load().CompactAccounts,
 	}
 	if revealHubKey {
 		state["hub_management_key"] = a.ManagementKey
@@ -367,10 +516,9 @@ func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": viewOfBase(a, account)})
 }
 
-// registerAuthRoutes mounts the optional-authentication endpoints. These
-// are exempt from the auth gate itself (see authGate.gate) and enforce
-// their own rules: password setup is loopback-only, everything else is
-// rate limited and constant-time.
+// registerAuthRoutes mounts the optional-authentication endpoints. Login,
+// status, and credential operations enforce their own checks; logout and
+// session deletion also pass through the cookie/CSRF auth gate.
 func (a *API) registerAuthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/status", a.handleAuthStatus)
 	mux.HandleFunc("POST /api/auth/login", a.handleAuthLogin)
@@ -416,6 +564,7 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		"password_set":        a.Settings.HasPassword(),
 		"menu_usage_bars":     a.Settings.MenuUsageBars(),
 		"reset_notifications": st.ResetNotifications,
+		"compact_accounts":    st.CompactAccounts,
 		"bind_lan":            st.BindLAN,
 		"lan_active":          LANListenerActive(),
 		"tls":                 st.TLS,
@@ -609,6 +758,7 @@ func (a *API) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"password_set":        st.PasswordHash != "",
 		"menu_usage_bars":     a.Settings.MenuUsageBars(),
 		"reset_notifications": st.ResetNotifications,
+		"compact_accounts":    st.CompactAccounts,
 	})
 }
 
@@ -621,6 +771,7 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		TLS                *bool `json:"tls"`
 		MenuUsageBars      *bool `json:"menu_usage_bars"`
 		ResetNotifications *bool `json:"reset_notifications"`
+		CompactAccounts    *bool `json:"compact_accounts"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -649,6 +800,9 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.ResetNotifications != nil {
 			st.ResetNotifications = *body.ResetNotifications
+		}
+		if body.CompactAccounts != nil {
+			st.CompactAccounts = *body.CompactAccounts
 		}
 		return nil
 	})

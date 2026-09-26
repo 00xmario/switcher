@@ -26,6 +26,16 @@ type importTestProvider struct {
 	account store.Account
 }
 
+type resetCreditTestProvider struct{ *recheckProvider }
+
+func (*resetCreditTestProvider) ListResetCredits(context.Context, store.Account) ([]provider.ResetCredit, error) {
+	return nil, nil
+}
+
+func (*resetCreditTestProvider) ConsumeResetCredit(context.Context, store.Account, string) (string, error) {
+	return "", nil
+}
+
 func (p *importTestProvider) ImportFromKeychain(context.Context) (store.Account, error) {
 	return p.account, nil
 }
@@ -187,5 +197,31 @@ func TestReloginImportRejectsAnotherIdentityAndKeepsTargetID(t *testing.T) {
 	}
 	if _, err := st.Get("fake-new-id"); err == nil {
 		t.Fatal("matching import minted a duplicate account")
+	}
+}
+
+func TestAccountViewIncludesEachBankedResetExpiry(t *testing.T) {
+	st := store.New(t.TempDir())
+	account := store.Account{ID: "fake-a", Provider: "fake", Email: "a@example.com"}
+	if err := st.Save(account); err != nil {
+		t.Fatal(err)
+	}
+	p := &resetCreditTestProvider{recheckProvider: &recheckProvider{}}
+	providers := map[string]provider.Provider{"fake": p}
+	m, err := proxy.New(st, providers, []string{"fake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	expiries := []int64{now.Add(24 * time.Hour).Unix(), now.Add(7 * 24 * time.Hour).Unix()}
+	a := &API{Store: st, Proxy: m, Providers: providers, creditsCache: map[string]creditsEntry{
+		account.ID: {credits: []provider.ResetCredit{
+			{ID: "first", ExpiresAt: expiries[0]}, {ID: "second", ExpiresAt: expiries[1]},
+		}, ok: true, at: now},
+	}}
+	view := a.viewOf(account)
+	if view.ResetCredits == nil || view.ResetCredits.Count != 2 || view.ResetCredits.NextID != "first" ||
+		len(view.ResetCredits.ExpiresAt) != 2 || view.ResetCredits.ExpiresAt[0] != expiries[0] || view.ResetCredits.ExpiresAt[1] != expiries[1] {
+		t.Fatalf("banked reset expiry list: %+v", view.ResetCredits)
 	}
 }

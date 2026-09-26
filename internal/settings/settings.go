@@ -30,6 +30,7 @@ type Settings struct {
 	TLS                bool   `json:"tls,omitempty"`             // the LAN listener is TLS-only
 	MenuUsageBars      *bool  `json:"menu_usage_bars,omitempty"` // nil means on
 	ResetNotifications bool   `json:"reset_notifications,omitempty"`
+	CompactAccounts    bool   `json:"compact_accounts,omitempty"`
 	CSRFToken          string `json:"csrf_token,omitempty"`
 	UpdatedAt          int64  `json:"updated_at,omitempty"`
 }

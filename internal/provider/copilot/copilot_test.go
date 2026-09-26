@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"switcher/internal/login"
 	"switcher/internal/provider"
 	"switcher/internal/store"
 )
@@ -73,10 +74,8 @@ func TestDeviceStartAndPollStateMachine(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`{"login":"octocat"}`))
 		case "/copilot_internal/v2/token":
-			if r.Header.Get("X-GitHub-Api-Version") != apiVersion {
-				t.Errorf("api version = %q", r.Header.Get("X-GitHub-Api-Version"))
-			}
-			_, _ = w.Write([]byte(`{"token":"cctok","expires_at":1900000000}`))
+			t.Error("Copilot token must be minted on demand, not during login")
+			w.WriteHeader(http.StatusInternalServerError)
 		case "/copilot_internal/user":
 			_, _ = w.Write([]byte(`{"copilot_plan":"pro_plus"}`))
 		default:
@@ -105,14 +104,105 @@ func TestDeviceStartAndPollStateMachine(t *testing.T) {
 	if acc.Provider != "copilot" || acc.Email != "octocat@copilot" || acc.Token.AccountID != "octocat" {
 		t.Fatalf("unexpected account: %+v", acc)
 	}
-	if acc.Token.AccessToken != "cctok" || acc.Token.RefreshToken != "ghu_token" {
+	if acc.Token.AccessToken != "" || acc.Token.RefreshToken != "ghu_token" {
 		t.Fatalf("token chain wrong: %+v", acc.Token)
 	}
 	if !strings.HasPrefix(acc.ID, "copilot-") || len(acc.ID) != len("copilot-")+8 {
 		t.Fatalf("id = %q", acc.ID)
 	}
-	if expiry := copilotExpiry(acc); expiry != 1900000000 {
-		t.Fatalf("copilot expiry = %d", expiry)
+	if !p.IsExpired(acc) {
+		t.Fatal("new GitHub login must mint Copilot token before forwarding")
+	}
+}
+
+// The GitHub device authorization can succeed while the subsequent Copilot
+// token mint rejects the request. Keep the whole login chain in this test.
+func TestDeviceLoginMintsCopilotTokenWithGitHubClientHeaders(t *testing.T) {
+	fastPoll(t)
+	stubEndpoints(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/device/code":
+			_, _ = w.Write([]byte(`{"device_code":"device","user_code":"ABCD","verification_uri":"https://github.com/login/device"}`))
+		case "/access_token":
+			_, _ = w.Write([]byte(`{"access_token":"github-oauth-token"}`))
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"octocat"}`))
+		case "/copilot_internal/v2/token":
+			if r.Header.Get("Authorization") != "token github-oauth-token" ||
+				r.Header.Get("Accept") != "application/vnd.github+json" ||
+				r.Header.Get("X-GitHub-Api-Version") != "2025-04-01" ||
+				r.Header.Get("User-Agent") == "" {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			_, _ = w.Write([]byte(`{"token":"copilot-token","expires_at":1900000000}`))
+		case "/copilot_internal/user":
+			_, _ = w.Write([]byte(`{"copilot_plan":"pro"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	_, poll, err := New().DeviceStart(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := poll(context.Background())
+	if err != nil {
+		t.Fatalf("GitHub authorization completed but Copilot account was not added: %v", err)
+	}
+	if account.Token.RefreshToken != "github-oauth-token" || account.Token.AccessToken != "" {
+		t.Fatal("GitHub login should persist without requiring a Copilot token")
+	}
+	if err := New().Refresh(context.Background(), &account); err != nil {
+		t.Fatalf("deferred Copilot token exchange: %v", err)
+	}
+	if account.Token.AccessToken != "copilot-token" {
+		t.Fatal("Copilot token was not minted on first use")
+	}
+}
+
+func TestDeviceLoginSurvivesCopilotMintForbidden(t *testing.T) {
+	fastPoll(t)
+	mintAvailable := false
+	stubEndpoints(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/device/code":
+			_, _ = w.Write([]byte(`{"device_code":"device","user_code":"ABCD","verification_uri":"https://github.com/login/device"}`))
+		case "/access_token":
+			_, _ = w.Write([]byte(`{"access_token":"github-oauth-token"}`))
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"octocat"}`))
+		case "/copilot_internal/v2/token":
+			if !mintAvailable {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			_, _ = w.Write([]byte(`{"token":"copilot-token","expires_at":1900000000}`))
+		case "/copilot_internal/user":
+			w.WriteHeader(http.StatusForbidden)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	st := store.New(t.TempDir())
+	manager := login.New(func(account *store.Account, _ string) error { return st.Save(*account) })
+	handle, err := manager.StartDevice(context.Background(), New(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err, finished := manager.Outcome(handle.State, time.Second)
+	if !finished || err != nil || account.ID == "" || account.Token.RefreshToken != "github-oauth-token" {
+		t.Fatalf("authorized GitHub account disappeared after Copilot 403: finished=%v error=%v", finished, err)
+	}
+	if saved, err := st.Get(account.ID); err != nil || saved.Token.RefreshToken != "github-oauth-token" {
+		t.Fatalf("authorized Copilot account not persisted: %v", err)
+	}
+	if err := New().Refresh(context.Background(), &account); err == nil {
+		t.Fatal("first use must still report Copilot mint failure")
+	}
+	mintAvailable = true
+	if err := New().Refresh(context.Background(), &account); err != nil || account.Token.AccessToken != "copilot-token" {
+		t.Fatalf("stored GitHub login could not recover after mint 403: %v", err)
 	}
 }
 
@@ -142,7 +232,7 @@ func TestRefreshOnlyClassifiesGitHubMintUnauthorized(t *testing.T) {
 		if r.URL.Path != "/copilot_internal/v2/token" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer github-token" {
+		if got := r.Header.Get("Authorization"); got != "token github-token" {
 			t.Errorf("authorization = %q", got)
 		}
 		w.WriteHeader(status)
@@ -274,7 +364,7 @@ func TestRefresh(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer ghu_token" {
+		if got := r.Header.Get("Authorization"); got != "token ghu_token" {
 			t.Errorf("refresh authorization = %q", got)
 		}
 		_, _ = w.Write([]byte(`{"token":"cctok2","expires_at":1900003600}`))
@@ -303,15 +393,15 @@ func TestRefresh(t *testing.T) {
 
 func TestIsExpired(t *testing.T) {
 	p := New()
-	if p.IsExpired(store.Account{}) {
-		t.Fatal("no expiry recorded must not count as expired")
+	if !p.IsExpired(store.Account{}) {
+		t.Fatal("missing Copilot token must require a mint")
 	}
-	soon := store.Account{Token: store.Token{
+	soon := store.Account{Token: store.Token{AccessToken: "copilot-token",
 		Extra: map[string]any{extraCopilotExpires: float64(time.Now().Add(time.Minute).Unix())}}}
 	if !p.IsExpired(soon) {
 		t.Fatal("a token inside the 5 minute lead must count as expired")
 	}
-	later := store.Account{Token: store.Token{
+	later := store.Account{Token: store.Token{AccessToken: "copilot-token",
 		Extra: map[string]any{extraCopilotExpires: float64(time.Now().Add(time.Hour).Unix())}}}
 	if p.IsExpired(later) {
 		t.Fatal("a token beyond the 5 minute lead is fresh")
@@ -385,7 +475,7 @@ func TestImportFromKeychain(t *testing.T) {
 		t.Fatal(err)
 	}
 	if acc.Provider != "copilot" || acc.Email != "octocat@copilot" ||
-		acc.Token.RefreshToken != "ghu_stored" || acc.Token.AccessToken != "cctok" {
+		acc.Token.RefreshToken != "ghu_stored" || acc.Token.AccessToken != "" || !p.IsExpired(acc) {
 		t.Fatalf("unexpected imported account: %+v", acc)
 	}
 

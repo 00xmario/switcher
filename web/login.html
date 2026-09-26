@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unlock Switcher</title>
+  <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+  <main class="login-page">
+    <section class="login-card" aria-labelledby="login-title">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 48 48">
+          <rect width="48" height="48" rx="11" fill="currentColor"/>
+          <g stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" fill="none">
+            <path d="M13.5 19.5h21"/><path d="M29.5 14.5l5 5-5 5"/>
+            <path d="M34.5 28.5h-21"/><path d="M18.5 23.5l-5 5 5 5"/>
+          </g>
+        </svg>
+      </span>
+      <h1 id="login-title">Switcher is locked</h1>
+      <p>Enter your password to continue.</p>
+      <form id="login-form">
+        <label for="login-password">Password</label>
+        <input type="password" id="login-password" autocomplete="current-password" required autofocus>
+        <button type="submit" id="login-submit">Unlock Switcher</button>
+        <p id="login-error" role="alert" aria-live="polite"></p>
+      </form>
+    </section>
+  </main>
+  <script type="module" src="/login.js"></script>
+</body>
+</html>

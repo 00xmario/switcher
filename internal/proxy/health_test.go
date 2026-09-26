@@ -54,6 +54,65 @@ func goodUsage() provider.Usage {
 	return provider.Usage{Available: true, Windows: []provider.UsageWindow{{Label: "week", UsedPercent: 37, ResetsAt: time.Now().Add(time.Hour).Unix()}}}
 }
 
+func TestUsageRateLimitBacksOffBackgroundButAllowsManualRecheck(t *testing.T) {
+	var calls atomic.Int32
+	p := &healthProvider{usage: func(context.Context, store.Account) (provider.Usage, error) {
+		if calls.Add(1) == 1 {
+			return provider.Usage{}, provider.UsageStatusError(http.StatusTooManyRequests)
+		}
+		return goodUsage(), nil
+	}}
+	m := healthFixture(t, p)
+	m.RefreshUsageAll(context.Background())
+	assertCondition(t, m, "usage_unavailable")
+	firstChecked := m.AccountHealth("a").LastChecked
+	m.RefreshUsageAll(context.Background())
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("background retried a throttled usage endpoint: %d requests", got)
+	}
+	if m.AccountHealth("a").LastChecked != firstChecked {
+		t.Fatal("skipping a throttled endpoint falsely reported a new check")
+	}
+	if err := m.QueueRecheck("a"); err != nil {
+		t.Fatal(err)
+	}
+	awaitCondition(t, m, "usage_current")
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("manual Recheck did not bypass the cooldown: %d requests", got)
+	}
+	m.RefreshUsageAll(context.Background())
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("successful Recheck did not clear cooldown: %d requests", got)
+	}
+}
+
+func TestUsageRateLimitCooldownDropsRolledSnapshot(t *testing.T) {
+	var calls atomic.Int32
+	p := &healthProvider{usage: func(context.Context, store.Account) (provider.Usage, error) {
+		calls.Add(1)
+		return provider.Usage{}, provider.UsageStatusError(http.StatusTooManyRequests)
+	}}
+	m := healthFixture(t, p)
+	m.mu.Lock()
+	m.lastUsage["a"] = goodUsage()
+	m.healthLocked("a").lastSuccess = time.Now().Add(-6 * time.Minute)
+	m.mu.Unlock()
+	m.RefreshUsageAll(context.Background())
+	m.mu.Lock()
+	m.lastUsage["a"] = provider.Usage{Available: true, Windows: []provider.UsageWindow{
+		{Label: "week", UsedPercent: 100, ResetsAt: time.Now().Add(-time.Minute).Unix()},
+	}}
+	m.mu.Unlock()
+	m.RefreshUsageAll(context.Background())
+	if calls.Load() != 1 {
+		t.Fatalf("cooldown sent %d quota requests, want one", calls.Load())
+	}
+	if _, ok := m.LastUsage("a"); ok {
+		t.Fatal("rolled snapshot remained visible during quota cooldown")
+	}
+	assertCondition(t, m, "usage_unavailable")
+}
+
 func TestReloginReplacementCannotRecreateDeletedAccount(t *testing.T) {
 	m := healthFixture(t, &healthProvider{})
 	for i := 0; i < 20; i++ {

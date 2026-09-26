@@ -39,6 +39,15 @@ struct Usage: Codable {
     let windows: [UsageWindow]?
 }
 
+struct ResetCredits: Codable {
+    let count: Int
+}
+
+func bankedResetText(_ credits: ResetCredits?) -> String? {
+    guard let count = credits?.count, count > 0 else { return nil }
+    return "⚡ \(count) banked"
+}
+
 struct Account: Codable {
     let id: String
     let provider: String
@@ -47,6 +56,7 @@ struct Account: Codable {
     let active: Bool
     let exhausted_until: Double?
     let usage: Usage?
+    let reset_credits: ResetCredits?
 }
 
 struct UpdateInfo: Codable {
@@ -177,14 +187,19 @@ func sectionHead(_ providerID: String, contentWidth: CGFloat) -> NSView {
     return head
 }
 
-// providerLogoImage loads the same SVG marks the web app uses. Grok's mark
-// is a single-color glyph, so it is a template and follows dark mode.
+// Copilot's single-path mark and Grok's glyph follow the current palette;
+// other provider marks retain their own colours.
+func logoUsesTemplate(_ providerID: String) -> Bool {
+    providerID == "grok" || providerID == "copilot"
+}
+
+// providerLogoImage loads the same provider marks used by the web app.
 func providerLogoImage(_ providerID: String) -> NSImage? {
     guard let url = Bundle.main.url(forResource: providerID, withExtension: "svg") else {
         return nil
     }
     guard let image = NSImage(contentsOf: url) else { return nil }
-    image.isTemplate = providerID == "grok"
+    image.isTemplate = logoUsesTemplate(providerID)
     if providerID == "opencode" && palette.dark {
         return invertedImage(image, size: NSSize(width: 22, height: 22)) ?? image
     }
@@ -887,11 +902,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             // for the widest plan; longer emails truncate with an ellipsis.
             let textX = cardInset
             let planText = account.plan.flatMap { planNames[$0] }.map { "· " + $0 } ?? ""
+            let bankedText = bankedResetText(account.reset_credits) ?? ""
+            let bankedFont = NSFont.systemFont(ofSize: 10.5)
+            let bankedWidth = bankedText.isEmpty ? CGFloat(0) : textWidth(bankedText, font: bankedFont)
+            let exhausted = !account.active && (account.exhausted_until.map { $0 > Date().timeIntervalSince1970 } ?? false)
             let titleFont = NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular)
             let titleColor = account.active ? accentColor : inkColor
-            let titleWidth = contentWidth - textX - cardInset - 22
+            let trailingWidth = max(account.active ? 14 : 0, exhausted ? 90 : 0) +
+                (bankedWidth > 0 ? bankedWidth + 8 : 0)
+            let titleWidth = contentWidth - textX - cardInset - trailingWidth - 8
             let titleY = rowH - rowTopPad - titleHeight
-            let emailWidth = planColumn > 0 ? min(emailColumn, titleWidth - planColumn - 6) : min(emailColumn, titleWidth)
+            let emailWidth = planColumn > 0 ? max(0, min(emailColumn, titleWidth - planColumn - 6)) : max(0, min(emailColumn, titleWidth))
             let emailField = label(account.email, font: titleFont, color: titleColor)
             emailField.frame = NSRect(x: textX, y: titleY, width: emailWidth, height: titleHeight)
             let email = BlurredLabel(field: emailField)
@@ -901,6 +922,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 let plan = label(planText, font: titleFont, color: titleColor)
                 plan.frame = NSRect(x: textX + emailWidth + 6, y: titleY, width: planColumn, height: titleHeight)
                 row.addSubview(plan)
+            }
+            if bankedWidth > 0 {
+                let banked = label(bankedText, font: bankedFont, color: warnColor)
+                banked.alignment = .right
+                banked.toolTip = "Banked usage-limit resets available"
+                banked.frame = NSRect(x: contentWidth - cardInset - (account.active ? 22 : 0) - bankedWidth,
+                                      y: titleY, width: bankedWidth, height: titleHeight)
+                row.addSubview(banked)
             }
 
             // Stable label and percentage columns, with resets trailing.
@@ -950,10 +979,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
                 check.contentTintColor = accentColor
                 row.addSubview(check)
-            } else if let until = account.exhausted_until, Date(timeIntervalSince1970: until) > Date() {
+            } else if exhausted {
                 let badge = label("Out of usage", font: NSFont.systemFont(ofSize: 10.5), color: warnColor)
                 badge.alignment = .right
-                badge.frame = NSRect(x: contentWidth - cardInset - 90, y: titleY, width: 90, height: 14)
+                badge.frame = NSRect(x: contentWidth - cardInset - 90 - (bankedWidth > 0 ? bankedWidth + 8 : 0),
+                                     y: titleY, width: 90, height: 14)
                 row.addSubview(badge)
             }
 

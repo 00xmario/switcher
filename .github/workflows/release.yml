@@ -13,23 +13,16 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
-      - name: Test
-        run: |
-          go test ./...
-          node --check web/app.js
-          node web/app_state_test.mjs
-
-      - name: Check menu bar layout
-        run: |
-          swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
-            build/macos/menubar_layout_test.swift -o /tmp/switcher-layout-test
-          /tmp/switcher-layout-test
+      - name: Verify
+        run: make verify
 
       - name: Build plain binaries
         run: |

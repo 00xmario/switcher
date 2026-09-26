@@ -85,7 +85,10 @@ func (s *Store) List() ([]Account, error) {
 	// disk reads, so the decoded list is cached until the directory or any
 	// file in it changes.
 	mtime := info.ModTime().UnixNano()
-	entries, _ := os.ReadDir(s.accountsDir)
+	entries, err := os.ReadDir(s.accountsDir)
+	if err != nil {
+		return nil, fmt.Errorf("list accounts: %w", err)
+	}
 	var newest int64
 	for _, e := range entries {
 		if fi, err := e.Info(); err == nil {
