@@ -75,12 +75,90 @@ struct AppState: Codable {
 }
 
 private let resetPrefix = "sh.switcher.reset."
+private let resetCatchupInterval: TimeInterval = 24 * 3600
+private let resetRolloverLead: TimeInterval = 5 * 60
 
-struct ResetAlert {
+struct ResetAlert: Codable {
     let id: String
+    let accountID: String
+    let providerID: String
     let provider: String
     let window: String
     let date: Date
+}
+
+struct ResetAlertLedger: Codable {
+    let alerts: [ResetAlert]
+    let deliveredIDs: [String]
+}
+
+struct ResetAlertPermission: Equatable {
+    let message: String
+    let canSend: Bool
+}
+
+func resetAlertPermission(_ status: UNAuthorizationStatus, alertSetting: UNNotificationSetting,
+                          alertStyle: UNAlertStyle, centerSetting: UNNotificationSetting) -> ResetAlertPermission {
+    switch status {
+    case .authorized where alertSetting == .enabled && alertStyle != .none:
+        return ResetAlertPermission(message: "macOS allows banners (Focus may silence)", canSend: true)
+    case .authorized where centerSetting == .enabled:
+        return ResetAlertPermission(message: "Reset alerts go to Notification Center", canSend: true)
+    case .authorized:
+        return ResetAlertPermission(message: "Reset alerts hidden in macOS Settings", canSend: false)
+    case .provisional where centerSetting == .enabled:
+        return ResetAlertPermission(message: "Reset alerts delivered quietly by macOS", canSend: true)
+    case .provisional:
+        return ResetAlertPermission(message: "Reset alerts hidden in macOS Settings", canSend: false)
+    case .denied:
+        return ResetAlertPermission(message: "Reset alerts blocked in macOS Settings", canSend: false)
+    case .notDetermined:
+        return ResetAlertPermission(message: "Waiting for notification permission", canSend: false)
+    @unknown default:
+        return ResetAlertPermission(message: "Check macOS notification permission", canSend: false)
+    }
+}
+
+func resetAlertPermission(_ settings: UNNotificationSettings) -> ResetAlertPermission {
+    resetAlertPermission(settings.authorizationStatus, alertSetting: settings.alertSetting,
+        alertStyle: settings.alertStyle, centerSetting: settings.notificationCenterSetting)
+}
+
+func sendTestResetAlert(completion: @escaping (String?) -> Void) {
+    guard resetAlertsEnabledOnDisk() else {
+        completion("Enable reset alerts in Switcher Settings first")
+        return
+    }
+    let center = UNUserNotificationCenter.current()
+    center.getNotificationSettings { settings in
+        let permission = resetAlertPermission(settings)
+        guard permission.canSend, resetAlertsEnabledOnDisk() else {
+            completion(permission.canSend ? "Reset alerts were turned off" : permission.message)
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Switcher reset alert test"
+        content.body = "Switcher can send macOS notifications."
+        content.sound = .default
+        center.add(UNNotificationRequest(identifier: "sh.switcher.test." + UUID().uuidString,
+            content: content, trigger: nil)) { error in completion(error?.localizedDescription) }
+    }
+}
+
+func loadResetAlertLedger(at url: URL) throws -> ResetAlertLedger {
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        return ResetAlertLedger(alerts: [], deliveredIDs: [])
+    }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .secondsSince1970
+    return try decoder.decode(ResetAlertLedger.self, from: Data(contentsOf: url))
+}
+
+func saveResetAlertLedger(_ ledger: ResetAlertLedger, at url: URL) throws {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .secondsSince1970
+    try encoder.encode(ledger).write(to: url, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
 }
 
 func desiredResetAlerts(_ state: AppState, now: Date = Date()) -> [ResetAlert] {
@@ -89,14 +167,48 @@ func desiredResetAlerts(_ state: AppState, now: Date = Date()) -> [ResetAlert] {
     var alerts: [ResetAlert] = []
     for account in state.accounts where account.usage?.available == true {
         for (index, window) in (account.usage?.windows ?? []).enumerated() {
-            guard window.used_percent > 0, let seconds = window.resets_at else { continue }
+            guard let seconds = window.resets_at else { continue }
             let date = Date(timeIntervalSince1970: seconds)
             guard date > now && date <= end else { continue }
             alerts.append(ResetAlert(id: resetPrefix + account.id + ".\(index).\(Int(seconds))",
+                accountID: account.id, providerID: account.provider,
                 provider: providerNames[account.provider] ?? account.provider, window: window.label, date: date))
         }
     }
     return Array(alerts.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }.prefix(32))
+}
+
+// A provider can roll a used window to the next period before the menu's
+// timer runs. Keep an alert near its reported time while the same account
+// and window still exist, even if usage is already back to zero.
+func reconciledResetAlerts(_ previous: [ResetAlert], state: AppState, now: Date) -> [ResetAlert] {
+    guard state.reset_notifications == true else { return [] }
+    let upcoming = desiredResetAlerts(state, now: now)
+    let carried = previous.filter { alert in
+        let delay = now.timeIntervalSince(alert.date)
+        guard delay >= -resetRolloverLead && delay < resetCatchupInterval,
+              let account = state.accounts.first(where: { $0.id == alert.accountID && $0.provider == alert.providerID }) else {
+            return false
+        }
+        // An unavailable usage response cannot revoke an already planned
+        // reset. A successful response that removed the window can.
+        guard account.usage?.available == true else { return true }
+        return (account.usage?.windows ?? []).contains { $0.label == alert.window }
+    }
+    let carriedIDs = Set(carried.map(\.id))
+    return Array((carried + upcoming.filter { !carriedIDs.contains($0.id) }).prefix(32))
+}
+
+func dueResetAlerts(_ alerts: [ResetAlert], now: Date, delivered: Set<String>, sending: Set<String>) -> [ResetAlert] {
+    alerts.filter { alert in
+        let delay = now.timeIntervalSince(alert.date)
+        return delay >= 0 && delay < resetCatchupInterval && !delivered.contains(alert.id) && !sending.contains(alert.id)
+    }
+}
+
+func recordDeliveredResetAlert(_ id: String, alerts: inout [ResetAlert], delivered: inout Set<String>) {
+    delivered.insert(id)
+    alerts.removeAll { $0.id == id }
 }
 
 let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode",
@@ -542,6 +654,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var deliveredResetIDs = Set<String>()
     private var sendingResetIDs = Set<String>()
     private var permissionRequested = false
+    private var notificationPermission: ResetAlertPermission?
+    private let resetLedgerURL = URL(fileURLWithPath: NSHomeDirectory() + "/.switcher/reset-alerts.json")
+
+    private func persistResetAlerts() {
+        do {
+            try saveResetAlertLedger(ResetAlertLedger(alerts: resetAlerts,
+                deliveredIDs: deliveredResetIDs.sorted()), at: resetLedgerURL)
+        } catch {
+            NSLog("Switcher could not save reset alerts: %@", error.localizedDescription)
+        }
+    }
+
+    private func clearResetAlerts() {
+        if !resetAlerts.isEmpty || !deliveredResetIDs.isEmpty || !sendingResetIDs.isEmpty {
+            resetAlerts = []
+            deliveredResetIDs.removeAll()
+            sendingResetIDs.removeAll()
+            persistResetAlerts()
+        }
+    }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
@@ -551,6 +683,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
         ensureServerRunning()
+        do {
+            let ledger = try loadResetAlertLedger(at: resetLedgerURL)
+            resetAlerts = ledger.alerts
+            deliveredResetIDs = Set(ledger.deliveredIDs)
+        } catch {
+            NSLog("Switcher could not load reset alerts: %@", error.localizedDescription)
+        }
         statusItem.button?.title = "⇄"
         statusItem.button?.toolTip = "Switcher"
         menu.autoenablesItems = false
@@ -618,44 +757,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }.resume()
     }
 
-    // Keep only upcoming windows in memory. Nothing remains queued in macOS
-    // after the app closes or the web preference is turned off.
+    // Persist upcoming and recently due windows. Nothing is pre-queued in
+    // macOS, so disabling alerts still takes effect before delivery.
     func updateResetAlerts() {
         guard let state = cachedState else { return }
         if state.reset_notifications != true {
-            resetAlerts = []
-            deliveredResetIDs.removeAll()
+            clearResetAlerts()
             return
         }
         let now = Date()
-        let upcoming = desiredResetAlerts(state, now: now)
-        // Preserve a just-due window until the delivery timer gets to it,
-        // unless its account or window vanished from the newest snapshot.
-        let currentIDs = Set(state.accounts.flatMap { account in
-            (account.usage?.windows ?? []).enumerated().compactMap { index, window -> String? in
-                guard account.usage?.available == true, window.used_percent > 0,
-                      let seconds = window.resets_at else { return nil }
-                return resetPrefix + account.id + ".\(index).\(Int(seconds))"
-            }
-        })
-        let due = resetAlerts.filter { $0.date <= now && now.timeIntervalSince($0.date) < 75 && currentIDs.contains($0.id) }
-        resetAlerts = due + upcoming
+        resetAlerts = reconciledResetAlerts(resetAlerts, state: state, now: now)
+        deliveredResetIDs.formIntersection(Set(resetAlerts.map(\.id)))
+        persistResetAlerts()
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { [weak self] settings in
-            guard settings.authorizationStatus == .notDetermined else { return }
             DispatchQueue.main.async {
-                guard let self = self, self.cachedState?.reset_notifications == true,
-                      !self.permissionRequested else { return }
+                guard let self = self else { return }
+                let permission = resetAlertPermission(settings)
+                if self.notificationPermission != permission {
+                    self.notificationPermission = permission
+                    if self.menuOpen { self.rebuildMenu() }
+                }
+                guard settings.authorizationStatus == .notDetermined,
+                      self.cachedState?.reset_notifications == true, !self.permissionRequested else { return }
                 self.permissionRequested = true
-                center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                center.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
+                    center.getNotificationSettings { result in
+                        DispatchQueue.main.async {
+                            self?.notificationPermission = resetAlertPermission(result)
+                            if self?.menuOpen == true { self?.rebuildMenu() }
+                        }
+                    }
+                }
             }
         }
     }
 
     func deliverDueResetAlerts() {
-        guard cachedState?.reset_notifications == true, resetAlertsEnabledOnDisk() else { resetAlerts = []; return }
+        guard cachedState?.reset_notifications == true, resetAlertsEnabledOnDisk() else {
+            clearResetAlerts()
+            return
+        }
+        // The state poll refreshes this permission every minute. Do not
+        // hammer the server for a due alert while macOS blocks banners.
+        guard notificationPermission?.canSend == true else { return }
         let now = Date()
-        let due = resetAlerts.filter { $0.date <= now && now.timeIntervalSince($0.date) < 75 && !deliveredResetIDs.contains($0.id) && !sendingResetIDs.contains($0.id) }
+        let due = dueResetAlerts(resetAlerts, now: now, delivered: deliveredResetIDs, sending: sendingResetIDs)
         guard !due.isEmpty else { return }
         // Read the server's current preference immediately before delivery.
         // If it is unavailable, skip the alert rather than risk showing one
@@ -684,7 +831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
+                guard resetAlertPermission(settings).canSend,
                       self.cachedState?.reset_notifications == true, resetAlertsEnabledOnDisk() else {
                     for alert in due { self.sendingResetIDs.remove(alert.id) }
                     return
@@ -698,8 +845,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: alert.id,
                         content: content, trigger: nil)) { [weak self] error in
                         DispatchQueue.main.async {
-                            self?.sendingResetIDs.remove(alert.id)
-                            if error == nil { self?.deliveredResetIDs.insert(alert.id) }
+                            guard let self = self else { return }
+                            self.sendingResetIDs.remove(alert.id)
+                            if let error = error {
+                                NSLog("Switcher reset alert delivery failed: %@", error.localizedDescription)
+                            } else {
+                                recordDeliveredResetAlert(alert.id, alerts: &self.resetAlerts,
+                                    delivered: &self.deliveredResetIDs)
+                                self.persistResetAlerts()
+                            }
                         }
                     }
                 }
@@ -860,6 +1014,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         toggle.onChanged = { [weak self] _ in self?.toggleStartAtLogin() }
         toggleCard.addSubview(toggle)
         menu.addItem(menuItemWithView(centered(toggleCard, verticalPadding: 4)))
+
+        if state?.reset_notifications == true {
+            let statusItem = NSMenuItem(title: notificationPermission?.message ?? "Checking notification permission",
+                action: nil, keyEquivalent: "")
+            statusItem.isEnabled = false
+            menu.addItem(statusItem)
+            let testItem = NSMenuItem(title: "Send test reset alert", action: #selector(testResetAlert), keyEquivalent: "")
+            testItem.target = self
+            testItem.isEnabled = notificationPermission?.canSend == true
+            menu.addItem(testItem)
+        }
 
         let quitItem = NSMenuItem(title: "Quit Switcher", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
@@ -1041,6 +1206,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
+    @objc func testResetAlert() {
+        guard cachedState?.reset_notifications == true else { return }
+        sendTestResetAlert { error in
+            if let error = error { NSLog("Switcher test alert failed: %@", error) }
+        }
+    }
+
     @objc func quit() {
         if let process = serverProcess, process.isRunning { process.terminate() }
         NSApp.terminate(nil)
@@ -1078,6 +1250,35 @@ func centered(_ card: NSView, verticalPadding: CGFloat = 0) -> NSView {
 @main
 struct SwitcherApp {
     static func main() {
+        if CommandLine.arguments.dropFirst() == ["--notification-status"] {
+            let done = DispatchSemaphore(value: 0)
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                let status = resetAlertPermission(settings)
+                FileHandle.standardOutput.write(Data((status.message + "\n").utf8))
+                done.signal()
+            }
+            guard done.wait(timeout: .now() + 5) == .success else {
+                FileHandle.standardError.write(Data("Could not read macOS notification settings\n".utf8))
+                exit(1)
+            }
+            return
+        }
+        if CommandLine.arguments.dropFirst() == ["--test-notification"] {
+            let done = DispatchSemaphore(value: 0)
+            sendTestResetAlert { error in
+                if let error = error {
+                    FileHandle.standardError.write(Data((error + "\n").utf8))
+                    exit(1)
+                }
+                FileHandle.standardOutput.write(Data("Reset test alert accepted by macOS\n".utf8))
+                done.signal()
+            }
+            guard done.wait(timeout: .now() + 5) == .success else {
+                FileHandle.standardError.write(Data("Reset test alert timed out\n".utf8))
+                exit(1)
+            }
+            return
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

@@ -383,8 +383,17 @@ function compactAccountHTML(account) {
 }
 
 function accountMenuHTML(account) {
+  const mode = account.auto_use_reset || 'global';
+  const labels = { global: 'Global', on: 'On', off: 'Off' };
   return `
     ${account.reset_credits?.count > 0 ? `<button type="button" role="menuitem" data-act="use-reset" data-account-id="${escapeHTML(account.id)}">Use reset</button>` : ''}
+    ${account.supports_banked_resets ? `
+      <div class="menu-auto-reset" role="group" aria-label="Auto-use reset, currently ${account.auto_use_reset_effective ? 'on' : 'off'}">
+        <span class="menu-group-label">Auto-use reset · ${account.auto_use_reset_effective ? 'on' : 'off'}</span>
+        <div class="menu-chips">
+          ${['global', 'on', 'off'].map(v => `<button type="button" role="menuitemradio" aria-checked="${mode === v}" data-act="auto-reset" data-mode="${v}" data-account-id="${escapeHTML(account.id)}">${labels[v]}</button>`).join('')}
+        </div>
+      </div>` : ''}
     ${ADD_METHOD[account.provider] === 'key' ? '' : `<button type="button" role="menuitem" data-act="relogin" data-provider="${escapeHTML(account.provider)}" data-account-id="${escapeHTML(account.id)}">Relogin</button>`}
     <button type="button" role="menuitem" data-act="delete" data-account-id="${escapeHTML(account.id)}">Remove</button>`;
 }
@@ -664,6 +673,25 @@ async function runAccountAction(button) {
       };
       toast(outcomes[res.outcome] || 'Done');
       await refreshState();
+    } else if (button.dataset.act === 'auto-reset') {
+      const mode = button.dataset.mode;
+      button.disabled = true;
+      try {
+        await api(`/api/accounts/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ auto_use_reset: mode }),
+        });
+        const messages = {
+          global: 'Auto-use reset: follow the global setting',
+          on: 'Will use a banked reset when this account is out',
+          off: 'Will not use banked resets automatically',
+        };
+        toast(messages[mode] || 'Saved');
+        await refreshState();
+      } finally {
+        button.disabled = false;
+      }
     } else if (button.dataset.act === 'delete') {
       const mail = data.accounts.find(a => a.id === id)?.email || 'This account';
       const yes = await confirmDialog({
@@ -1601,9 +1629,11 @@ function cliSetupRowHTML(client) {
   }
   return `<div class="settings-row cli-setup-row" data-cli-target="${escapeHTML(client.id)}">
     <div><strong>${escapeHTML(client.name)}</strong><span class="dim"> · ${escapeHTML(summary)}</span>
-      <p class="cli-setup-evidence">${escapeHTML(count)} · ${escapeHTML(detail)}</p>
-      ${!codex ? `<p class="cli-setup-reason">${escapeHTML(readiness)}</p>` : ''}
-      ${codex ? `<p class="cli-setup-evidence">${escapeHTML(routeTest)}</p>` : ''}</div>
+      <details class="cli-setup-details"><summary>${escapeHTML(count)}</summary>
+        <p class="cli-setup-evidence">${escapeHTML(detail)}</p>
+        ${!codex ? `<p class="cli-setup-reason">${escapeHTML(readiness)}</p>` : ''}
+        ${codex ? `<p class="cli-setup-evidence">${escapeHTML(routeTest)}</p>` : ''}
+      </details></div>
     ${actions.length ? `<div class="cli-setup-actions">${actions.join('')}</div>` : ''}
   </div>`;
 }
@@ -1617,14 +1647,22 @@ async function renderSettings() {
   }
   settingsPage.innerHTML = `
     <div class="settings-grid">
-      <div class="settings-card">
-        <h2>CLI setup</h2>
-        <p class="settings-sub">A Switcher account is separate from a CLI's login and configuration. Automatic status checks only read local files; the optional Codex route test uses quota and does not run the native CLI.</p>
-        <div id="cli-setup-list"><p class="settings-sub">Checking local configuration…</p></div>
-        <div class="sr-only" id="cli-setup-announcer" role="status"></div>
-        <p class="settings-sub">CLI installation and native requests are not checked here. Other clients get a setup action only after their routing is validated.</p>
-        <button id="codex-setup-check" type="button">Check again</button>
-      </div>
+      <details class="settings-card cli-setup-card" id="cli-setup-card">
+        <summary class="cli-setup-summary">
+          <span class="cli-setup-summary-text">
+            <strong>CLI setup</strong>
+            <span class="dim" id="cli-setup-status">Checking local configuration…</span>
+          </span>
+          <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </summary>
+        <div class="cli-setup-body">
+          <p class="settings-sub">A Switcher account is separate from a CLI's login and configuration. Status checks only read local files; the optional Codex route test uses quota and does not run the native CLI.</p>
+          <div id="cli-setup-list"><p class="settings-sub">Checking local configuration…</p></div>
+          <div class="sr-only" id="cli-setup-announcer" role="status"></div>
+          <p class="settings-sub">CLI installation and native requests are not checked here. Other clients get a setup action only after their routing is validated.</p>
+          <button id="codex-setup-check" type="button">Check again</button>
+        </div>
+      </details>
       <div class="settings-card">
         <h2>Display</h2>
         <div class="settings-row">
@@ -1632,6 +1670,14 @@ async function renderSettings() {
           <label class="switch-wrap"><input type="checkbox" id="compact-accounts" aria-label="Show compact account cards" ${status.compact_accounts ? 'checked' : ''}><span class="switch-visual"></span></label>
         </div>
         <p class="settings-sub">Providers with several accounts show cards in two columns when space allows. Reset times and account actions stay available; single accounts fill the row.</p>
+      </div>
+      <div class="settings-card">
+        <h2>Banked resets</h2>
+        <div class="settings-row">
+          <div><strong>Use automatically</strong><span class="dim"> · when an account is out of usage</span></div>
+          <label class="switch-wrap"><input type="checkbox" id="auto-use-reset" aria-label="Use a banked reset automatically when an account is out of usage" ${status.auto_use_reset ? 'checked' : ''}><span class="switch-visual"></span></label>
+        </div>
+        <p class="settings-sub">Switcher fails over to another usable account first. Only when there is nowhere to go does it spend one banked reset and retry the same account. Any account can override this in its ⋯ menu.</p>
       </div>
       <div class="settings-card">
         <h2>Security</h2>
@@ -1675,20 +1721,28 @@ async function renderSettings() {
           <div><strong>Reset alerts</strong><span class="dim"> · at provider-reported usage reset times</span></div>
           <label class="switch-wrap"><input type="checkbox" id="reset-notifications" aria-label="Notify when a usage window is due to reset" ${status.reset_notifications ? 'checked' : ''}><span class="switch-visual"></span></label>
         </div>
-        <p class="settings-sub">Requires the Switcher menu bar app to be running and macOS notification permission. If permission was denied, allow Switcher in System Settings → Notifications. Alerts fire at the reported time only while the app is running.</p>
+        <p class="settings-sub">Requires the Switcher menu bar app and macOS notification permission. The menu shows delivery status and has a test alert. Focus can send banners to Notification Center instead. Switcher remembers resets across app restarts and catches up within a day after sleep.</p>
       </div>
     </div>`;
 
   const setupList = settingsPage.querySelector('#cli-setup-list');
   const setupAnnouncer = settingsPage.querySelector('#cli-setup-announcer');
+  const setupStatus = settingsPage.querySelector('#cli-setup-status');
   async function checkCLISetup() {
     try {
       const { clients } = await api('/api/cli-setup');
       if (!Array.isArray(clients)) throw new Error('This Switcher server cannot inspect other CLIs yet');
       setupList.innerHTML = clients.map(cliSetupRowHTML).join('');
+      // One glanceable line while the card is collapsed; the rows below hold
+      // the long diagnostics.
+      const ready = clients.filter(c => c.configuration?.condition === 'ready').length;
+      setupStatus.textContent = ready > 0
+        ? `${ready} configured · ${clients.length - ready} awaiting native validation`
+        : `${clients.length} awaiting native validation`;
       setupAnnouncer.textContent = 'CLI setup checked';
     } catch (err) {
       setupList.textContent = `Could not check CLI setup: ${err.message}`;
+      setupStatus.textContent = 'Could not check local configuration';
       setupAnnouncer.textContent = 'Could not check CLI setup';
     }
   }
@@ -1779,6 +1833,25 @@ async function renderSettings() {
       toast(err.message);
     } finally {
       resetNotifications.disabled = false;
+    }
+  });
+
+  const autoUseReset = settingsPage.querySelector('#auto-use-reset');
+  autoUseReset?.addEventListener('change', async () => {
+    const enabled = autoUseReset.checked;
+    autoUseReset.disabled = true;
+    try {
+      await api('/api/settings', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_use_reset: enabled }),
+      });
+      await refreshState();
+      toast(enabled ? 'Banked resets will be used when an account is out' : 'Banked resets stay manual');
+    } catch (err) {
+      autoUseReset.checked = !enabled;
+      toast(err.message);
+    } finally {
+      autoUseReset.disabled = false;
     }
   });
 

@@ -75,10 +75,15 @@ required; OpenCode Go uses its own API key.
   minutes; Recheck can try sooner. This does not affect request routing.
 - **Reset alerts**: opt in under Settings → Menu bar to receive macOS
   notifications at provider-reported usage-window reset times. Switcher
-  delivers them while the menu bar app is running and macOS has granted
-  notification permission. No alerts are queued after the app closes. An
-  alert marks the reported time, not a verified return of quota; denied
-  permission can be changed in System Settings.
+  remembers pending alerts across menu app restarts and catches up within a
+  day after sleep. The menu shows macOS permission status and offers a test
+  alert. Delivery requires the menu bar app to be running and macOS to allow
+  notifications. Even unused windows with a reported reset time can alert.
+  Nothing is pre-queued in macOS; an alert marks the reported time, not a
+  verified return of quota. Focus can route a banner to Notification Center
+  instead. Check permission from Terminal with
+  `/Applications/Switcher.app/Contents/MacOS/Switcher --notification-status`.
+  To send one test alert, use `--test-notification` instead.
 - **Cost and tokens**: a Usage tab that reads the provider CLIs' own
   session logs (like ccusage does) and prices them with LiteLLM rates:
   daily cost chart, per-provider and per-model breakdowns, cache savings.
@@ -90,6 +95,12 @@ required; OpenCode Go uses its own API key.
   the account in place, keeping its id, active slot, and history.
 - **Banked resets**: Codex usage-limit resets can be spent from the UI. A
   compact count appears beside the account plan in the web UI and menu bar.
+  **Auto-use** can spend one automatically when an account runs out, as a
+  last resort after failover finds no other usable account. It is off by
+  default: enable it under Settings → Banked resets, or override it per
+  account from the account's ⋯ menu (Global / On / Off). At most one credit
+  is spent per request, and an account is not auto-reset again for five
+  minutes, so a client retry loop cannot drain every banked reset.
 - **Account actions**: Recheck and account switching stay on the account card.
   Use the ⋯ menu for a banked reset, relogin, or removal.
 - **Compact account view**: a single switch under Settings → Display puts

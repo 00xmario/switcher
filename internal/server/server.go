@@ -79,6 +79,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/tokens/refresh", a.handleUsageRefresh)
 	mux.HandleFunc("POST /api/accounts", a.handleAddKey)
 	mux.HandleFunc("POST /api/accounts/{id}/use-reset", a.handleUseReset)
+	mux.HandleFunc("PATCH /api/accounts/{id}", a.handleAccountPatch)
 	mux.HandleFunc("POST /api/update", a.handleUpdate)
 	mux.HandleFunc("PATCH /api/providers/order", a.handleProviderOrder)
 	mux.HandleFunc("POST /api/providers/{id}/hide", a.handleProviderHide)
@@ -340,6 +341,27 @@ type accountView struct {
 	Usage          *provider.Usage   `json:"usage,omitempty"`
 	Health         proxy.Health      `json:"health"`
 	ResetCredits   *resetCreditsView `json:"reset_credits,omitempty"`
+	// SupportsBankedResets is true for providers that bank usage-limit
+	// resets (codex), so the UI can offer the auto-use preference even when
+	// the account currently has none.
+	SupportsBankedResets bool `json:"supports_banked_resets,omitempty"`
+	// AutoUseReset is the per-account override: "global", "on", or "off".
+	AutoUseReset string `json:"auto_use_reset"`
+	// AutoUseResetEffective is the resolved policy after applying the
+	// global preference to the override.
+	AutoUseResetEffective bool `json:"auto_use_reset_effective"`
+}
+
+// autoUseResetMode renders a per-account override for the API.
+func autoUseResetMode(a store.Account) string {
+	switch {
+	case a.AutoUseReset == nil:
+		return "global"
+	case *a.AutoUseReset:
+		return "on"
+	default:
+		return "off"
+	}
 }
 
 // resetCreditsView surfaces banked usage-limit resets (codex).
@@ -375,6 +397,33 @@ func (a *API) viewOf(acc store.Account) accountView {
 	return v
 }
 
+// viewOfBase builds the parts of an account view that need no upstream
+// round trip, so login and import responses carry the same contract as
+// /api/state.
+func viewOfBase(a *API, acc store.Account) accountView {
+	v := accountView{
+		ID:          acc.ID,
+		Provider:    acc.Provider,
+		Email:       acc.Email,
+		Plan:        acc.Plan,
+		Active:      acc.ID == a.Proxy.ActiveID(acc.Provider),
+		LastRefresh: acc.LastRefresh,
+		Health:      a.Proxy.AccountHealth(acc.ID),
+	}
+	_, v.SupportsBankedResets = a.Providers[acc.Provider].(provider.ResetCreditProvider)
+	v.AutoUseReset = autoUseResetMode(acc)
+	global := a.Settings != nil && a.Settings.Load().AutoUseReset
+	v.AutoUseResetEffective = acc.AutoUseResetEnabled(global)
+	if until, ok := a.Proxy.Exhausted(acc.ID); ok {
+		v.ExhaustedUntil = until.Unix()
+	}
+	if usage, ok := a.Proxy.LastUsage(acc.ID); ok {
+		u := usage
+		v.Usage = &u
+	}
+	return v
+}
+
 // resetCreditsTTL is how long a banked-reset count stays fresh.
 const resetCreditsTTL = 2 * time.Minute
 
@@ -395,26 +444,6 @@ func (a *API) cachedResetCredits(rc provider.ResetCreditProvider, acc store.Acco
 		a.creditsMu.Unlock()
 	}()
 	return entry.credits, entry.ok
-}
-
-func viewOfBase(a *API, acc store.Account) accountView {
-	v := accountView{
-		ID:          acc.ID,
-		Provider:    acc.Provider,
-		Email:       acc.Email,
-		Plan:        acc.Plan,
-		Active:      acc.ID == a.Proxy.ActiveID(acc.Provider),
-		LastRefresh: acc.LastRefresh,
-		Health:      a.Proxy.AccountHealth(acc.ID),
-	}
-	if until, ok := a.Proxy.Exhausted(acc.ID); ok {
-		v.ExhaustedUntil = until.Unix()
-	}
-	if usage, ok := a.Proxy.LastUsage(acc.ID); ok {
-		u := usage
-		v.Usage = &u
-	}
-	return v
 }
 
 func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
@@ -565,6 +594,7 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		"menu_usage_bars":     a.Settings.MenuUsageBars(),
 		"reset_notifications": st.ResetNotifications,
 		"compact_accounts":    st.CompactAccounts,
+		"auto_use_reset":      st.AutoUseReset,
 		"bind_lan":            st.BindLAN,
 		"lan_active":          LANListenerActive(),
 		"tls":                 st.TLS,
@@ -759,6 +789,7 @@ func (a *API) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"menu_usage_bars":     a.Settings.MenuUsageBars(),
 		"reset_notifications": st.ResetNotifications,
 		"compact_accounts":    st.CompactAccounts,
+		"auto_use_reset":      st.AutoUseReset,
 	})
 }
 
@@ -772,6 +803,7 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		MenuUsageBars      *bool `json:"menu_usage_bars"`
 		ResetNotifications *bool `json:"reset_notifications"`
 		CompactAccounts    *bool `json:"compact_accounts"`
+		AutoUseReset       *bool `json:"auto_use_reset"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -803,6 +835,11 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.CompactAccounts != nil {
 			st.CompactAccounts = *body.CompactAccounts
+		}
+		// A routing preference takes effect on the next exhausted request,
+		// so it never restarts the listeners.
+		if body.AutoUseReset != nil {
+			st.AutoUseReset = *body.AutoUseReset
 		}
 		return nil
 	})
@@ -1094,6 +1131,65 @@ func (a *API) handleProviderShow(w http.ResponseWriter, r *http.Request) {
 	a.Proxy.ShowProvider(id)
 	order, hidden := a.Proxy.Providers()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "order": order, "hidden": hidden})
+}
+
+// handleAccountPatch stores per-account preferences. Today that is the
+// banked-reset auto-use override: "global" clears the override so the
+// account follows the global preference again, while "on" and "off" force
+// the behavior for this one account.
+func (a *API) handleAccountPatch(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validID(id) {
+		http.Error(w, "invalid account id", http.StatusBadRequest)
+		return
+	}
+	if _, err := a.Store.Get(id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such account"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	var body struct {
+		AutoUseReset *string `json:"auto_use_reset"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if body.AutoUseReset != nil {
+		mode := *body.AutoUseReset
+		if mode != "global" && mode != "on" && mode != "off" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "auto_use_reset must be global, on, or off"})
+			return
+		}
+		// Written under the same per-account lock token rotation uses, so a
+		// concurrent refresh cannot be reverted by a stale save.
+		err := a.Proxy.UpdateAccount(id, func(account *store.Account) error {
+			switch mode {
+			case "global":
+				account.AutoUseReset = nil
+			case "on":
+				yes := true
+				account.AutoUseReset = &yes
+			default:
+				no := false
+				account.AutoUseReset = &no
+			}
+			return nil
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	account, err := a.Store.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": a.viewOf(account)})
 }
 
 // handleUseReset redeems one banked reset for the account and clears its

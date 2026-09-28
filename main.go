@@ -125,6 +125,12 @@ func run(port int) {
 	}
 
 	settingsStore := settings.New(config.Dir())
+	// Spend a banked reset only when the user allows it: the per-account
+	// override wins over the global preference, and the feature is off
+	// until one of them is turned on.
+	proxyManager.SetAutoUseResetPolicy(func(a store.Account) bool {
+		return a.AutoUseResetEnabled(settingsStore.Load().AutoUseReset)
+	})
 	// The device token exists for the menu bar app as soon as auth is on.
 	if settingsStore.Enabled() {
 		_, _ = settingsStore.EnsureDeviceToken()

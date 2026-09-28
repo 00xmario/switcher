@@ -34,6 +34,12 @@ const maxBodyBytes = 64 << 20
 // 429. A user-initiated Recheck may still try immediately.
 const usageRateLimitCooldown = 5 * time.Minute
 
+// autoUseResetCooldown is how long an account waits before Switcher may
+// spend another banked reset for it automatically. It bounds credit burn
+// when a redeemed reset does not actually lift the limit. The manual
+// "Use reset" action is unaffected.
+const autoUseResetCooldown = 5 * time.Minute
+
 // errNoAccount is the message returned when nothing can serve a request.
 var errNoAccount = errors.New("no usable account is active; add one in the Switcher UI")
 
@@ -87,6 +93,14 @@ type Manager struct {
 	order             []string // display order of provider sections
 	hidden            []string // providers dismissed from the UI
 	managementKey     string   // hub management key, kept in state.json
+	// autoUseReset reports whether an exhausted account may spend a banked
+	// reset to stay in rotation. Nil means the feature is off: the proxy
+	// never spends credits unless the server wires the user's preference in.
+	autoUseReset func(store.Account) bool
+	// autoResetAt throttles automatic redemptions per account so a client
+	// retry loop cannot drain every banked reset on a limit that a reset
+	// does not actually clear.
+	autoResetAt map[string]time.Time
 }
 
 // New loads persisted state and returns the proxy manager. registration is
@@ -145,6 +159,7 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		health:            map[string]*healthState{},
 		generation:        map[string]uint64{},
 		accountRevision:   map[string]uint64{},
+		autoResetAt:       map[string]time.Time{},
 		selectionRevision: map[string]uint64{},
 		probeBootID:       hex.EncodeToString(boot[:]),
 		order:             order,
@@ -325,6 +340,12 @@ func (m *Manager) ReplaceAccount(a store.Account) error {
 	lock := m.refreshLock(a.ID)
 	lock.Lock()
 	defer lock.Unlock()
+	// Replacing credentials must not silently drop the user's per-account
+	// preferences: provider-built accounts never carry them, so keep the
+	// ones already on disk.
+	if existing, err := m.store.Get(a.ID); err == nil {
+		a.AutoUseReset = existing.AutoUseReset
+	}
 	return m.saveAccount(a)
 }
 
@@ -343,7 +364,29 @@ func (m *Manager) ReplaceReloginAccount(a *store.Account, target string) error {
 		return ErrReloginIdentityMismatch
 	}
 	a.ID = existing.ID
+	// A relogin refreshes credentials only. Keep the account's per-account
+	// preferences, which the provider never sets.
+	a.AutoUseReset = existing.AutoUseReset
 	return m.saveAccount(*a)
+}
+
+// UpdateAccount applies a per-account preference under the same lock token
+// rotation uses, so a concurrent refresh cannot be reverted by a stale save.
+// Credentials and cached usage are untouched: only the record changes.
+func (m *Manager) UpdateAccount(id string, mutate func(*store.Account) error) error {
+	lock := m.refreshLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	a, err := m.store.Get(id)
+	if err != nil {
+		return err
+	}
+	if err := mutate(&a); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.Save(a)
 }
 
 func (m *Manager) saveAccount(a store.Account) error {
@@ -769,6 +812,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	refreshed := map[string]bool{}
+	usedAutoReset := false
 	for attempt := 0; attempt < 4; attempt++ {
 		account, pickErr := m.pick(providerID)
 		if pickErr != nil {
@@ -816,9 +860,17 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("proxy: %s exhausted until %s", account.Email, until.Format(time.RFC3339))
 			m.markExhausted(account.ID, until)
+			// Failover first: another usable account costs nothing extra,
+			// while a banked reset is a finite credit.
 			if next := m.nextAvailable(account.ID, providerID); next != "" {
 				m.setActive(providerID, next)
 				continue // transparent retry on the new account
+			}
+			// Last resort: with nowhere to fail over, spend one of this
+			// account's banked resets and retry the same account.
+			if !usedAutoReset && m.autoUseBankedReset(r.Context(), prov, account) {
+				usedAutoReset = true
+				continue
 			}
 			writeJSON(w, resp.StatusCode, map[string]any{
 				"error": map[string]any{
@@ -941,6 +993,75 @@ func (m *Manager) markExhausted(id string, until time.Time) {
 	m.exhausted[id] = until
 	if err := m.persistLocked(); err != nil {
 		log.Printf("proxy: persist exhaustion: %v", err)
+	}
+}
+
+// SetAutoUseResetPolicy wires the user's preference for spending a banked
+// reset when an account runs out of usage. The resolver receives the
+// exhausted account so a per-account override can win over the global
+// setting. Passing nil (the zero value) disables the feature entirely.
+func (m *Manager) SetAutoUseResetPolicy(resolver func(store.Account) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.autoUseReset = resolver
+}
+
+// autoUseBankedReset redeems one banked reset for an exhausted account and
+// lifts its local park so the request can retry on the same account. It is
+// a last resort: callers only reach it after failover found no other usable
+// account. Returns true when the account is ready to serve again. At most
+// one credit is spent per resolution, and a provider without banked resets
+// (or a user who left the feature off) is never touched.
+func (m *Manager) autoUseBankedReset(ctx context.Context, prov provider.Provider, account store.Account) bool {
+	m.mu.Lock()
+	resolver := m.autoUseReset
+	cooldownUntil := m.autoResetAt[account.ID]
+	m.mu.Unlock()
+	if resolver == nil || !resolver(account) {
+		return false
+	}
+	if time.Now().Before(cooldownUntil) {
+		// A recent automatic redemption did not lift the limit. Do not burn
+		// the rest of this account's banked resets on the same problem.
+		return false
+	}
+	rc, ok := prov.(provider.ResetCreditProvider)
+	if !ok {
+		return false
+	}
+	// Serialize per account so a burst of concurrent requests cannot spend
+	// one credit each: whoever wins the lock lifts the park and the rest
+	// retry without redeeming anything.
+	lock := m.refreshLock(account.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if _, stillExhausted := m.Exhausted(account.ID); !stillExhausted {
+		return true
+	}
+	credits, err := rc.ListResetCredits(ctx, account)
+	if err != nil {
+		log.Printf("proxy: list banked resets for %s: %v", account.Email, err)
+		return false
+	}
+	if len(credits) == 0 {
+		return false
+	}
+	outcome, err := rc.ConsumeResetCredit(ctx, account, credits[0].ID)
+	if err != nil {
+		log.Printf("proxy: auto-use banked reset for %s: %v", account.Email, err)
+		return false
+	}
+	switch outcome {
+	case "reset", "already_redeemed":
+		log.Printf("proxy: auto-used a banked reset for %s (%s)", account.Email, outcome)
+		m.mu.Lock()
+		m.autoResetAt[account.ID] = time.Now().Add(autoUseResetCooldown)
+		m.mu.Unlock()
+		m.ClearExhausted(account.ID)
+		return true
+	default:
+		log.Printf("proxy: banked reset for %s did not clear the limit (%s)", account.Email, outcome)
+		return false
 	}
 }
 

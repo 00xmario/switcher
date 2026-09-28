@@ -99,3 +99,25 @@ func TestDeleteMissingIsIdempotent(t *testing.T) {
 		t.Fatalf("delete of missing account must not fail: %v", err)
 	}
 }
+
+func TestAutoUseResetOverrideBeatsGlobal(t *testing.T) {
+	yes, no := true, false
+	for _, tc := range []struct {
+		name     string
+		override *bool
+		global   bool
+		want     bool
+	}{
+		{"forced on beats global off", &yes, false, true},
+		{"forced off beats global on", &no, true, false},
+		{"no override follows global on", nil, true, true},
+		{"no override follows global off", nil, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := Account{ID: "a", AutoUseReset: tc.override}
+			if got := a.AutoUseResetEnabled(tc.global); got != tc.want {
+				t.Fatalf("AutoUseResetEnabled(%t) = %t, want %t", tc.global, got, tc.want)
+			}
+		})
+	}
+}

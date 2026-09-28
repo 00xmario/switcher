@@ -278,4 +278,56 @@ assert.match(cliContext.cliSetupRowHTML({ ...codexEvidence,
   verification: { condition: 'historical', last_success: reset, model: 'gpt-5.5' } }),
   /Historical Switcher route test:/);
 
+// Auto-use banked reset is a three-way per-account choice, offered only for
+// providers that actually bank resets.
+const autoAccount = { id: 'auto-id', provider: 'codex', supports_banked_resets: true,
+  auto_use_reset: 'on', auto_use_reset_effective: true };
+const autoMenu = accountContext.accountMenuHTML(autoAccount);
+assert.match(autoMenu, /role="group" aria-label="Auto-use reset, currently on"/);
+assert.match(autoMenu, /Auto-use reset · on/);
+assert.equal((autoMenu.match(/data-act="auto-reset"/g) || []).length, 3,
+  'the menu must offer exactly Global, On, and Off');
+assert.match(autoMenu, /role="menuitemradio" aria-checked="true" data-act="auto-reset" data-mode="on"/);
+assert.match(autoMenu, /role="menuitemradio" aria-checked="false" data-act="auto-reset" data-mode="global"/);
+assert.match(autoMenu, /role="menuitemradio" aria-checked="false" data-act="auto-reset" data-mode="off"/);
+assert.match(autoMenu, /data-account-id="auto-id"/);
+const followingGlobal = accountContext.accountMenuHTML({ id: 'auto-id', provider: 'codex',
+  supports_banked_resets: true, auto_use_reset: 'global', auto_use_reset_effective: false });
+assert.match(followingGlobal, /Auto-use reset · off/);
+assert.match(followingGlobal, /role="group" aria-label="Auto-use reset, currently off"/);
+assert.match(followingGlobal, /aria-checked="true" data-act="auto-reset" data-mode="global"/);
+// A provider that cannot bank resets gets no auto-use control at all.
+assert.doesNotMatch(accountContext.accountMenuHTML({ id: 'plain', provider: 'codex' }),
+  /auto-reset|Auto-use reset/);
+// With no banked reset there is nothing to spend, so the manual "Use reset"
+// action stays hidden even though the preference control is shown.
+const noCredits = accountContext.accountMenuHTML({ id: 'plain', provider: 'codex',
+  supports_banked_resets: true, auto_use_reset: 'off' });
+assert.match(noCredits, /Auto-use reset · off/);
+assert.doesNotMatch(noCredits, /data-act="use-reset"/);
+assert.doesNotMatch(accountContext.accountMenuHTML({ id: 'a"b', provider: 'codex',
+  supports_banked_resets: true, auto_use_reset: 'on' }), /data-account-id="a"b"/,
+  'account ids in the auto-reset chips must go through escapeHTML');
+
+// CLI setup must stay collapsed on the settings page while keeping every
+// piece of evidence reachable in the markup the tests above assert on.
+assert.match(source, /<details class="settings-card cli-setup-card" id="cli-setup-card">/);
+assert.match(source, /id="cli-setup-status"/);
+assert.doesNotMatch(source, /<h2>CLI setup<\/h2>/, 'the CLI setup heading must live in the summary');
+assert.match(source, /<details class="cli-setup-details"><summary>/);
+{
+  const summaryAt = source.indexOf('<summary class="cli-setup-summary">');
+  const bodyAt = source.indexOf('class="cli-setup-body"');
+  assert.ok(summaryAt > 0 && bodyAt > summaryAt, 'the summary must wrap the collapsed body');
+  // The controls have to stay in the DOM inside the body, or the existing
+  // querySelector wiring and click delegation would silently break.
+  for (const id of ['#cli-setup-list', '#cli-setup-announcer', '#codex-setup-check']) {
+    const at = source.indexOf(`id="${id.slice(1)}"`);
+    assert.ok(at > bodyAt, `${id} must stay inside the collapsed CLI setup body`);
+  }
+  assert.ok(source.indexOf('id="cli-setup-status"', summaryAt) > 0 &&
+    source.indexOf('id="cli-setup-status"', summaryAt) < bodyAt,
+  'the status line must live in the summary so it is visible while collapsed');
+}
+
 console.log('State ordering and fast Recheck reconciliation: OK');

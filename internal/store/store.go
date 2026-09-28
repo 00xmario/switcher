@@ -36,6 +36,20 @@ type Account struct {
 	Token       Token  `json:"token"`
 	CreatedAt   int64  `json:"created_at"`
 	LastRefresh int64  `json:"last_refresh,omitempty"`
+	// AutoUseReset is the per-account override for spending a banked reset
+	// when this account runs out of usage. Nil means "follow the global
+	// preference"; true and false force the behavior for this account.
+	AutoUseReset *bool `json:"auto_use_reset,omitempty"`
+}
+
+// AutoUseResetEnabled resolves the effective policy for spending a banked
+// reset on this account: the per-account override wins, otherwise the
+// global preference applies.
+func (a Account) AutoUseResetEnabled(global bool) bool {
+	if a.AutoUseReset != nil {
+		return *a.AutoUseReset
+	}
+	return global
 }
 
 // State is the persisted routing state: the active account per provider,

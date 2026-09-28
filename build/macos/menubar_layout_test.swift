@@ -1,4 +1,5 @@
 import AppKit
+import UserNotifications
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data((message + "\n").utf8))
@@ -112,8 +113,145 @@ struct MenuBarLayoutTest {
                 update: nil, menu_usage_bars: nil, reset_notifications: enabled)
         }
         let alerts = desiredResetAlerts(state([base], true), now: Date(timeIntervalSince1970: now))
-        guard alerts.count == 1, alerts[0].window == "Session", !alerts[0].id.contains("private") else {
-            fail("Reset planner included unused/past/unknown windows or private identity")
+        guard alerts.map(\.window) == ["Session", "Weekly"], !alerts[0].id.contains("private") else {
+            fail("Reset planner omitted a zero-used window or included past/unknown windows or private identity")
+        }
+        let unused = Account(id: "unused-codex", provider: "codex", email: "", plan: nil,
+            active: false, exhausted_until: nil, usage: Usage(available: true,
+                windows: [UsageWindow(label: "Weekly", used_percent: 0,
+                    resets_at: now + 3600)]), reset_credits: nil)
+        guard desiredResetAlerts(state([unused], true), now: Date(timeIntervalSince1970: now)).count == 1 else {
+            fail("A zero-used Codex window reset without an opted-in alert")
+        }
+        guard resetAlertPermission(.authorized, alertSetting: .enabled,
+                  alertStyle: .banner, centerSetting: .enabled).canSend,
+              resetAlertPermission(.authorized, alertSetting: .disabled,
+                  alertStyle: .none, centerSetting: .enabled).message.contains("Notification Center"),
+              !resetAlertPermission(.authorized, alertSetting: .disabled,
+                  alertStyle: .none, centerSetting: .disabled).canSend,
+              !resetAlertPermission(.denied, alertSetting: .disabled,
+                  alertStyle: .none, centerSetting: .disabled).canSend,
+              resetAlertPermission(.provisional, alertSetting: .enabled,
+                  alertStyle: .none, centerSetting: .enabled).message.contains("quietly") else {
+            fail("macOS banner, quiet, or blocked delivery was reported incorrectly")
+        }
+        // The server can poll Codex again just as the reset rolls over. Its
+        // new snapshot has a zeroed window and next week's reset timestamp,
+        // before the menu's delivery timer has fired for the old timestamp.
+        let before = Account(id: "codex-reset", provider: "codex", email: "private@example.com", plan: nil,
+            active: true, exhausted_until: nil, usage: Usage(available: true,
+                windows: [UsageWindow(label: "Weekly", used_percent: 25,
+                    resets_at: now + 3600)]), reset_credits: nil)
+        let planned = desiredResetAlerts(state([before], true), now: Date(timeIntervalSince1970: now))
+        guard planned.count == 1 else { fail("Expected one Codex reset alert before rollover") }
+        let rolled = Account(id: before.id, provider: "codex", email: "", plan: nil,
+            active: true, exhausted_until: nil, usage: Usage(available: true,
+                windows: [UsageWindow(label: "Weekly", used_percent: 0,
+                    resets_at: now + 3600 + 7 * 86400)]), reset_credits: nil)
+        let afterReset = Date(timeIntervalSince1970: now + 3602)
+        let retained = reconciledResetAlerts(planned, state: state([rolled], true), now: afterReset)
+        let afterDeliveryCheck = reconciledResetAlerts(retained, state: state([rolled], true),
+            now: afterReset.addingTimeInterval(1))
+        let rechecked = reconciledResetAlerts(
+            reconciledResetAlerts(planned, state: state([before], true), now: afterReset),
+            state: state([rolled], true), now: afterReset.addingTimeInterval(1))
+        let afterSleep = reconciledResetAlerts(planned, state: state([rolled], true),
+            now: afterReset.addingTimeInterval(5 * 60))
+        let id = planned[0].id
+        let survivesRefresh = retained.contains { $0.id == id }
+        let survivesSecondCheck = afterDeliveryCheck.contains { $0.id == id } &&
+            rechecked.contains { $0.id == id }
+        let survivesSleep = afterSleep.contains { $0.id == id }
+        guard survivesRefresh && survivesSecondCheck && survivesSleep else {
+            fail("Codex reset alert lost: refresh=\(survivesRefresh), server recheck=\(survivesSecondCheck), delayed timer=\(survivesSleep)")
+        }
+        guard dueResetAlerts(retained, now: afterReset, delivered: [], sending: []).map(\.id) == [id],
+              dueResetAlerts(retained, now: afterReset, delivered: [id], sending: []).isEmpty,
+              dueResetAlerts(retained, now: afterReset, delivered: [], sending: [id]).isEmpty else {
+            fail("Reset alert was not due exactly once")
+        }
+        let nextDay = afterReset.addingTimeInterval(12 * 3600)
+        guard reconciledResetAlerts(planned, state: state([rolled], true), now: nextDay).contains(where: { $0.id == id }),
+              dueResetAlerts(planned, now: nextDay, delivered: [], sending: []).count == 1,
+              !reconciledResetAlerts(planned, state: state([rolled], true),
+                  now: afterReset.addingTimeInterval(25 * 3600)).contains(where: { $0.id == id }) else {
+            fail("Sleeping past a reset lost bounded catch-up or delivered a stale alert")
+        }
+        guard reconciledResetAlerts(planned, state: state([], true), now: afterReset).isEmpty,
+              reconciledResetAlerts(planned, state: state([rolled], false), now: afterReset).isEmpty else {
+            fail("Removed accounts or disabled notifications kept a reset alert")
+        }
+        let missingWindow = Account(id: before.id, provider: "codex", email: "", plan: nil,
+            active: true, exhausted_until: nil, usage: Usage(available: true, windows: []), reset_credits: nil)
+        guard reconciledResetAlerts(planned, state: state([missingWindow], true), now: afterReset).isEmpty else {
+            fail("A removed usage window kept its reset alert")
+        }
+        let unavailable = Account(id: before.id, provider: "codex", email: "", plan: nil,
+            active: true, exhausted_until: nil, usage: Usage(available: false, windows: nil), reset_credits: nil)
+        guard reconciledResetAlerts(planned, state: state([unavailable], true), now: afterReset).map(\.id) == [id] else {
+            fail("A temporary usage outage erased a scheduled reset")
+        }
+        let shortlyBefore = Date(timeIntervalSince1970: now + 3600 - 90)
+        guard reconciledResetAlerts(planned, state: state([rolled], true), now: shortlyBefore).contains(where: { $0.id == id }),
+              dueResetAlerts(planned, now: shortlyBefore, delivered: [], sending: []).isEmpty else {
+            fail("A near-reset upstream rollover was not retained until its reported time")
+        }
+        let farBefore = Date(timeIntervalSince1970: now + 3600 - 10 * 60)
+        guard !reconciledResetAlerts(planned, state: state([rolled], true), now: farBefore).contains(where: { $0.id == id }) else {
+            fail("An old reset stayed scheduled after an early upstream change")
+        }
+        let corrected = Account(id: before.id, provider: "codex", email: "", plan: nil,
+            active: true, exhausted_until: nil, usage: Usage(available: true,
+                windows: [UsageWindow(label: "Weekly", used_percent: 25,
+                    resets_at: now + 4000)]), reset_credits: nil)
+        let revised = reconciledResetAlerts(planned, state: state([corrected], true),
+            now: Date(timeIntervalSince1970: now + 10))
+        guard revised.count == 1, revised[0].id != id else {
+            fail("An upstream reset correction kept the obsolete alert")
+        }
+        let other = Account(id: "second-codex", provider: "codex", email: "", plan: nil,
+            active: false, exhausted_until: nil, usage: Usage(available: true,
+                windows: [UsageWindow(label: "Weekly", used_percent: 0,
+                    resets_at: now + 3600)]), reset_credits: nil)
+        let twoPlans = desiredResetAlerts(state([before, other], true), now: Date(timeIntervalSince1970: now))
+        let otherRolled = Account(id: other.id, provider: "codex", email: "", plan: nil,
+            active: false, exhausted_until: nil, usage: Usage(available: true,
+                windows: [UsageWindow(label: "Weekly", used_percent: 0,
+                    resets_at: now + 3600 + 7 * 86400)]), reset_credits: nil)
+        let twoDue = dueResetAlerts(reconciledResetAlerts(twoPlans,
+            state: state([rolled, otherRolled], true), now: afterReset),
+            now: afterReset, delivered: [], sending: [])
+        guard Set(twoDue.map(\.accountID)) == Set([before.id, other.id]),
+              Set(twoDue.map(\.id)).count == 2 else {
+            fail("Two Codex accounts resetting together did not produce separate alerts")
+        }
+        var pending = twoDue
+        var deliveredIDs = Set<String>()
+        recordDeliveredResetAlert(twoDue[0].id, alerts: &pending, delivered: &deliveredIDs)
+        guard pending.map(\.id) == [twoDue[1].id],
+              dueResetAlerts(pending, now: afterReset, delivered: deliveredIDs, sending: []).map(\.id) == [twoDue[1].id] else {
+            fail("Delivering one account's alert erased or repeated another account's alert")
+        }
+        let ledgerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("switcher-reset-test-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: ledgerURL) }
+        let ledgerFile = ledgerURL.appendingPathComponent("reset-alerts.json")
+        do {
+            try FileManager.default.createDirectory(at: ledgerURL, withIntermediateDirectories: true)
+            try saveResetAlertLedger(ResetAlertLedger(alerts: planned, deliveredIDs: []), at: ledgerFile)
+            let restored = try loadResetAlertLedger(at: ledgerFile)
+            guard reconciledResetAlerts(restored.alerts, state: state([rolled], true), now: afterReset).contains(where: { $0.id == id }),
+                  restored.deliveredIDs.isEmpty else { fail("A menu restart lost the pending reset") }
+            let raw = try Data(contentsOf: ledgerFile)
+            let permissions = try FileManager.default.attributesOfItem(atPath: ledgerFile.path)[.posixPermissions] as? NSNumber
+            guard !String(decoding: raw, as: UTF8.self).contains("private@example.com"),
+                  permissions?.intValue == 0o600 else { fail("Reset ledger revealed identity or was not private") }
+            try saveResetAlertLedger(ResetAlertLedger(alerts: retained, deliveredIDs: [id]), at: ledgerFile)
+            let delivered = try loadResetAlertLedger(at: ledgerFile)
+            guard dueResetAlerts(delivered.alerts, now: afterReset, delivered: Set(delivered.deliveredIDs),
+                sending: []).isEmpty else { fail("A menu restart repeated a delivered notification") }
+        } catch {
+            fail("Reset ledger persistence failed: \(error)")
         }
         let shifted = Account(id: "a", provider: "codex", email: base.email, plan: nil,
             active: true, exhausted_until: nil, usage: Usage(available: true,
@@ -159,6 +297,6 @@ struct MenuBarLayoutTest {
         guard logoBrightness(Palette.dark.ink) > logoBrightness(Palette.light.ink) + 0.35 else {
             fail("Copilot mark did not follow light and dark menu colours")
         }
-        print("Menu bar layout and Copilot theme tint: OK")
+        print("Menu bar layout, reset alerts, and Copilot theme tint: OK")
     }
 }
