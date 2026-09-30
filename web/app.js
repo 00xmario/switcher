@@ -1,5 +1,6 @@
 import { createClaudeSync } from './claude-sync.js';
 import { patchProviderList, createResetFeedback, mergeAccountMutation } from './account-updates.js';
+import { createAppearance } from './themes.js';
 
 const providersEl = document.getElementById('providers');
 const resetFeedback = createResetFeedback({ getCard: id => [...providersEl.querySelectorAll('.account')].find(card => card.dataset.id === id) });
@@ -17,6 +18,12 @@ const claudeSessionSync = createClaudeSync({
   },
 });
 const themeButtons = document.querySelectorAll('[data-theme-choice]');
+const appearance = createAppearance({
+  root: document.documentElement,
+  storage: { getItem: key => localStorage.getItem(key), setItem: (key, value) => localStorage.setItem(key, value) },
+  media: matchMedia('(prefers-color-scheme: dark)'),
+  onModeChange: updateModeButtons,
+});
 
 let data = { accounts: [], order: [], hidden: [] };
 let lastRenderMinute = -1;
@@ -24,20 +31,31 @@ let lastRenderMinute = -1;
 /* ---------- theme ---------- */
 
 function applyTheme(theme) {
-  document.documentElement.dataset.theme = theme;
-  localStorage.setItem('switcher-theme', theme);
-  themeButtons.forEach(b => b.classList.toggle('selected', b.dataset.themeChoice === theme));
+  appearance.setMode(theme);
+}
+function updateModeButtons(mode) {
+  themeButtons.forEach(b => {
+    const selected = b.dataset.themeChoice === mode;
+    b.classList.toggle('selected', selected);
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-checked', String(selected));
+    b.tabIndex = selected ? 0 : -1;
+  });
 }
 
-themeButtons.forEach(btn =>
-  btn.addEventListener('click', () => applyTheme(btn.dataset.themeChoice)));
-
-// Keep "system" alive when the OS preference flips.
-matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  if (document.documentElement.dataset.theme === 'system') render();
+themeButtons.forEach((btn, index) => {
+  btn.addEventListener('click', () => applyTheme(btn.dataset.themeChoice));
+  btn.addEventListener('keydown', event => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? themeButtons.length - 1
+      : (index + (['ArrowRight', 'ArrowDown'].includes(event.key) ? 1 : -1) + themeButtons.length) % themeButtons.length;
+    applyTheme(themeButtons[next].dataset.themeChoice);
+    themeButtons[next].focus();
+  });
 });
 
-applyTheme(localStorage.getItem('switcher-theme') || 'system');
+applyTheme(appearance.mode);
 
 /* ---------- provider marks ---------- */
 
@@ -259,22 +277,20 @@ function healthText(health) {
   }
 }
 
-// PROVIDER_BAR_COLORS mirrors T3 Code's usageProviders.ts: the fill is the
-// theme's foreground colour (provider-tinted), so it reads on both themes.
+// PROVIDER_BAR_COLORS uses shared theme tokens for both card layouts and charts.
 const PROVIDER_BAR_COLORS = {
-  codex: 'var(--text)',
-  claude: '#d97757',
-  grok: 'color-mix(in oklab, var(--text) 72%, var(--bg))',
-  opencode: 'var(--text)',
-  antigravity: 'var(--accent)',
-  gemini: '#3186ff',
-  copilot: '#6e7781',
+  codex: 'var(--bar-codex, var(--accent))',
+  claude: 'var(--bar-claude, var(--accent))',
+  grok: 'var(--bar-grok, var(--accent))',
+  opencode: 'var(--bar-opencode, var(--accent))',
+  antigravity: 'var(--bar-antigravity, var(--accent))',
+  gemini: 'var(--bar-gemini, var(--accent))',
+  copilot: 'var(--bar-copilot, var(--accent))',
 };
 
 function windowHTML(win, providerID) {
   const left = Math.max(0, Math.min(100, 100 - win.used_percent));
   const used = 100 - left;
-  const name = PROVIDER_NAMES[providerID] || providerID;
   const remaining = fmtRemaining(win.resets_at);
   const exact = remaining ? resetTime(win.resets_at) : null;
   const exactTitle = exact ? ` title="${escapeHTML(exact.title)}"` : '';
@@ -288,12 +304,13 @@ function windowHTML(win, providerID) {
   const color = PROVIDER_BAR_COLORS[providerID] || 'var(--text)';
   const fill = `<div class="fill" style="width:${left}%; background-color:${color}"></div>`;
   const hatch = `<div class="hatch" style="width:${used}%; color:${color}"></div>`;
-  const bar = `<div class="bar">${fill}${hatch}<span class="bar-label"><span class="bar-name">${escapeHTML(name)}</span><span class="bar-pct">${left}%</span></span>${exact ? `<time class="reset-badge"${exactDate}${exactTitle}>${resetText}</time>` : `<span class="reset-badge">${resetText}</span>`}</div>`;
+  const bar = `<div class="bar" role="progressbar" aria-label="${escapeHTML(win.label)} quota remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${left}">${fill}${hatch}</div>
+    <div class="bar-caption"><span>${used}% used</span>${exact ? `<time class="reset-badge"${exactDate}${exactTitle}>${resetText}</time>` : `<span class="reset-badge">${resetText}</span>`}</div>`;
   return `
     <div class="window" data-quota-window="${escapeHTML(win.label)}">
       <div class="win-left">
         <div class="win-label">${escapeHTML(win.label)}</div>
-        <div class="win-pct">${left}%<span>left</span></div>
+        <div class="win-pct ${left <= 20 ? 'low-quota' : ''}">${left}%<span>left</span></div>
         ${recovery}
       </div>
       <div class="win-bar">
@@ -322,10 +339,10 @@ function accountHTML(account) {
     <div class="account ${isActive ? 'active' : ''}" data-id="${escapeHTML(account.id)}">
       <div class="account-head">
         <div class="who">
-          <div class="email" tabindex="0">${escapeHTML(account.email)}</div>
+          ${accountIdentityHTML(account, isActive)}
           <div class="meta">
-            <span class="dot ${status.cls}"></span>${status.label}
-            ${plan ? ` · ${escapeHTML(plan)}` : ''}
+            ${plan ? `<span>${escapeHTML(plan)}</span>` : ''}
+            ${status.cls === 'exhausted' ? '<span class="routing-warning">Out of usage</span>' : ''}
             ${account.reset_credits?.count > 0 ? `<span class="banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
           </div>
           <div class="account-health ${escapeHTML(health.condition)}"><span class="health-mark" aria-hidden="true"></span>${escapeHTML(healthText(health))}</div>
@@ -334,9 +351,7 @@ function accountHTML(account) {
           <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-label="Recheck account usage" title="Recheck usage" aria-disabled="${recheckPending}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
           </button>
-          <button class="use" data-act="activate" ${isActive ? 'disabled' : ''}>
-            ${isActive ? 'Active' : 'Use this account'}
-          </button>
+          ${isActive ? '' : '<button class="use" data-act="activate">Use this account</button>'}
           <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
         </div>
       </div>
@@ -352,7 +367,7 @@ function compactWindowHTML(win) {
     <div class="compact-window" data-quota-window="${escapeHTML(win.label)}">
       <div class="compact-window-head">
         <span class="compact-window-name">${escapeHTML(win.label)}</span>
-        <strong>${left}% <span>left</span></strong>
+        <strong class="${left <= 20 ? 'low-quota' : ''}">${left}% <span>left</span></strong>
         ${exact ? `<time datetime="${exact.iso}" title="${escapeHTML(exact.title)}">${escapeHTML(exact.short)}</time><span class="compact-reset-relative">· in ${remaining}</span>` : ''}
       </div>
       <div class="compact-track" role="progressbar" aria-label="${escapeHTML(win.label)} quota remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${left}">
@@ -386,12 +401,12 @@ function compactAccountHTML(account) {
       <div class="compact-card-head">
         <span class="compact-provider-logo" aria-hidden="true">${LOGOS[account.provider] || ''}</span>
         <div class="who compact-identity">
-          <div class="email" tabindex="0">${escapeHTML(account.email)}</div>
-          <div class="meta"><span class="dot ${status.cls}"></span>${status.label}</div>
+          ${accountIdentityHTML(account, isActive)}
         </div>
         <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
       </div>
       <div class="compact-plan"><span>Plan</span><strong>${escapeHTML(plan)}</strong>
+        ${status.cls === 'exhausted' ? '<span class="routing-warning">Out of usage</span>' : ''}
         ${account.reset_credits?.count > 0 ? `<span class="banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
       </div>
       <div class="account-health ${escapeHTML(health.condition)}"><span class="health-mark" aria-hidden="true"></span>${escapeHTML(healthText(health))}</div>
@@ -400,9 +415,16 @@ function compactAccountHTML(account) {
         <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-disabled="${recheckPending}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>Refresh quota
         </button>
-        <button class="use" data-act="activate" ${isActive ? 'disabled' : ''}>${isActive ? 'Active' : 'Use this account'}</button>
+        ${isActive ? '' : '<button class="use" data-act="activate">Use this account</button>'}
       </div>
     </div>`;
+}
+
+function accountIdentityHTML(account, active) {
+  return `<div class="identity-line">
+    <div class="email" tabindex="0">${escapeHTML(account.email)}</div>
+    ${active ? '<span class="account-badge active-status"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Active</span>' : '<span class="account-state">Idle</span>'}
+  </div>`;
 }
 
 function accountMenuHTML(account) {
@@ -1735,6 +1757,7 @@ async function renderSettings() {
   }
   settingsPage.innerHTML = `
     <div class="settings-grid">
+      <section class="settings-card appearance-card" id="appearance-settings" aria-label="Appearance"></section>
       <details class="settings-card cli-setup-card" id="cli-setup-card">
         <summary class="cli-setup-summary">
           <span class="cli-setup-summary-text">
@@ -1813,6 +1836,7 @@ async function renderSettings() {
       </div>
     </div>`;
 
+  appearance.mount(settingsPage.querySelector('#appearance-settings'));
   const setupList = settingsPage.querySelector('#cli-setup-list');
   const setupAnnouncer = settingsPage.querySelector('#cli-setup-announcer');
   const setupStatus = settingsPage.querySelector('#cli-setup-status');

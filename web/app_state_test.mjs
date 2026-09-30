@@ -128,6 +128,8 @@ const withCredit = accountContext.accountHTML({ id: 'banked-id', provider: 'code
   email: 'banked@example.com', plan: 'prolite', health: { condition: 'usage_current' },
   reset_credits: { count: 1 } });
 assert.doesNotMatch(withoutCredit, /class="banked"|data-act="use-reset"/);
+assert.match(withoutCredit, /class="identity-line"[\s\S]*class="email"[\s\S]*class="account-badge active-status"/);
+assert.doesNotMatch(withoutCredit, /data-act="activate"/, 'active cards must not repeat Active in a disabled action');
 assert.match(withCredit, /class="meta">[\s\S]*Pro 5x[\s\S]*<span class="banked"[^>]*>⚡ 1 banked<\/span>[\s\S]*<\/div>\s*<div class="account-health/);
 assert.match(withCredit, /data-account-menu[^>]*aria-haspopup="menu"[^>]*aria-expanded="false"/);
 assert.doesNotMatch(withCredit.match(/<div class="actions">([\s\S]*?)<\/div>/)?.[1] || '', /class="banked"|data-act="use-reset"|data-act="relogin"|data-act="delete"/);
@@ -158,6 +160,9 @@ assert.match(compactCard, /data-act="recheck"[\s\S]*Refresh quota[\s\S]*data-act
 assert.match(compactCard, /data-account-menu/);
 assert.equal((compactCard.match(/class="compact-credit"/g) || []).length, 2);
 assert.match(compactCard, /Banked reset expiry[\s\S]*Reset 1[\s\S]*title="Banked reset expires:/);
+const activeCompact = accountContext.compactAccountHTML({ id: 'active-id', provider: 'codex', email: 'active@example.com', plan: 'pro' });
+assert.match(activeCompact, /class="identity-line"[\s\S]*class="email"[\s\S]*class="account-badge active-status"/);
+assert.doesNotMatch(activeCompact, /data-act="activate"/);
 
 let compactPage = false;
 const providersEl = { hidden: false, innerHTML: '', querySelectorAll: () => [], querySelector: () => null };

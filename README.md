@@ -135,7 +135,16 @@ required; OpenCode Go uses its own API key.
   card still shows its plan, every available quota window, the reported
   reset date and countdown, health, and account actions. The expanded view
   remains the default. With compact view on, all tabs keep the same width;
-  the active card is marked by a small badge and edge accent.
+  the active card has a quiet border and an inline Active badge beside its
+  account name. Both layouts avoid a duplicate disabled Active button.
+- **Appearance themes**: choose Graphite, Tide, or Ember under Settings →
+  Appearance. Every preset supports light, dark, and system mode. Create up
+  to eight named custom themes with a live preview of background, accent,
+  corner style, action buttons, and per-provider usage-bar colors. Save or
+  cancel a preview, edit or delete custom themes, or return to a preset.
+  Appearance is saved in this browser, like the light/dark preference, and
+  updates other tabs on the same origin. Text contrast adjusts automatically.
+  Bar colors are shared by compact cards, expanded cards, and usage charts.
 - **T3 Code hub**: speaks CLIProxyAPI's management protocol, so T3 Code
   shows every account's quota from one place.
 - **Menu bar app**: the macOS app supervises the server, shows every
