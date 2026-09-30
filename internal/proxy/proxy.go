@@ -100,8 +100,12 @@ type Manager struct {
 	// autoResetAt throttles automatic redemptions per account so a client
 	// retry loop cannot drain every banked reset on a limit that a reset
 	// does not actually clear.
-	autoResetAt map[string]time.Time
-	planChecked map[string]time.Time
+	autoResetAt   map[string]time.Time
+	planChecked   map[string]time.Time
+	resetEvents   map[string]ResetEvent
+	resetSerial   uint64
+	quotaRevision map[string]uint64
+	spentCredits  map[string]map[string]int64
 }
 
 // New loads persisted state and returns the proxy manager. registration is
@@ -162,6 +166,9 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		accountRevision:   map[string]uint64{},
 		autoResetAt:       map[string]time.Time{},
 		planChecked:       map[string]time.Time{},
+		resetEvents:       map[string]ResetEvent{},
+		quotaRevision:     map[string]uint64{},
+		spentCredits:      map[string]map[string]int64{},
 		selectionRevision: map[string]uint64{},
 		probeBootID:       hex.EncodeToString(boot[:]),
 		order:             order,
@@ -295,6 +302,9 @@ func (m *Manager) Remove(id string) {
 }
 
 func (m *Manager) removeLocked(id string) {
+	delete(m.resetEvents, id)
+	delete(m.spentCredits, id)
+	m.quotaRevision[id]++
 	delete(m.planChecked, id)
 	delete(m.exhausted, id)
 	delete(m.lastUsage, id)
@@ -333,6 +343,7 @@ func (m *Manager) ResetAccount(id string) {
 	defer m.mu.Unlock()
 	m.generation[id]++
 	m.accountRevision[id]++
+	m.quotaRevision[id]++
 	delete(m.health, id)
 	delete(m.lastUsage, id)
 }
@@ -389,7 +400,11 @@ func (m *Manager) UpdateAccount(id string, mutate func(*store.Account) error) er
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.store.Save(a)
+	if err := m.store.Save(a); err != nil {
+		return err
+	}
+	m.quotaRevision[id]++
+	return nil
 }
 
 func (m *Manager) saveAccount(a store.Account) error {
@@ -403,6 +418,8 @@ func (m *Manager) saveAccount(a store.Account) error {
 	}
 	m.generation[a.ID]++
 	m.accountRevision[a.ID]++
+	delete(m.resetEvents, a.ID)
+	m.quotaRevision[a.ID]++
 	delete(m.planChecked, a.ID)
 	delete(m.health, a.ID)
 	delete(m.lastUsage, a.ID)
@@ -415,6 +432,7 @@ func (m *Manager) ClearExhausted(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.exhausted, id)
+	m.quotaRevision[id]++
 	_ = m.persistLocked()
 }
 
@@ -576,6 +594,7 @@ func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, for
 	if !force && time.Now().Before(h.retryAt) {
 		if staleSnapshot(m.lastUsage[id]) {
 			delete(m.lastUsage, id)
+			m.quotaRevision[id]++
 		}
 		cached := m.lastUsage[id]
 		m.mu.Unlock()
@@ -692,6 +711,7 @@ func (m *Manager) recordUsage(id string, gen uint64, usage provider.Usage, succe
 		h.retryAt = time.Time{}
 		h.lastSuccess = h.lastChecked
 		m.lastUsage[id] = usage
+		m.quotaRevision[id]++
 		return usage
 	}
 	if errors.Is(err, provider.ErrUsageRateLimited) {
@@ -700,6 +720,7 @@ func (m *Manager) recordUsage(id string, gen uint64, usage provider.Usage, succe
 	if last, ok := m.lastUsage[id]; ok {
 		if staleSnapshot(last) {
 			delete(m.lastUsage, id)
+			m.quotaRevision[id]++
 		} else if last.Available {
 			return last
 		}
@@ -862,6 +883,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		resetBeforeForward := m.resetID(account.ID)
 		resp, err := m.forward(prov, account, rest, r, body)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, fmt.Sprintf("upstream request failed: %v", err))
@@ -891,8 +913,18 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				copyResponseStatus(w, resp.StatusCode, body429, resp.Header)
 				return
 			}
+			// A concurrent request may have restored this account while this
+			// older upstream response was in flight. Retry once instead of
+			// re-parking it based on the pre-reset 429.
+			if !m.markExhaustedIfResetUnchanged(account.ID, until, resetBeforeForward) {
+				if !usedAutoReset {
+					usedAutoReset = true
+					continue
+				}
+				copyResponseStatus(w, resp.StatusCode, body429, resp.Header)
+				return
+			}
 			log.Printf("proxy: %s exhausted until %s", account.Email, until.Format(time.RFC3339))
-			m.markExhausted(account.ID, until)
 			// Failover first: another usable account costs nothing extra,
 			// while a banked reset is a finite credit.
 			if next := m.nextAvailable(account.ID, providerID); next != "" {
@@ -1023,7 +1055,24 @@ func (m *Manager) setActive(providerID, id string) {
 func (m *Manager) markExhausted(id string, until time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.markExhaustedLocked(id, until)
+}
+
+// The epoch check and park must be one critical section: redemption may
+// complete at any point while another response is being handled.
+func (m *Manager) markExhaustedIfResetUnchanged(id string, until time.Time, expected string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.resetEvents[id].ID != expected {
+		return false
+	}
+	m.markExhaustedLocked(id, until)
+	return true
+}
+
+func (m *Manager) markExhaustedLocked(id string, until time.Time) {
 	m.exhausted[id] = until
+	m.quotaRevision[id]++
 	if err := m.persistLocked(); err != nil {
 		log.Printf("proxy: persist exhaustion: %v", err)
 	}
@@ -1048,14 +1097,8 @@ func (m *Manager) SetAutoUseResetPolicy(resolver func(store.Account) bool) {
 func (m *Manager) autoUseBankedReset(ctx context.Context, prov provider.Provider, account store.Account) bool {
 	m.mu.Lock()
 	resolver := m.autoUseReset
-	cooldownUntil := m.autoResetAt[account.ID]
 	m.mu.Unlock()
 	if resolver == nil || !resolver(account) {
-		return false
-	}
-	if time.Now().Before(cooldownUntil) {
-		// A recent automatic redemption did not lift the limit. Do not burn
-		// the rest of this account's banked resets on the same problem.
 		return false
 	}
 	rc, ok := prov.(provider.ResetCreditProvider)
@@ -1068,14 +1111,34 @@ func (m *Manager) autoUseBankedReset(ctx context.Context, prov provider.Provider
 	lock := m.refreshLock(account.ID)
 	lock.Lock()
 	defer lock.Unlock()
+	// Re-read after taking the account lock: a queued request must honor a
+	// recent preference change, token rotation, or completed redemption.
+	fresh, err := m.store.Get(account.ID)
+	if err != nil || !resolver(fresh) {
+		return false
+	}
+	account = fresh
 	if _, stillExhausted := m.Exhausted(account.ID); !stillExhausted {
 		return true
+	}
+	if event := m.LastReset(account.ID); event != nil && event.Pending {
+		return false
+	}
+	m.mu.Lock()
+	cooldownUntil := m.autoResetAt[account.ID]
+	m.mu.Unlock()
+	if time.Now().Before(cooldownUntil) {
+		return false
 	}
 	credits, err := rc.ListResetCredits(ctx, account)
 	if err != nil {
 		log.Printf("proxy: list banked resets for %s: %v", account.Email, err)
 		return false
 	}
+	if len(credits) == 0 {
+		return false
+	}
+	credits = m.AvailableResetCredits(account.ID, credits)
 	if len(credits) == 0 {
 		return false
 	}
@@ -1087,10 +1150,7 @@ func (m *Manager) autoUseBankedReset(ctx context.Context, prov provider.Provider
 	switch outcome {
 	case "reset", "already_redeemed":
 		log.Printf("proxy: auto-used a banked reset for %s (%s)", account.Email, outcome)
-		m.mu.Lock()
-		m.autoResetAt[account.ID] = time.Now().Add(autoUseResetCooldown)
-		m.mu.Unlock()
-		m.ClearExhausted(account.ID)
+		m.recordBankedReset(account.ID, credits[0].ID, outcome, credits[1:], true)
 		return true
 	default:
 		log.Printf("proxy: banked reset for %s did not clear the limit (%s)", account.Email, outcome)

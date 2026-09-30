@@ -20,6 +20,7 @@ const accountStatusAnnouncer = { textContent: '' };
 let renders = 0;
 const context = vm.createContext({
   data: null,
+  lastRenderMinute: Math.floor(Date.now() / 60000),
   stateEpoch: 0,
   stateRequestId: 0,
   lastAppliedStateRequestId: 0,
@@ -29,6 +30,7 @@ const context = vm.createContext({
   api: () => new Promise(resolve => responses.push(resolve)),
   render: () => { renders++; },
   renderAddProviderMenu: () => {},
+  resetFeedback: { observe: () => {} },
   toast: message => { throw new Error(message); },
 });
 vm.runInContext(source.slice(settleStart, settleEnd) + '\n' + source.slice(healthStart, healthEnd) +
@@ -160,6 +162,8 @@ assert.match(compactCard, /Banked reset expiry[\s\S]*Reset 1[\s\S]*title="Banked
 let compactPage = false;
 const providersEl = { hidden: false, innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
 const renderContext = vm.createContext({
+  patchProviderList: (container, html) => { container.innerHTML = html; },
+  resetFeedback: { repaint: () => {} },
   data: { active: {}, compact_accounts: true, accounts: [
     { id: 'a', provider: 'codex' }, { id: 'b', provider: 'codex' },
   ], order: ['codex'], hidden: [] },

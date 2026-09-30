@@ -46,14 +46,20 @@ type API struct {
 	probeCodexForTest func(context.Context) proxy.ProbeCodexResult
 	syncClaudeForTest func(context.Context, map[string]string) (claudesync.Result, error)
 
-	creditsMu    sync.Mutex
-	creditsCache map[string]creditsEntry
+	creditsMu     sync.Mutex
+	creditsCache  map[string]creditsEntry
+	creditsSerial uint64
 }
 
 type creditsEntry struct {
-	credits []provider.ResetCredit
-	ok      bool
-	at      time.Time
+	credits       []provider.ResetCredit
+	ok            bool
+	at            time.Time
+	loading       bool
+	version       uint64
+	token         string
+	resetID       string
+	resetSequence uint64
 }
 
 // Register mounts the API on the given mux, initialising the lazily
@@ -344,6 +350,9 @@ type accountView struct {
 	Usage          *provider.Usage   `json:"usage,omitempty"`
 	Health         proxy.Health      `json:"health"`
 	ResetCredits   *resetCreditsView `json:"reset_credits,omitempty"`
+	LastReset      *proxy.ResetEvent `json:"last_reset,omitempty"`
+	QuotaRevision  uint64            `json:"quota_revision"`
+	QuotaEpoch     string            `json:"quota_epoch"`
 	// SupportsBankedResets is true for providers that bank usage-limit
 	// resets (codex), so the UI can offer the auto-use preference even when
 	// the account currently has none.
@@ -376,13 +385,24 @@ type resetCreditsView struct {
 }
 
 func (a *API) viewOf(acc store.Account) accountView {
-	v := viewOfBase(a, acc)
+	return a.viewWithSettings(acc, a.preferenceSnapshot())
+}
+
+func (a *API) preferenceSnapshot() settings.Settings {
+	if a.Settings == nil {
+		return settings.Settings{}
+	}
+	return a.Settings.Load()
+}
+
+func (a *API) viewWithSettings(acc store.Account, preferences settings.Settings) accountView {
+	v := viewBaseWithSettings(a, acc, preferences)
 	// Providers with banked resets report how many are available so the UI
 	// can offer spending one. The upstream call is TTL-cached: /api/state
 	// is polled every few seconds and must never make the request path
 	// wait on chatgpt.com.
 	if rc, ok := a.Providers[acc.Provider].(provider.ResetCreditProvider); ok {
-		if credits, ok := a.cachedResetCredits(rc, acc); ok && len(credits) > 0 {
+		if credits, ok := a.cachedResetCredits(rc, acc); ok {
 			expiries := make([]int64, 0, len(credits))
 			for _, credit := range credits {
 				if credit.ExpiresAt > 0 {
@@ -390,10 +410,12 @@ func (a *API) viewOf(acc store.Account) accountView {
 				}
 			}
 			v.ResetCredits = &resetCreditsView{
-				Count:         len(credits),
-				NextID:        credits[0].ID,
-				NextExpiresAt: credits[0].ExpiresAt,
-				ExpiresAt:     expiries,
+				Count:     len(credits),
+				ExpiresAt: expiries,
+			}
+			if len(credits) > 0 {
+				v.ResetCredits.NextID = credits[0].ID
+				v.ResetCredits.NextExpiresAt = credits[0].ExpiresAt
 			}
 		}
 	}
@@ -404,6 +426,10 @@ func (a *API) viewOf(acc store.Account) accountView {
 // round trip, so login and import responses carry the same contract as
 // /api/state.
 func viewOfBase(a *API, acc store.Account) accountView {
+	return viewBaseWithSettings(a, acc, a.preferenceSnapshot())
+}
+
+func viewBaseWithSettings(a *API, acc store.Account, preferences settings.Settings) accountView {
 	v := accountView{
 		ID:          acc.ID,
 		Provider:    acc.Provider,
@@ -415,15 +441,11 @@ func viewOfBase(a *API, acc store.Account) accountView {
 	}
 	_, v.SupportsBankedResets = a.Providers[acc.Provider].(provider.ResetCreditProvider)
 	v.AutoUseReset = autoUseResetMode(acc)
-	global := a.Settings != nil && a.Settings.Load().AutoUseReset
-	v.AutoUseResetEffective = acc.AutoUseResetEnabled(global)
+	v.AutoUseResetEffective = acc.AutoUseResetEnabled(preferences.AutoUseReset)
 	if until, ok := a.Proxy.Exhausted(acc.ID); ok {
 		v.ExhaustedUntil = until.Unix()
 	}
-	if usage, ok := a.Proxy.LastUsage(acc.ID); ok {
-		u := usage
-		v.Usage = &u
-	}
+	v.Usage, v.LastReset, v.QuotaRevision, v.QuotaEpoch = a.Proxy.QuotaSnapshot(acc.ID)
 	return v
 }
 
@@ -434,17 +456,61 @@ const resetCreditsTTL = 2 * time.Minute
 // the background when stale. Errors keep the last known value.
 func (a *API) cachedResetCredits(rc provider.ResetCreditProvider, acc store.Account) ([]provider.ResetCredit, bool) {
 	a.creditsMu.Lock()
+	var reset *proxy.ResetEvent
+	if a.Proxy != nil {
+		reset = a.Proxy.LastReset(acc.ID)
+	}
+	if a.creditsCache == nil {
+		a.creditsCache = map[string]creditsEntry{}
+	}
 	entry, ok := a.creditsCache[acc.ID]
+	if entry.token != acc.Token.AccessToken {
+		entry.token = acc.Token.AccessToken
+		entry.version++
+		entry.loading = false
+		entry.at = time.Time{}
+	}
+	if reset != nil && reset.Sequence > entry.resetSequence {
+		entry.resetID = reset.ID
+		entry.resetSequence = reset.Sequence
+		entry.version++
+		entry.loading = false
+		entry.at = time.Time{}
+		entry.credits = append([]provider.ResetCredit(nil), reset.Remaining...)
+		entry.ok = true
+	}
 	fresh := ok && time.Since(entry.at) < resetCreditsTTL
-	a.creditsMu.Unlock()
-	if fresh {
+	if fresh || entry.loading {
+		a.creditsCache[acc.ID] = entry
+		a.creditsMu.Unlock()
 		return entry.credits, entry.ok
 	}
+	entry.loading = true
+	a.creditsSerial++
+	entry.version = a.creditsSerial
+	a.creditsCache[acc.ID] = entry
+	version := entry.version
+	a.creditsMu.Unlock()
 	go func() {
-		credits, err := rc.ListResetCredits(context.Background(), acc)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		credits, err := rc.ListResetCredits(ctx, acc)
+		if a.Proxy != nil {
+			credits = a.Proxy.AvailableResetCredits(acc.ID, credits)
+		}
 		a.creditsMu.Lock()
-		a.creditsCache[acc.ID] = creditsEntry{credits: credits, ok: err == nil, at: time.Now()}
-		a.creditsMu.Unlock()
+		defer a.creditsMu.Unlock()
+		current := a.creditsCache[acc.ID]
+		if current.version != version {
+			return
+		}
+		current.loading = false
+		current.at = time.Now()
+		if err == nil {
+			current.credits = credits
+			current.ok = true
+		}
+		a.creditsCache[acc.ID] = current
 	}()
 	return entry.credits, entry.ok
 }
@@ -456,8 +522,9 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	views := make([]accountView, 0, len(accounts))
+	preferences := a.preferenceSnapshot()
 	for _, acc := range accounts {
-		views = append(views, a.viewOf(acc))
+		views = append(views, a.viewWithSettings(acc, preferences))
 	}
 	order, hidden := a.Proxy.Providers()
 	if hidden == nil {
@@ -475,9 +542,9 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"hub_url":             "http://127.0.0.1:8787",
 		"version":             a.Version,
 		"update":              a.UpdateState(),
-		"menu_usage_bars":     a.Settings == nil || a.Settings.MenuUsageBars(),
-		"reset_notifications": a.Settings != nil && a.Settings.Load().ResetNotifications,
-		"compact_accounts":    a.Settings != nil && a.Settings.Load().CompactAccounts,
+		"menu_usage_bars":     preferences.MenuUsageBars == nil || *preferences.MenuUsageBars,
+		"reset_notifications": preferences.ResetNotifications,
+		"compact_accounts":    preferences.CompactAccounts,
 	}
 	if revealHubKey {
 		state["hub_management_key"] = a.ManagementKey
@@ -1078,6 +1145,9 @@ func (a *API) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not delete account"})
 		return
 	}
+	a.creditsMu.Lock()
+	delete(a.creditsCache, id)
+	a.creditsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1203,38 +1273,40 @@ func (a *API) handleUseReset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid account id", http.StatusBadRequest)
 		return
 	}
+	var body struct {
+		CreditID string `json:"credit_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.CreditID == "" || len(body.CreditID) > 256 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Choose a banked reset from refreshed account state"})
+		return
+	}
+	outcome, err := a.Proxy.UseBankedReset(r.Context(), id, body.CreditID)
+	if err != nil {
+		status := http.StatusBadGateway
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, proxy.ErrResetUnsupported):
+			status = http.StatusBadRequest
+		case errors.Is(err, proxy.ErrNoResetCredits):
+			status = http.StatusConflict
+		case errors.Is(err, proxy.ErrResetPending):
+			status = http.StatusConflict
+		}
+		message := "The reset did not go through"
+		if status != http.StatusBadGateway {
+			message = err.Error()
+		}
+		writeJSON(w, status, map[string]string{"error": message})
+		return
+	}
 	account, err := a.Store.Get(id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such account"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account no longer exists"})
 		return
 	}
-	rc, ok := a.Providers[account.Provider].(provider.ResetCreditProvider)
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this provider has no banked resets"})
-		return
-	}
-	credits, err := rc.ListResetCredits(r.Context(), account)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not list banked resets"})
-		return
-	}
-	if len(credits) == 0 {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "no banked reset available for this account"})
-		return
-	}
-	outcome, err := rc.ConsumeResetCredit(r.Context(), account, credits[0].ID)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "the reset did not go through"})
-		return
-	}
-	switch outcome {
-	case "reset", "already_redeemed":
-		a.Proxy.ClearExhausted(account.ID)
-		usage := a.Proxy.RefreshUsage(r.Context(), account)
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "outcome": outcome, "usage": usage})
-	default:
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "outcome": outcome})
-	}
+	view := a.viewOf(account)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "outcome": outcome, "account": view, "usage": view.Usage})
 }
 
 // validID accepts only the identifiers Switcher itself generates

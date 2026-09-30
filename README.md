@@ -91,9 +91,11 @@ required; OpenCode Go uses its own API key.
   from the macOS keychain. The native CLI and Switcher then hold separate
   credential copies; refresh-token coexistence has not been established as
   a native CLI setup path.
-- **Claude Desktop session sync**: the small sync icon beside Claude in the
+- **Claude Desktop session sync**: the small two-arrow sync icon after the Claude name in the
   menu bar and web app makes new Claude Code chats discoverable across your
-  Desktop account indexes. It closes Claude Desktop, backs up every
+  Desktop account indexes. Clicking it first asks for confirmation, with
+  Cancel selected by default, because syncing closes and reopens Claude
+  Desktop even when it is running in the background. It backs up every
   `local_*.json` to a unique folder under
   `~/.claude/desktop-session-sync-backups/`, copies only missing pointers,
   then reopens Desktop. Existing pointers, archive/deletion markers, and
@@ -118,6 +120,14 @@ required; OpenCode Go uses its own API key.
   account from the account's ⋯ menu (Global / On / Off). At most one credit
   is spent per request, and an account is not auto-reset again for five
   minutes, so a client retry loop cannot drain every banked reset.
+  Redeeming a reset acknowledges success immediately, removes the spent
+  credit, and refreshes quota in the background. The web card gets a brief
+  success sweep and animates its bar to the balance reported by the provider.
+  Reduced-motion settings are respected. Automatic resets use the same
+  feedback; old resets are not replayed when opening the page.
+  Manual requests are tied to the displayed credit ID, so a delayed response
+  or repeated click cannot silently spend the next credit. Quota refreshes
+  are bounded, and late responses cannot overwrite a newer balance.
 - **Account actions**: Recheck and account switching stay on the account card.
   Use the ⋯ menu for a banked reset, relogin, or removal.
 - **Compact account view**: a single switch under Settings → Display puts
@@ -229,6 +239,13 @@ environment; a terminal-only override needs the CLI command. The first
 `.switcher-backup` of an existing config is kept.
 
 ## Verification before a release
+
+`make benchmark-menu` measures optimized menu construction and the click-time
+preparation path using six synthetic accounts and bundled logos. The menu
+keeps prepared views, patches changed providers, caches blurred email images,
+and reuses formatters and text measurements. It updates countdowns on open.
+State polling compares only menu-visible data; hidden web tabs pause polling,
+and unchanged account cards retain their DOM nodes.
 
 Run `make verify` before creating a tag. The same Go, race, vet, web-state,
 Swift menu, and cross-platform build checks run on pushes and pull requests

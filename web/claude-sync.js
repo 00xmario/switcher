@@ -1,7 +1,7 @@
 const title = 'Sync Claude Code sessions between accounts';
-const explanation = 'Makes new Claude Code chats visible on your other Claude accounts. Existing shared conversations use the same local transcript. Closes and reopens Claude Desktop.';
+const explanation = 'Share new Claude Code chats across accounts. Confirmation required: this closes and reopens Claude Desktop.';
 const icons = {
-  idle: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/>',
+  idle: '<path d="M4 8h16m-4-4 4 4-4 4M20 16H4m4-4-4 4 4 4"/>',
   success: '<path d="m5 12 4 4L19 6"/>',
   error: '<path d="M12 7v6m0 4h.01"/><circle cx="12" cy="12" r="9"/>',
 };
@@ -9,8 +9,8 @@ const escape = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', 
 
 // State survives dashboard polling and tab changes. Both render() and an
 // in-flight completion paint from this same controller.
-export function createClaudeSync({ request, paint, schedule = setTimeout }) {
-  let phase = 'idle', detail = '', timerVersion = 0;
+export function createClaudeSync({ request, confirm, paint, schedule = setTimeout }) {
+  let phase = 'idle', detail = '', timerVersion = 0, confirming = false;
   function html() {
     const icon = icons[phase] || icons.idle;
     return `<span class="claude-sync-control">
@@ -23,7 +23,13 @@ export function createClaudeSync({ request, paint, schedule = setTimeout }) {
     </span>`;
   }
   async function run() {
-    if (phase === 'running') return;
+    if (phase === 'running' || confirming) return;
+    confirming = true;
+    try {
+      if (!await confirm()) return;
+    } finally {
+      confirming = false;
+    }
     const version = ++timerVersion;
     phase = 'running'; detail = ''; paint();
     try {

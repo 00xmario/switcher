@@ -1,0 +1,22 @@
+import assert from 'node:assert/strict';
+import { quotaLevels, newlyRedeemed, mergeAccountMutation } from './account-updates.js';
+
+const before = { id: 'a', usage: { windows: [{ label: 'Session', used_percent: 100 }, { label: 'Weekly', used_percent: 25 }] } };
+const reset = { ...before, last_reset: { id: 'boot-1', outcome: 'reset', pending: true } };
+assert.deepEqual([...quotaLevels(before)], [['Session', 0], ['Weekly', 75]]);
+assert.deepEqual(newlyRedeemed([], [reset]), [], 'initial loading must not replay historical resets');
+assert.deepEqual(newlyRedeemed([before], [reset]), [reset]);
+assert.deepEqual(newlyRedeemed([reset], [{ ...reset, last_reset: { ...reset.last_reset, pending: false } }]), [], 'polling must not replay the same reset');
+assert.deepEqual(newlyRedeemed([before], [{ ...reset, last_reset: { id: 'boot-1', outcome: 'already_redeemed' } }]), [], 'already-redeemed is not a new credit spend');
+assert.deepEqual(newlyRedeemed([before], [before]), []);
+assert.deepEqual(newlyRedeemed([before], [{ ...reset, id: 'b' }]), [], 'a newly added account must not replay its reset history');
+const automatic = { ...reset, last_reset: { ...reset.last_reset, automatic: true } };
+assert.deepEqual(newlyRedeemed([before], [automatic]), [automatic]);
+assert.deepEqual([...quotaLevels(null)], []);
+const fresh = { ...reset, quota_epoch: 'boot-a', quota_revision: 4, usage: { windows: [{ label: 'Session', used_percent: 5 }] } };
+const stale = { ...reset, quota_epoch: 'boot-a', quota_revision: 2 };
+assert.equal(mergeAccountMutation(fresh, stale), fresh, 'late POST must not undo fresher polled quota');
+assert.equal(mergeAccountMutation(stale, fresh), fresh);
+const restarted = { ...stale, quota_epoch: 'boot-b', quota_revision: 1 };
+assert.equal(mergeAccountMutation(fresh, restarted), restarted, 'server restart must not freeze the old revision');
+console.log('Banked-reset event detection, quota levels, and replay prevention: OK');

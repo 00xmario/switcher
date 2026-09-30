@@ -171,7 +171,7 @@ button:disabled { opacity: .45; cursor: default; }
 .provider-head .claude-sync-button.success, .provider-head .claude-sync-button.success:hover:not(:disabled) { color: var(--accent); }
 .provider-head .claude-sync-button.error, .provider-head .claude-sync-button.error:hover:not(:disabled) { color: var(--danger); }
 .claude-sync-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.claude-sync-feedback { position: absolute; z-index: 45; top: 34px; left: 0; width: min(300px, 65vw); padding: 12px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); font-size: 13px; font-weight: 500; }
+.claude-sync-feedback { position: absolute; z-index: 45; top: 34px; left: 50%; transform: translateX(-50%); width: min(300px, calc(100vw - 48px)); padding: 12px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); font-size: 13px; font-weight: 500; }
 .claude-sync-feedback span { display: block; margin-top: 4px; font-size: 12px; color: var(--dim); font-weight: 400; overflow-wrap: anywhere; }
 .claude-sync-feedback.error summary { cursor: pointer; color: var(--danger); }
 .claude-sync-feedback pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; font-family: inherit; font-size: 12px; line-height: 1.5; }
@@ -271,6 +271,18 @@ html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
   box-shadow: var(--shadow);
   overflow: hidden;
 }
+
+/* A reset gets one contained energy sweep; quota animates to provider data. */
+.account { position: relative; }
+.account .account-health.reset-status-host { position: relative; color: transparent; }
+.reset-status-host > .health-mark { opacity: 0; }
+.reset-feedback { position: absolute; left: 0; top: 0; z-index: 3; max-width: 100%; color: var(--accent); font-size: 12px; pointer-events: none; }
+.reset-sending { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
+.reset-celebrate { animation: reset-charge 1.5s ease-out; animation-delay: var(--reset-elapsed, 0ms); }
+.reset-celebrate::after { content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 2; border-radius: inherit; background: linear-gradient(105deg, transparent 20%, color-mix(in srgb, var(--accent) 24%, transparent) 45%, rgb(255 255 255 / .28) 50%, transparent 70%); background-size: 250% 100%; animation: reset-sweep 1.4s cubic-bezier(.16,1,.3,1) both; animation-delay: var(--reset-elapsed, 0ms); }
+@keyframes reset-sweep { from { background-position: 180% 0; opacity: 0; } 20% { opacity: 1; } to { background-position: -80% 0; opacity: 0; } }
+@keyframes reset-charge { 0%, 100% { box-shadow: inset 0 0 0 1px transparent; } 25% { box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 36px color-mix(in srgb, var(--accent) 18%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .reset-celebrate, .reset-celebrate::after { animation: none; } .reset-celebrate::after { display: none; } }
 .account-list.compact-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

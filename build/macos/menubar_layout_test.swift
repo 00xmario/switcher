@@ -9,6 +9,7 @@ func fail(_ message: String) -> Never {
 @main
 struct MenuBarLayoutTest {
     static func main() {
+        _ = NSApplication.shared
         guard planNames["claude_max_5x"] == "Max 5x",
               planNames["claude_max_20x"] == "Max 20x",
               planNames["claude_max"] == "Max" else { fail("Claude Max tiers must not be inferred from a generic max flag") }
@@ -20,8 +21,15 @@ struct MenuBarLayoutTest {
                 fail("Claude sync button missing or has incorrect state")
             }
             let labels = head.subviews.compactMap { $0 as? NSTextField }
-            guard labels.allSatisfy({ !$0.frame.intersects(button.frame) }) else { fail("Claude sync button overlaps its title") }
+            guard labels.allSatisfy({ !$0.frame.intersects(button.frame) && $0.frame.maxX < button.frame.minX }) else { fail("Claude sync button must follow its title without overlapping") }
         }
+        let syncConfirmation = claudeSyncConfirmation()
+        guard syncConfirmation.messageText == "Sync Claude Code sessions?",
+              syncConfirmation.informativeText.contains("close and reopen Claude Desktop"),
+              syncConfirmation.informativeText.contains("background"),
+              syncConfirmation.buttons.map(\.title) == ["Cancel", "Sync sessions"],
+              syncConfirmation.buttons[0].keyEquivalent == "\r",
+              syncConfirmation.buttons[1].keyEquivalent.isEmpty else { fail("Sync confirmation must explain interruption and default to Cancel") }
         guard !sectionHead("codex", contentWidth: menuWidth - 2 * edgeInset).subviews.contains(where: { $0 is ClaudeSyncButton }) else {
             fail("Claude sync action appeared on another provider")
         }
@@ -127,6 +135,60 @@ struct MenuBarLayoutTest {
         func state(_ accounts: [Account], _ enabled: Bool) -> AppState {
             AppState(accounts: accounts, order: nil, hidden: nil, version: nil,
                 update: nil, menu_usage_bars: nil, reset_notifications: enabled)
+        }
+        // A click reuses the prepared menu. Updating one provider preserves
+        // the other provider's views and hover targets.
+        let otherProvider = Account(id: "claude-fixture", provider: "claude", email: "fixture@example.test",
+            plan: "claude_max_5x", active: false, exhausted_until: nil, usage: base.usage, reset_credits: nil)
+        let delegate = AppDelegate()
+        let initial = state([base, otherProvider], false)
+        delegate.applyMenuState(initial)
+        let items = delegate.menu.items.map(ObjectIdentifier.init)
+        func providerViews() -> [NSView] {
+            delegate.menu.items.compactMap(\.view).filter { container in
+                container.subviews.contains { $0 is HoverCard && $0.subviews.contains(where: { $0 is ClickableRow }) }
+            }
+        }
+        let cards = providerViews()
+        guard cards.count == 2 else { fail("Missing provider fixture cards") }
+        for _ in 0..<10 { delegate.prepareMenuForOpening() }
+        delegate.applyMenuState(initial)
+        guard delegate.menu.items.map(ObjectIdentifier.init) == items else { fail("Unchanged menu was rebuilt on open or poll") }
+        let changedAccount = Account(id: base.id, provider: base.provider, email: base.email, plan: base.plan,
+            active: base.active, exhausted_until: nil, usage: Usage(available: true,
+                windows: [UsageWindow(label: "Session", used_percent: 7, resets_at: now + 3600)]), reset_credits: nil)
+        delegate.applyMenuState(state([changedAccount, otherProvider], false))
+        let nextCards = providerViews()
+        guard nextCards[0] !== cards[0], nextCards[1] === cards[1] else { fail("Provider patch rebuilt unrelated cards") }
+        delegate.applyMenuState(state([changedAccount, otherProvider], true))
+        delegate.applyNotificationPermission(ResetAlertPermission(message: "Fixture permission granted", canSend: true))
+        guard delegate.menu.items.contains(where: { $0.title == "Fixture permission granted" }),
+              delegate.menu.items.contains(where: { $0.title == "Send test reset alert" && $0.isEnabled }) else {
+            fail("Permission change while closed left stale prepared controls")
+        }
+        let expiry = Date().timeIntervalSince1970 + 1
+        let parked = Account(id: base.id, provider: base.provider, email: base.email, plan: base.plan,
+            active: false, exhausted_until: expiry, usage: base.usage, reset_credits: nil)
+        delegate.applyMenuState(state([parked, otherProvider], false))
+        Thread.sleep(forTimeInterval: max(0, expiry - Date().timeIntervalSince1970 + 0.02))
+        let changedOther = Account(id: otherProvider.id, provider: otherProvider.provider, email: otherProvider.email,
+            plan: "claude_max_20x", active: false, exhausted_until: nil, usage: otherProvider.usage, reset_credits: nil)
+        delegate.applyMenuState(state([parked, changedOther], false))
+        func hasExpiredBadge(_ view: NSView) -> Bool {
+            if let field = view as? NSTextField, field.stringValue == "Out of usage" { return true }
+            return view.subviews.contains(where: hasExpiredBadge)
+        }
+        guard !providerViews().contains(where: hasExpiredBadge) else { fail("Unrelated provider patch lost an expired exhaustion deadline") }
+        let olderPoll = delegate.beginStateRequest()
+        let newerNotificationCheck = delegate.beginStateRequest()
+        guard delegate.acceptStateResponse(initial, serial: newerNotificationCheck),
+              !delegate.acceptStateResponse(state([], false), serial: olderPoll),
+              delegate.cachedState == initial else { fail("Old poll replaced a newer notification-state check") }
+        let oldNotificationCheck = delegate.beginStateRequest()
+        let newPoll = delegate.beginStateRequest()
+        guard delegate.acceptStateResponse(initial, serial: newPoll),
+              !delegate.acceptStateResponse(state([], false), serial: oldNotificationCheck) else {
+            fail("Old notification-state check replaced a newer poll")
         }
         let alerts = desiredResetAlerts(state([base], true), now: Date(timeIntervalSince1970: now))
         guard alerts.map(\.window) == ["Session", "Weekly"], !alerts[0].id.contains("private") else {

@@ -1,7 +1,15 @@
 import { createClaudeSync } from './claude-sync.js';
+import { patchProviderList, createResetFeedback, mergeAccountMutation } from './account-updates.js';
 
 const providersEl = document.getElementById('providers');
+const resetFeedback = createResetFeedback({ getCard: id => [...providersEl.querySelectorAll('.account')].find(card => card.dataset.id === id) });
 const claudeSessionSync = createClaudeSync({
+  confirm: () => confirmDialog({
+    title: 'Sync Claude Code sessions?',
+    message: 'This will close and reopen Claude Desktop, even if it is running in the background. Finish any active work first. Switcher will back up the Desktop session indexes and copy only missing session pointers between accounts. Existing records and conversation transcripts stay unchanged.',
+    confirmLabel: 'Sync sessions',
+    initialFocus: 'cancel',
+  }),
   request: () => fetchWithCSRF('/api/claude/sync', { method: 'POST' }),
   paint: () => {
     const control = providersEl.querySelector('.claude-sync-control');
@@ -11,6 +19,7 @@ const claudeSessionSync = createClaudeSync({
 const themeButtons = document.querySelectorAll('[data-theme-choice]');
 
 let data = { accounts: [], order: [], hidden: [] };
+let lastRenderMinute = -1;
 
 /* ---------- theme ---------- */
 
@@ -179,9 +188,13 @@ async function refreshState() {
     if (epoch !== stateEpoch || request < lastAppliedStateRequestId) return;
     lastAppliedStateRequestId = request;
     const completed = settleRechecks(next.accounts);
-    if (completed || JSON.stringify(next) !== JSON.stringify(data)) {
+    const minute = Math.floor(Date.now() / 60000);
+    if (completed || minute !== lastRenderMinute || JSON.stringify(next) !== JSON.stringify(data)) {
+      lastRenderMinute = minute;
+      const previous = data?.accounts || [];
       data = next;
       render();
+      resetFeedback.observe(previous, next.accounts || []);
       renderAddProviderMenu();
     }
   } catch (err) {
@@ -273,11 +286,11 @@ function windowHTML(win, providerID) {
     ? `<div class="recover"${exactTitle}>↻ +${used}% in ${remaining || 'a moment'}</div>`
     : '';
   const color = PROVIDER_BAR_COLORS[providerID] || 'var(--text)';
-  const fill = left > 0 ? `<div class="fill" style="width:${left}%; background-color:${color}"></div>` : '';
-  const hatch = used > 0 ? `<div class="hatch" style="width:${used}%; color:${color}"></div>` : '';
+  const fill = `<div class="fill" style="width:${left}%; background-color:${color}"></div>`;
+  const hatch = `<div class="hatch" style="width:${used}%; color:${color}"></div>`;
   const bar = `<div class="bar">${fill}${hatch}<span class="bar-label"><span class="bar-name">${escapeHTML(name)}</span><span class="bar-pct">${left}%</span></span>${exact ? `<time class="reset-badge"${exactDate}${exactTitle}>${resetText}</time>` : `<span class="reset-badge">${resetText}</span>`}</div>`;
   return `
-    <div class="window">
+    <div class="window" data-quota-window="${escapeHTML(win.label)}">
       <div class="win-left">
         <div class="win-label">${escapeHTML(win.label)}</div>
         <div class="win-pct">${left}%<span>left</span></div>
@@ -336,7 +349,7 @@ function compactWindowHTML(win) {
   const remaining = fmtRemaining(win.resets_at);
   const exact = remaining ? resetTime(win.resets_at) : null;
   return `
-    <div class="compact-window">
+    <div class="compact-window" data-quota-window="${escapeHTML(win.label)}">
       <div class="compact-window-head">
         <span class="compact-window-name">${escapeHTML(win.label)}</span>
         <strong>${left}% <span>left</span></strong>
@@ -396,7 +409,7 @@ function accountMenuHTML(account) {
   const mode = account.auto_use_reset || 'global';
   const labels = { global: 'Global', on: 'On', off: 'Off' };
   return `
-    ${account.reset_credits?.count > 0 ? `<button type="button" role="menuitem" data-act="use-reset" data-account-id="${escapeHTML(account.id)}">Use reset</button>` : ''}
+    ${account.reset_credits?.count > 0 ? `<button type="button" role="menuitem" data-act="use-reset" data-account-id="${escapeHTML(account.id)}" data-credit-id="${escapeHTML(account.reset_credits.next_id || '')}" ${account.last_reset?.pending ? 'disabled title="Refreshing quota after the last reset"' : ''}>Use reset</button>` : ''}
     ${account.supports_banked_resets ? `
       <div class="menu-auto-reset" role="group" aria-label="Auto-use reset, currently ${account.auto_use_reset_effective ? 'on' : 'off'}">
         <span class="menu-group-label">Auto-use reset · ${account.auto_use_reset_effective ? 'on' : 'off'}</span>
@@ -431,7 +444,6 @@ function render() {
   const focusedMenu = document.activeElement?.matches?.('button[data-account-menu]')
     ? document.activeElement.closest('.account')?.dataset.id
     : activeAccountMenu?.anchor.closest('.account')?.dataset.id;
-  closeAccountMenu();
   const byProvider = new Map();
   for (const a of data.accounts) {
     if (!byProvider.has(a.provider)) byProvider.set(a.provider, []);
@@ -452,8 +464,8 @@ function render() {
             <svg viewBox="0 0 12 18" aria-hidden="true"><circle cx="4" cy="3" r="1.5"/><circle cx="10" cy="3" r="1.5"/><circle cx="4" cy="9" r="1.5"/><circle cx="10" cy="9" r="1.5"/><circle cx="4" cy="15" r="1.5"/><circle cx="10" cy="15" r="1.5"/></svg>
           </span>
           <span class="logo logo-${providerID}">${LOGOS[providerID] || ''}</span>
-          ${providerID === 'claude' ? claudeSessionSync.html() : ''}
           <h2>${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</h2>
+          ${providerID === 'claude' ? claudeSessionSync.html() : ''}
           <span class="count">${accounts.length}</span>
           <button class="add-provider" data-add="${providerID}">Add account</button>
           <span class="provider-tools">
@@ -465,20 +477,35 @@ function render() {
         </div>
       </section>`;
   });
-  // Keep an open sync-error disclosure and its focus through usage polls.
-  const syncControl = providersEl.querySelector('.claude-sync-control');
-  const syncFocus = syncControl?.contains(document.activeElement) ? document.activeElement : null;
-  providersEl.innerHTML = html;
-  if (syncControl) providersEl.querySelector('.claude-sync-control')?.replaceWith(syncControl);
-  syncFocus?.focus({ preventScroll: true });
-  if (focusedRecheck) {
+  const previousFocus = document.activeElement;
+  patchProviderList(providersEl, html);
+  if (activeAccountMenu && !activeAccountMenu.anchor.isConnected) closeAccountMenu();
+  if (activeAccountMenu) {
+    const account = data.accounts.find(a => a.id === activeAccountMenu.anchor.closest('.account')?.dataset.id);
+    if (account) {
+      const html = accountMenuHTML(account);
+      if (activeAccountMenu.html !== html) {
+        const focused = activeAccountMenu.menu.contains(document.activeElement) ? document.activeElement : null;
+        activeAccountMenu.menu.innerHTML = html;
+        activeAccountMenu.html = html;
+        if (focused) {
+          const buttons = [...activeAccountMenu.menu.querySelectorAll('button:not(:disabled)')];
+          const replacement = buttons.find(b => b.dataset.act === focused.dataset.act && b.dataset.mode === focused.dataset.mode);
+          (replacement || buttons[0])?.focus({ preventScroll: true });
+        }
+      }
+    }
+  }
+  resetFeedback.repaint(data.accounts);
+  if (focusedRecheck && !previousFocus?.isConnected) {
     const card = [...providersEl.querySelectorAll('.account')].find(el => el.dataset.id === focusedRecheck);
     card?.querySelector('.recheck-btn')?.focus({ preventScroll: true });
   }
-  if (focusedMenu) {
+  if (focusedMenu && !activeAccountMenu && !previousFocus?.isConnected) {
     const card = [...providersEl.querySelectorAll('.account')].find(el => el.dataset.id === focusedMenu);
     card?.querySelector('[data-account-menu]')?.focus({ preventScroll: true });
   }
+  if (activeAccountMenu) positionAccountMenu(activeAccountMenu.menu, activeAccountMenu.anchor);
 }
 
 /* ---------- usage ---------- */
@@ -547,6 +574,17 @@ function closeAccountMenu(restoreFocus = false) {
   if (restoreFocus && anchor.isConnected) anchor.focus({ preventScroll: true });
 }
 
+function positionAccountMenu(menu, anchor) {
+  const rect = anchor.getBoundingClientRect();
+  const width = menu.offsetWidth;
+  const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+  const below = rect.bottom + 6;
+  const top = below + menu.offsetHeight <= window.innerHeight - 8
+    ? below : Math.max(8, rect.top - menu.offsetHeight - 6);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
 function openAccountMenu(anchor, account) {
   closeAccountMenu();
   document.querySelector('.prov-menu')?.remove();
@@ -556,18 +594,11 @@ function openAccountMenu(anchor, account) {
   menu.setAttribute('aria-label', `Actions for ${account.email}`);
   menu.innerHTML = accountMenuHTML(account);
   document.body.appendChild(menu);
-  const rect = anchor.getBoundingClientRect();
-  const width = menu.offsetWidth;
-  const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
-  const below = rect.bottom + 6;
-  const top = below + menu.offsetHeight <= window.innerHeight - 8
-    ? below : Math.max(8, rect.top - menu.offsetHeight - 6);
-  menu.style.left = `${left}px`;
-  menu.style.top = `${top}px`;
+  positionAccountMenu(menu, anchor);
   anchor.setAttribute('aria-expanded', 'true');
   const listeners = new AbortController();
-  activeAccountMenu = { menu, anchor, listeners };
-  menu.querySelector('button')?.focus({ preventScroll: true });
+  activeAccountMenu = { menu, anchor, listeners, html: accountMenuHTML(account) };
+  menu.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
   menu.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-act]');
     if (!button) return;
@@ -583,7 +614,7 @@ function openAccountMenu(anchor, account) {
       closeAccountMenu(true);
     } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
       event.preventDefault();
-      const items = [...menu.querySelectorAll('button')];
+      const items = [...menu.querySelectorAll('button:not(:disabled)')];
       const current = items.indexOf(document.activeElement);
       const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
         : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
@@ -683,16 +714,27 @@ async function runAccountAction(button) {
       }
       await refreshState();
     } else if (button.dataset.act === 'use-reset') {
+      const creditID = button.dataset.creditId;
+      if (!creditID) throw new Error('Refresh the account before choosing a banked reset');
+      if (!resetFeedback.begin(id)) return;
       button.disabled = true;
-      const res = await api(`/api/accounts/${id}/use-reset`, { method: 'POST' });
-      const outcomes = {
-        reset: 'Banked reset used; this account is back in rotation',
-        already_redeemed: 'That reset was already spent',
-        nothing_to_reset: 'Nothing to reset right now',
-        no_credit: 'No banked reset available',
-      };
-      toast(outcomes[res.outcome] || 'Done');
-      await refreshState();
+      try {
+        const res = await api(`/api/accounts/${id}/use-reset`, { method: 'POST',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credit_id: creditID }) });
+        stateEpoch++; // an older in-flight state response cannot undo this mutation
+        if (res.account) {
+          const previous = data.accounts;
+          data = { ...data, accounts: data.accounts.map(a => a.id === id ? mergeAccountMutation(a, res.account) : a) };
+          render();
+          if (res.outcome === 'reset') resetFeedback.observe(previous, data.accounts);
+        }
+        const outcomes = {
+          reset: 'Banked reset used', already_redeemed: 'That reset was already spent',
+          nothing_to_reset: 'Nothing to reset right now', no_credit: 'No banked reset available',
+        };
+        toast(outcomes[res.outcome] || 'Done');
+        await pollState();
+      } finally { button.disabled = false; resetFeedback.end(id); }
     } else if (button.dataset.act === 'auto-reset') {
       const mode = button.dataset.mode;
       button.disabled = true;
@@ -928,8 +970,9 @@ function showDeviceModal(verifyURL, userCode, providerTitle) {
 
 // confirmDialog is the in-app replacement for window.confirm: themed,
 // keyboard-friendly, and destructive actions get their own styling.
-function confirmDialog({ title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, logoHTML = '' }) {
+function confirmDialog({ title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, logoHTML = '', initialFocus = 'confirm' }) {
   return new Promise(resolve => {
+    const previousFocus = document.activeElement;
     const overlay = document.createElement('div');
     overlay.className = 'device-overlay confirm-overlay';
     overlay.innerHTML = `
@@ -945,11 +988,21 @@ function confirmDialog({ title, message, confirmLabel = 'Confirm', cancelLabel =
     document.body.appendChild(overlay);
     const ok = overlay.querySelector('[data-ok]');
     const cancel = overlay.querySelector('[data-cancel]');
-    ok.focus();
-    const close = (value) => { overlay.remove(); document.removeEventListener('keydown', onKey); resolve(value); };
+    (initialFocus === 'cancel' ? cancel : ok).focus();
+    const close = (value) => {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+      if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
+      resolve(value);
+    };
     const onKey = (e) => {
-      if (e.key === 'Escape') close(false);
-      if (e.key === 'Enter') close(true);
+      if (e.key === 'Escape') { e.preventDefault(); close(false); }
+      // Enter activates the focused button natively. It must not confirm
+      // while Cancel is focused.
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        (document.activeElement === ok ? cancel : ok).focus();
+      }
     };
     ok.addEventListener('click', () => close(true));
     cancel.addEventListener('click', () => close(false));
@@ -1094,9 +1147,24 @@ async function runUpdateFlow(button) {
 
 /* ---------- boot ---------- */
 
-refreshState().then(refreshAllUsage);
-scheduleUsage();
-let stateTimer = setInterval(refreshState, 4000);
+let stateTimer;
+let pollRequest = 0;
+async function pollState() {
+  const request = ++pollRequest;
+  clearTimeout(stateTimer);
+  if (document.hidden || authState.locked) return;
+  await refreshState();
+  if (request === pollRequest && !document.hidden && !authState.locked) {
+    const pendingReset = data.accounts.some(account => account.last_reset?.pending);
+    stateTimer = setTimeout(pollState, pendingReset ? 1000 : 4000);
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  pollRequest++;
+  clearTimeout(stateTimer);
+  if (!document.hidden) pollState();
+});
+pollState();
 window.addEventListener('pageshow', (event) => {
   if (event.persisted) location.reload();
 });

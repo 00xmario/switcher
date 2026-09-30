@@ -1,7 +1,7 @@
 BINARY := switcher
 VERSION ?= $(shell cat VERSION 2>/dev/null || echo dev)
 
-.PHONY: build test vet verify install run dev clean
+.PHONY: build test vet verify benchmark-menu install run dev clean
 
 build:
 	go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BINARY) .
@@ -22,6 +22,8 @@ verify:
 	node web/app_state_test.mjs
 	node web/login_test.mjs
 	node web/claude-sync_test.mjs
+	node web/account-updates_test.mjs
+	node web/account-updates_motion_test.mjs
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
 			build/macos/menubar_layout_test.swift -o "$$tmp/switcher-layout-test"; \
@@ -36,6 +38,19 @@ verify:
 
 install: build
 	install -m 0755 $(BINARY) "$(shell go env GOPATH)/bin"
+
+# Optimized build with bundled logos and six synthetic accounts. Never starts
+# a server, reads real accounts, or invokes Desktop/session-sync actions.
+benchmark-menu:
+	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		app="$$tmp/MenuBench.app"; mkdir -p "$$app/Contents/MacOS" "$$app/Contents/Resources"; \
+		cp build/macos/Info.plist "$$app/Contents/Info.plist"; \
+		plutil -replace CFBundleIdentifier -string sh.switcher.benchmark "$$app/Contents/Info.plist"; \
+		plutil -replace CFBundleExecutable -string MenuBench "$$app/Contents/Info.plist"; \
+		cp build/macos/logos/*.svg web/logo.svg build/macos/AppIcon.icns "$$app/Contents/Resources/"; \
+		swiftc -O -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
+			build/macos/menubar_perf_test.swift -o "$$app/Contents/MacOS/MenuBench"; \
+		"$$app/Contents/MacOS/MenuBench"
 
 run: build
 	./$(BINARY)

@@ -24,6 +24,13 @@ type fakeCreditProvider struct {
 	listErr   error
 }
 
+func (f *fakeCreditProvider) Usage(context.Context, store.Account) (provider.Usage, error) {
+	f.mu.Lock()
+	spent := len(f.consumed)
+	f.mu.Unlock()
+	return provider.Usage{Available: true, Windows: []provider.UsageWindow{{Label: "Session", ResetsAt: int64(100000 + spent)}}}, nil
+}
+
 func (f *fakeCreditProvider) ListResetCredits(context.Context, store.Account) ([]provider.ResetCredit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

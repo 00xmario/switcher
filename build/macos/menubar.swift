@@ -28,18 +28,18 @@ let menuWidth: CGFloat = 340
 let edgeInset: CGFloat = 16      // menu-level padding (left + right)
 let cardInset: CGFloat = 14      // padding inside cards
 
-struct UsageWindow: Codable {
+struct UsageWindow: Codable, Equatable {
     let label: String
     let used_percent: Int
     let resets_at: Double?
 }
 
-struct Usage: Codable {
+struct Usage: Codable, Equatable {
     let available: Bool
     let windows: [UsageWindow]?
 }
 
-struct ResetCredits: Codable {
+struct ResetCredits: Codable, Equatable {
     let count: Int
 }
 
@@ -48,7 +48,7 @@ func bankedResetText(_ credits: ResetCredits?) -> String? {
     return "⚡ \(count) banked"
 }
 
-struct Account: Codable {
+struct Account: Codable, Equatable {
     let id: String
     let provider: String
     let email: String
@@ -59,12 +59,12 @@ struct Account: Codable {
     let reset_credits: ResetCredits?
 }
 
-struct UpdateInfo: Codable {
+struct UpdateInfo: Codable, Equatable {
     let latest: String?
     let update_available: Bool?
 }
 
-struct AppState: Codable {
+struct AppState: Codable, Equatable {
     let accounts: [Account]
     let order: [String]?
     let hidden: [String]?
@@ -78,7 +78,7 @@ private let resetPrefix = "sh.switcher.reset."
 private let resetCatchupInterval: TimeInterval = 24 * 3600
 private let resetRolloverLead: TimeInterval = 5 * 60
 
-struct ResetAlert: Codable {
+struct ResetAlert: Codable, Equatable {
     let id: String
     let accountID: String
     let providerID: String
@@ -87,7 +87,7 @@ struct ResetAlert: Codable {
     let date: Date
 }
 
-struct ResetAlertLedger: Codable {
+struct ResetAlertLedger: Codable, Equatable {
     let alerts: [ResetAlert]
     let deliveredIDs: [String]
 }
@@ -294,13 +294,14 @@ func sectionHead(_ providerID: String, contentWidth: CGFloat, syncPhase: String 
     logo.contentTintColor = inkColor
     let name = label(providerNames[providerID] ?? providerID,
         font: NSFont.systemFont(ofSize: 13, weight: .semibold), color: inkColor)
-    let syncWidth: CGFloat = providerID == "claude" ? 30 : 0
-    name.frame = NSRect(x: edgeInset + 22 + 10 + syncWidth, y: 8, width: contentWidth - 32 - syncWidth, height: 16)
+    let nameWidth = providerID == "claude"
+        ? ceil(textWidth(name.stringValue, font: name.font!)) : contentWidth - 32
+    name.frame = NSRect(x: edgeInset + 22 + 10, y: 8, width: nameWidth, height: 16)
     head.addSubview(logo)
     head.addSubview(name)
     if providerID == "claude" {
         let button = ClaudeSyncButton(phase: syncPhase, onSync: onSync)
-        button.frame = NSRect(x: edgeInset + 25, y: 3, width: 26, height: 26)
+        button.frame = NSRect(x: name.frame.maxX + 6, y: 3, width: 26, height: 26)
         head.addSubview(button)
     }
     return head
@@ -317,12 +318,12 @@ final class ClaudeSyncButton: NSButton {
         isBordered = false
         title = ""
         setAccessibilityLabel("Sync Claude Code sessions between accounts")
-        toolTip = "Sync Claude Code sessions between accounts\nMakes new chats visible on your other Claude accounts. Shared conversations use the same local transcript. Closes and reopens Claude Desktop."
+        toolTip = "Sync Claude Code sessions between accounts\nConfirmation required: this closes and reopens Claude Desktop."
         target = self
         action = #selector(clicked)
         wantsLayer = true
         layer?.cornerRadius = 7
-        let symbol = phase == "success" ? "checkmark" : phase == "error" ? "exclamationmark.circle" : "arrow.triangle.2.circlepath"
+        let symbol = phase == "success" ? "checkmark" : phase == "error" ? "exclamationmark.circle" : "arrow.left.arrow.right"
         image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
         contentTintColor = phase == "success" ? accentColor : phase == "error" ? NSColor.systemRed : dimColor
@@ -357,6 +358,17 @@ struct ClaudeSyncResponse: Decodable {
     struct SyncResult: Decodable { let backup: String? }
 }
 
+func claudeSyncConfirmation() -> NSAlert {
+    let alert = NSAlert()
+    alert.messageText = "Sync Claude Code sessions?"
+    alert.informativeText = "This will close and reopen Claude Desktop, even if it is running in the background. Finish any active work first. Switcher will back up the Desktop session indexes and copy only missing session pointers between accounts. Existing records and conversation transcripts stay unchanged."
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: "Sync sessions")
+    alert.buttons[0].keyEquivalent = "\r"
+    alert.buttons[1].keyEquivalent = ""
+    return alert
+}
+
 // Copilot's single-path mark and Grok's glyph follow the current palette;
 // other provider marks retain their own colours.
 func logoUsesTemplate(_ providerID: String) -> Bool {
@@ -365,16 +377,31 @@ func logoUsesTemplate(_ providerID: String) -> Bool {
 
 // providerLogoImage loads the same provider marks used by the web app.
 func providerLogoImage(_ providerID: String) -> NSImage? {
+    let key = "\(providerID)|\(palette.dark)" as NSString
+    if let cached = menuLogoCache.object(forKey: key) { return cached }
     guard let url = Bundle.main.url(forResource: providerID, withExtension: "svg") else {
         return nil
     }
     guard let image = NSImage(contentsOf: url) else { return nil }
     image.isTemplate = logoUsesTemplate(providerID)
-    if providerID == "opencode" && palette.dark {
-        return invertedImage(image, size: NSSize(width: 22, height: 22)) ?? image
-    }
-    return image
+    let result = providerID == "opencode" && palette.dark
+        ? invertedImage(image, size: NSSize(width: 22, height: 22)) ?? image : image
+    menuLogoCache.setObject(result, forKey: key)
+    return result
 }
+
+private let menuImageContext = CIContext()
+private let menuLogoCache: NSCache<NSString, NSImage> = {
+    let cache = NSCache<NSString, NSImage>(); cache.countLimit = 32; return cache
+}()
+private let menuBlurCache: NSCache<NSString, NSImage> = {
+    let cache = NSCache<NSString, NSImage>(); cache.countLimit = 128; cache.totalCostLimit = 8 * 1024 * 1024; return cache
+}()
+private let menuTextWidths: NSCache<NSString, NSNumber> = {
+    let cache = NSCache<NSString, NSNumber>(); cache.countLimit = 512; return cache
+}()
+private let menuResetFormatter = DateFormatter()
+private var menuResetFormatKey = ""
 
 // invertedImage renders an image and inverts its colours (dark mode
 // counterpart of the web app's CSS invert on the OpenCode mark).
@@ -391,7 +418,7 @@ func invertedImage(_ image: NSImage, size: NSSize) -> NSImage? {
           let masked = CIFilter(name: "CIBlendWithAlphaMask", parameters: [
               kCIInputImageKey: inverted, kCIInputBackgroundImageKey: CIImage.empty(), kCIInputMaskImageKey: input,
           ])?.outputImage,
-          let result = CIContext().createCGImage(masked, from: input.extent) else { return nil }
+          let result = menuImageContext.createCGImage(masked, from: input.extent) else { return nil }
     return NSImage(cgImage: result, size: size)
 }
 
@@ -413,10 +440,15 @@ func resetRemaining(_ untilUnix: Double?) -> String? {
 func exactResetTime(_ untilUnix: Double?) -> String? {
     guard let untilUnix = untilUnix, untilUnix.isFinite,
           untilUnix > Date().timeIntervalSince1970 else { return nil }
-    let formatter = DateFormatter()
-    formatter.dateStyle = .full
-    formatter.timeStyle = .full
-    formatter.timeZone = .current
+    let formatter = menuResetFormatter
+    let formatKey = Locale.current.identifier + "|" + TimeZone.current.identifier
+    if menuResetFormatKey != formatKey {
+        formatter.locale = .current
+        formatter.dateStyle = .full
+        formatter.timeStyle = .full
+        formatter.timeZone = .current
+        menuResetFormatKey = formatKey
+    }
     let date = Date(timeIntervalSince1970: untilUnix)
     let offset = TimeZone.current.secondsFromGMT(for: date)
     let sign = offset >= 0 ? "+" : "-"
@@ -429,10 +461,15 @@ func exactResetTime(_ untilUnix: Double?) -> String? {
 // textWidth measures the frame width a label needs for a string, using a
 // real NSTextField so the field's own padding is included.
 func textWidth(_ text: String, font: NSFont) -> CGFloat {
+    let key = String(reflecting: [text, font.fontName, String(describing: font.pointSize),
+        String(describing: font.fontDescriptor.object(forKey: .traits))]) as NSString
+    if let cached = menuTextWidths.object(forKey: key) { return CGFloat(cached.doubleValue) }
     let probe = NSTextField(labelWithString: text)
     probe.font = font
     probe.sizeToFit()
-    return ceil(probe.frame.width) + 2
+    let width = ceil(probe.frame.width) + 2
+    menuTextWidths.setObject(NSNumber(value: Double(width)), forKey: key)
+    return width
 }
 
 struct UsageLineLayout {
@@ -556,6 +593,11 @@ func renderBitmap(_ view: NSView) -> NSBitmapImageRep? {
 let blurRadius: Double = 5
 
 func blurredImage(of field: NSTextField) -> NSImage? {
+    let key = String(reflecting: [field.stringValue, String(describing: field.bounds.size),
+        field.font?.fontName ?? "", String(describing: field.font?.pointSize),
+        String(describing: field.font?.fontDescriptor.object(forKey: .traits)),
+        String(describing: field.textColor?.usingColorSpace(.deviceRGB)), String(palette.dark), "scale=2"]) as NSString
+    if let cached = menuBlurCache.object(forKey: key) { return cached }
     guard let rep = renderBitmap(field), let cg = rep.cgImage else { return nil }
     let input = CIImage(cgImage: cg)
     guard let clamp = CIFilter(name: "CIAffineClamp"), let blur = CIFilter(name: "CIGaussianBlur") else { return nil }
@@ -564,8 +606,9 @@ func blurredImage(of field: NSTextField) -> NSImage? {
     blur.setValue(clamp.outputImage, forKey: kCIInputImageKey)
     blur.setValue(blurRadius * 2, forKey: kCIInputRadiusKey) // radius in 2x pixels
     guard let output = blur.outputImage?.cropped(to: input.extent),
-          let result = CIContext().createCGImage(output, from: input.extent) else { return nil }
+          let result = menuImageContext.createCGImage(output, from: input.extent) else { return nil }
     let image = NSImage(cgImage: result, size: field.bounds.size)
+    menuBlurCache.setObject(image, forKey: key, cost: result.bytesPerRow * result.height)
     return image
 }
 
@@ -703,25 +746,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     let menu = NSMenu()
     var serverProcess: Process?
     var cachedState: AppState?
-    var cachedRaw: Data?
     var hoverCards: [HoverCard] = []
     var hoverTimer: Timer?
     var menuOpen = false
     private var stateRequest = 0
+    private var providerItems: [String: NSMenuItem] = [:]
+    private var providerHovers: [String: HoverCard] = [:]
+    private var countdownLabels: [(NSTextField, Double)] = []
+    private var nextExhaustionChange = Date.distantFuture
     private var claudeSyncPhase = "idle"
     private var claudeSyncDetail = ""
     private var claudeSyncGeneration = 0
+    private var claudeSyncConfirming = false
     private var resetAlerts: [ResetAlert] = []
     private var deliveredResetIDs = Set<String>()
     private var sendingResetIDs = Set<String>()
     private var permissionRequested = false
     private var notificationPermission: ResetAlertPermission?
     private let resetLedgerURL = URL(fileURLWithPath: NSHomeDirectory() + "/.switcher/reset-alerts.json")
+    private var savedResetLedger: ResetAlertLedger?
 
     private func persistResetAlerts() {
+        let ledger = ResetAlertLedger(alerts: resetAlerts, deliveredIDs: deliveredResetIDs.sorted())
+        guard ledger != savedResetLedger else { return }
         do {
-            try saveResetAlertLedger(ResetAlertLedger(alerts: resetAlerts,
-                deliveredIDs: deliveredResetIDs.sorted()), at: resetLedgerURL)
+            try saveResetAlertLedger(ledger, at: resetLedgerURL)
+            savedResetLedger = ledger
         } catch {
             NSLog("Switcher could not save reset alerts: %@", error.localizedDescription)
         }
@@ -748,6 +798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let ledger = try loadResetAlertLedger(at: resetLedgerURL)
             resetAlerts = ledger.alerts
             deliveredResetIDs = Set(ledger.deliveredIDs)
+            savedResetLedger = ledger
         } catch {
             NSLog("Switcher could not load reset alerts: %@", error.localizedDescription)
         }
@@ -770,12 +821,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // the data changed. A poll drives hover while open.
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
-        rebuildMenu()
+        prepareMenuForOpening()
         fetchStateAsync()
         hoverTimer?.invalidate()
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.pollHover() }
         RunLoop.main.add(timer, forMode: .common)
         hoverTimer = timer
+    }
+
+    // The menu is built ahead of the click. Only time-sensitive labels need
+    // attention here; expensive image rendering stays off the opening path.
+    func prepareMenuForOpening(now: Date = Date()) {
+        if menu.items.isEmpty || palette.dark != Palette.current().dark || now >= nextExhaustionChange {
+            rebuildMenu()
+            return
+        }
+        for (label, reset) in countdownLabels {
+            guard let remaining = resetRemaining(reset) else { label.isHidden = true; continue }
+            let text = "↻ " + remaining
+            if textWidth(text, font: label.font!) > label.frame.width {
+                rebuildMenu()
+                return
+            }
+            label.isHidden = false
+            label.stringValue = text
+            label.toolTip = exactResetTime(reset)
+        }
+    }
+
+    // Compare only the data the menu actually decodes. Health timestamps and
+    // other web-only API fields cannot force a menu rebuild.
+    func applyMenuState(_ state: AppState) {
+        let previous = cachedState
+        cachedState = state
+        if Date() >= nextExhaustionChange { rebuildMenu(); return }
+        guard previous != state else { return }
+        guard let previous = previous, previous.order == state.order, previous.hidden == state.hidden,
+              previous.version == state.version, previous.update == state.update,
+              previous.menu_usage_bars == state.menu_usage_bars,
+              previous.reset_notifications == state.reset_notifications,
+              palette.dark == Palette.current().dark else { rebuildMenu(); return }
+        let oldProviders = Set(previous.accounts.map(\.provider))
+        let newProviders = Set(state.accounts.map(\.provider))
+        guard oldProviders == newProviders else { rebuildMenu(); return }
+        for providerID in providerItems.keys {
+            let accounts = state.accounts.filter { $0.provider == providerID }
+            if accounts == previous.accounts.filter({ $0.provider == providerID }) { continue }
+            let card = providerCard(providerID: providerID, accounts: accounts,
+                contentWidth: menuWidth - 2 * edgeInset, showUsageBars: state.menu_usage_bars ?? true)
+            providerItems[providerID]?.view = centered(card)
+            providerHovers[providerID] = card as? HoverCard
+        }
+        hoverCards = Array(providerHovers.values)
+        // Discard references to labels in replaced provider cards.
+        countdownLabels.removeAll { label, _ in
+            !providerHovers.values.contains { label.isDescendant(of: $0) }
+        }
+        updateExhaustionDeadline()
+    }
+
+    private func updateExhaustionDeadline() {
+        let now = Date()
+        nextExhaustionChange = (cachedState?.accounts ?? []).compactMap { $0.exhausted_until }
+            .map { Date(timeIntervalSince1970: $0) }.filter { $0 > now }.min() ?? .distantFuture
+    }
+
+    func applyNotificationPermission(_ permission: ResetAlertPermission) {
+        guard notificationPermission != permission else { return }
+        notificationPermission = permission
+        // The prepared menu must be ready on the next click, even when the
+        // permission result arrived while it was closed.
+        rebuildMenu()
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -792,9 +908,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     // fetchStateAsync refreshes the cache off the main thread. The menu is
     // rebuilt only when the JSON differs from what is currently shown.
-    func fetchStateAsync() {
+    func beginStateRequest() -> Int {
         stateRequest += 1
-        let serial = stateRequest
+        return stateRequest
+    }
+
+    @discardableResult
+    func acceptStateResponse(_ state: AppState, serial: Int) -> Bool {
+        guard serial == stateRequest else { return false }
+        applyMenuState(state)
+        return true
+    }
+
+    func fetchStateAsync() {
+        let serial = beginStateRequest()
         var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
         request.timeoutInterval = 5
         let token = currentDeviceToken()
@@ -808,11 +935,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let decoded = try? JSONDecoder().decode(AppState.self, from: data) else { return }
             DispatchQueue.main.async {
-                guard serial >= self.stateRequest else { return }
-                let changed = self.cachedRaw != data
-                self.cachedState = decoded
-                self.cachedRaw = data
-                if changed { self.rebuildMenu() }
+                guard self.acceptStateResponse(decoded, serial: serial) else { return }
+                if self.menuOpen { self.prepareMenuForOpening() }
                 self.updateResetAlerts()
             }
         }.resume()
@@ -835,18 +959,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 let permission = resetAlertPermission(settings)
-                if self.notificationPermission != permission {
-                    self.notificationPermission = permission
-                    if self.menuOpen { self.rebuildMenu() }
-                }
+                self.applyNotificationPermission(permission)
                 guard settings.authorizationStatus == .notDetermined,
                       self.cachedState?.reset_notifications == true, !self.permissionRequested else { return }
                 self.permissionRequested = true
                 center.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
                     center.getNotificationSettings { result in
                         DispatchQueue.main.async {
-                            self?.notificationPermission = resetAlertPermission(result)
-                            if self?.menuOpen == true { self?.rebuildMenu() }
+                            self?.applyNotificationPermission(resetAlertPermission(result))
                         }
                     }
                 }
@@ -865,6 +985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let now = Date()
         let due = dueResetAlerts(resetAlerts, now: now, delivered: deliveredResetIDs, sending: sendingResetIDs)
         guard !due.isEmpty else { return }
+        let serial = beginStateRequest()
         // Read the server's current preference immediately before delivery.
         // If it is unavailable, skip the alert rather than risk showing one
         // after the user turned the setting off in the web app.
@@ -876,7 +997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                   let state = try? JSONDecoder().decode(AppState.self, from: data) else { return }
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.cachedState = state
+                guard self.acceptStateResponse(state, serial: serial) else { return }
                 self.updateResetAlerts()
                 guard state.reset_notifications == true, resetAlertsEnabledOnDisk() else { return }
                 let valid = Set(self.resetAlerts.map(\.id))
@@ -976,6 +1097,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     func rebuildMenu() {
         menu.removeAllItems()
+        providerItems.removeAll()
+        providerHovers.removeAll()
+        countdownLabels.removeAll()
+        updateExhaustionDeadline()
         let contentWidth = menuWidth - 2 * edgeInset
 
         // Header: app icon with name and version beside it, block centered.
@@ -991,7 +1116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let blockX = (menuWidth - blockWidth) / 2
         let logo = NSImageView(frame: NSRect(x: blockX, y: 11, width: 36, height: 36))
         // Same SVG as the web app header, so the two marks are identical.
-        logo.image = Bundle.main.url(forResource: "logo", withExtension: "svg").flatMap { NSImage(contentsOf: $0) }
+        logo.image = providerLogoImage("logo")
             ?? Bundle.main.image(forResource: "AppIcon")
         headerView.addSubview(logo)
         let nameField = label("Switcher", font: nameFont, color: inkColor)
@@ -1046,7 +1171,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 }
                 let card = providerCard(providerID: providerID, accounts: accounts,
                     contentWidth: contentWidth, showUsageBars: state?.menu_usage_bars ?? true)
-                menu.addItem(menuItemWithView(centered(card)))
+                let item = menuItemWithView(centered(card))
+                providerItems[providerID] = item
+                providerHovers[providerID] = card as? HoverCard
+                menu.addItem(item)
             }
         }
 
@@ -1213,6 +1341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 if let reset = line.resetText, let frame = line.reset {
                     let resetLabel = label(reset, font: resetFont, color: dimColor)
                     resetLabel.toolTip = exactResetTime(window.resets_at)
+                    if let timestamp = window.resets_at { countdownLabels.append((resetLabel, timestamp)) }
                     resetLabel.alignment = .right
                     resetLabel.frame = frame
                     row.addSubview(resetLabel)
@@ -1252,7 +1381,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // MARK: actions
 
     func syncClaudeSessions() {
-        guard claudeSyncPhase != "running" else { return }
+        guard claudeSyncPhase != "running", !claudeSyncConfirming else { return }
+        claudeSyncConfirming = true
+        menu.cancelTracking()
+        NSApp.activate(ignoringOtherApps: true)
+        let confirmed = claudeSyncConfirmation().runModal() == .alertSecondButtonReturn
+        claudeSyncConfirming = false
+        guard confirmed else { return }
         claudeSyncGeneration += 1
         let generation = claudeSyncGeneration
         claudeSyncPhase = "running"
