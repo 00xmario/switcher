@@ -21,6 +21,7 @@ verify:
 	node --check web/login.js
 	node web/app_state_test.mjs
 	node web/login_test.mjs
+	node web/claude-sync_test.mjs
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
 			build/macos/menubar_layout_test.swift -o "$$tmp/switcher-layout-test"; \

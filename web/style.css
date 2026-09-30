@@ -163,6 +163,19 @@ button:disabled { opacity: .45; cursor: default; }
 }
 .provider-head .logo { display: grid; place-items: center; width: 22px; height: 22px; color: var(--text); }
 .provider-head .logo svg { width: 20px; height: 20px; }
+.claude-sync-control { position: relative; display: inline-flex; flex: none; cursor: default; }
+.provider-head .claude-sync-button { display: grid; place-items: center; width: 26px; height: 26px; padding: 4px; background: transparent; color: var(--dim); border: 1px solid transparent; border-radius: 7px; }
+.provider-head .claude-sync-button:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: var(--border); }
+.claude-sync-button svg { width: 16px; height: 16px; }
+.claude-sync-button.running svg { animation: usage-spin .8s linear infinite; }
+.provider-head .claude-sync-button.success, .provider-head .claude-sync-button.success:hover:not(:disabled) { color: var(--accent); }
+.provider-head .claude-sync-button.error, .provider-head .claude-sync-button.error:hover:not(:disabled) { color: var(--danger); }
+.claude-sync-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.claude-sync-feedback { position: absolute; z-index: 45; top: 34px; left: 0; width: min(300px, 65vw); padding: 12px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); font-size: 13px; font-weight: 500; }
+.claude-sync-feedback span { display: block; margin-top: 4px; font-size: 12px; color: var(--dim); font-weight: 400; overflow-wrap: anywhere; }
+.claude-sync-feedback.error summary { cursor: pointer; color: var(--danger); }
+.claude-sync-feedback pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; font-family: inherit; font-size: 12px; line-height: 1.5; }
+@media (prefers-reduced-motion: reduce) { .claude-sync-button.running svg { animation: none; } }
 .provider-head h2 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
 .provider-head .count { color: var(--faint); font-size: 13px; }
 .provider-head .add-provider { margin-left: auto; padding: 6px 12px; font-size: 13px; border-radius: 8px; background: transparent; }

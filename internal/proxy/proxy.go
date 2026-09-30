@@ -101,6 +101,7 @@ type Manager struct {
 	// retry loop cannot drain every banked reset on a limit that a reset
 	// does not actually clear.
 	autoResetAt map[string]time.Time
+	planChecked map[string]time.Time
 }
 
 // New loads persisted state and returns the proxy manager. registration is
@@ -160,6 +161,7 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		generation:        map[string]uint64{},
 		accountRevision:   map[string]uint64{},
 		autoResetAt:       map[string]time.Time{},
+		planChecked:       map[string]time.Time{},
 		selectionRevision: map[string]uint64{},
 		probeBootID:       hex.EncodeToString(boot[:]),
 		order:             order,
@@ -293,6 +295,7 @@ func (m *Manager) Remove(id string) {
 }
 
 func (m *Manager) removeLocked(id string) {
+	delete(m.planChecked, id)
 	delete(m.exhausted, id)
 	delete(m.lastUsage, id)
 	delete(m.health, id)
@@ -400,6 +403,7 @@ func (m *Manager) saveAccount(a store.Account) error {
 	}
 	m.generation[a.ID]++
 	m.accountRevision[a.ID]++
+	delete(m.planChecked, a.ID)
 	delete(m.health, a.ID)
 	delete(m.lastUsage, a.ID)
 	return nil
@@ -623,6 +627,35 @@ func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, for
 			log.Printf("proxy: usage unavailable for %s (%s): %v", a.Email, a.Provider, err)
 		}
 		return m.recordUsage(id, gen, provider.Usage{}, false, err)
+	}
+	// Some providers expose plan metadata separately from usage. Save it
+	// under the same account lock as rotating credentials and preferences.
+	if reader, ok := prov.(interface {
+		ResolvePlan(context.Context, store.Account) (string, error)
+	}); ok {
+		m.mu.Lock()
+		due := force || time.Since(m.planChecked[id]) >= time.Hour
+		if due {
+			// Failures retry in five minutes; successful metadata stays fresh
+			// for an hour. Manual Recheck bypasses this metadata backoff.
+			m.planChecked[id] = time.Now().Add(-55 * time.Minute)
+		}
+		m.mu.Unlock()
+		if due {
+			if plan, err := reader.ResolvePlan(ctx, a); err == nil && plan != "" {
+				if plan != a.Plan {
+					a.Plan = plan
+					err = m.store.Save(a)
+				}
+				if err != nil {
+					log.Printf("proxy: save account plan: %v", err)
+				} else {
+					m.mu.Lock()
+					m.planChecked[id] = time.Now()
+					m.mu.Unlock()
+				}
+			}
+		}
 	}
 	return m.recordUsage(id, gen, usage, true, nil)
 }

@@ -9,6 +9,22 @@ func fail(_ message: String) -> Never {
 @main
 struct MenuBarLayoutTest {
     static func main() {
+        guard planNames["claude_max_5x"] == "Max 5x",
+              planNames["claude_max_20x"] == "Max 20x",
+              planNames["claude_max"] == "Max" else { fail("Claude Max tiers must not be inferred from a generic max flag") }
+        for phase in ["idle", "running", "success", "error"] {
+            let head = sectionHead("claude", contentWidth: menuWidth - 2 * edgeInset, syncPhase: phase)
+            guard let button = head.subviews.compactMap({ $0 as? ClaudeSyncButton }).first,
+                  button.isEnabled == (phase != "running"),
+                  button.toolTip?.contains("Sync Claude Code sessions between accounts") == true else {
+                fail("Claude sync button missing or has incorrect state")
+            }
+            let labels = head.subviews.compactMap { $0 as? NSTextField }
+            guard labels.allSatisfy({ !$0.frame.intersects(button.frame) }) else { fail("Claude sync button overlaps its title") }
+        }
+        guard !sectionHead("codex", contentWidth: menuWidth - 2 * edgeInset).subviews.contains(where: { $0 is ClaudeSyncButton }) else {
+            fail("Claude sync action appeared on another provider")
+        }
         let now = Date().timeIntervalSince1970
         var cases: [[UsageWindow]] = [
             [UsageWindow(label: "Weekly", used_percent: 3,

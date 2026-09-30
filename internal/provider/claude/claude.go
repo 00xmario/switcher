@@ -462,7 +462,9 @@ type claudeProfile struct {
 		Email string `json:"email"`
 	} `json:"account"`
 	Organization struct {
-		Name string `json:"name"`
+		Name          string `json:"name"`
+		Type          string `json:"organization_type"`
+		RateLimitTier string `json:"rate_limit_tier"`
 	} `json:"organization"`
 	HasClaudeMax bool `json:"has_claude_max"`
 	HasClaudePro bool `json:"has_claude_pro"`
@@ -511,17 +513,43 @@ func (p *Provider) ImportFromKeychain(ctx context.Context) (store.Account, error
 	}
 	acc.Email = profile.Account.Email
 	acc.Token.AccountID = profile.Account.UUID
-	if profile.HasClaudeMax {
-		acc.Plan = "max"
-	} else if profile.HasClaudePro {
-		acc.Plan = "pro"
-	}
+	acc.Plan = profile.plan()
 	if acc.Email == "" {
 		return store.Account{}, errors.New("claude profile has no email")
 	}
 	sum := sha256.Sum256([]byte(acc.Provider + "|" + acc.Email + "|" + profile.Account.UUID))
 	acc.ID = fmt.Sprintf("%s-%x", acc.Provider, sum[:4])
 	return acc, nil
+}
+
+// ResolvePlan reads the provider's tier, not an assumption based on a
+// generic Max subscription flag. The proxy calls this at most hourly.
+func (p *Provider) ResolvePlan(ctx context.Context, a store.Account) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	profile, err := p.fetchProfile(ctx, a.Token.AccessToken)
+	if err != nil {
+		return "", err
+	}
+	return profile.plan(), nil
+}
+
+func (p claudeProfile) plan() string {
+	switch p.Organization.RateLimitTier {
+	case "default_claude_max_5x":
+		return "claude_max_5x"
+	case "default_claude_max_20x":
+		return "claude_max_20x"
+	case "default_claude_pro":
+		return "claude_pro"
+	}
+	if p.Organization.Type == "claude_max" || p.HasClaudeMax {
+		return "claude_max"
+	}
+	if p.Organization.Type == "claude_pro" || p.HasClaudePro {
+		return "claude_pro"
+	}
+	return ""
 }
 
 func (p *Provider) fetchProfile(ctx context.Context, accessToken string) (claudeProfile, error) {

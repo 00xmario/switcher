@@ -213,7 +213,8 @@ func recordDeliveredResetAlert(_ id: String, alerts: inout [ResetAlert], deliver
 
 let providerNames = ["codex": "Codex", "claude": "Claude", "grok": "Grok", "opencode": "OpenCode",
     "antigravity": "Antigravity", "gemini": "Gemini", "copilot": "Copilot"]
-let planNames = ["max": "Max 20x", "pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free",
+let planNames = ["claude_max_5x": "Max 5x", "claude_max_20x": "Max 20x", "claude_max": "Max", "claude_pro": "Pro",
+    "max": "Max", "pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "free": "Free",
     "copilot_pro": "Pro", "copilot_pro_plus": "Pro+", "copilot_business": "Business", "copilot_enterprise": "Enterprise",
     "copilot_free": "Free"]
 
@@ -285,7 +286,7 @@ func cardView(width: CGFloat, height: CGFloat) -> NSView {
     return card
 }
 
-func sectionHead(_ providerID: String, contentWidth: CGFloat) -> NSView {
+func sectionHead(_ providerID: String, contentWidth: CGFloat, syncPhase: String = "idle", onSync: (() -> Void)? = nil) -> NSView {
     let head = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 32))
     let logo = NSImageView(frame: NSRect(x: edgeInset, y: 5, width: 22, height: 22))
     logo.imageScaling = .scaleProportionallyUpOrDown
@@ -293,10 +294,67 @@ func sectionHead(_ providerID: String, contentWidth: CGFloat) -> NSView {
     logo.contentTintColor = inkColor
     let name = label(providerNames[providerID] ?? providerID,
         font: NSFont.systemFont(ofSize: 13, weight: .semibold), color: inkColor)
-    name.frame = NSRect(x: edgeInset + 22 + 10, y: 8, width: contentWidth - 32, height: 16)
+    let syncWidth: CGFloat = providerID == "claude" ? 30 : 0
+    name.frame = NSRect(x: edgeInset + 22 + 10 + syncWidth, y: 8, width: contentWidth - 32 - syncWidth, height: 16)
     head.addSubview(logo)
     head.addSubview(name)
+    if providerID == "claude" {
+        let button = ClaudeSyncButton(phase: syncPhase, onSync: onSync)
+        button.frame = NSRect(x: edgeInset + 25, y: 3, width: 26, height: 26)
+        head.addSubview(button)
+    }
     return head
+}
+
+// A native secondary button with a small progress indicator. Unlike the
+// usage refresh animation, its busy state lasts for the actual request.
+final class ClaudeSyncButton: NSButton {
+    private let onSync: (() -> Void)?
+    private var tracking: NSTrackingArea?
+    init(phase: String, onSync: (() -> Void)?) {
+        self.onSync = onSync
+        super.init(frame: NSRect(x: 0, y: 0, width: 26, height: 26))
+        isBordered = false
+        title = ""
+        setAccessibilityLabel("Sync Claude Code sessions between accounts")
+        toolTip = "Sync Claude Code sessions between accounts\nMakes new chats visible on your other Claude accounts. Shared conversations use the same local transcript. Closes and reopens Claude Desktop."
+        target = self
+        action = #selector(clicked)
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        let symbol = phase == "success" ? "checkmark" : phase == "error" ? "exclamationmark.circle" : "arrow.triangle.2.circlepath"
+        image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        contentTintColor = phase == "success" ? accentColor : phase == "error" ? NSColor.systemRed : dimColor
+        isEnabled = phase != "running"
+        if phase == "running" {
+            image = nil
+            let spinner = NSProgressIndicator(frame: NSRect(x: 6, y: 6, width: 14, height: 14))
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.startAnimation(nil)
+            addSubview(spinner)
+            setAccessibilityValue("Syncing")
+        }
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking = tracking { removeTrackingArea(tracking) }
+        tracking = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        if let tracking = tracking { addTrackingArea(tracking) }
+    }
+    override func mouseEntered(with event: NSEvent) { if isEnabled { layer?.backgroundColor = palette.hover.cgColor } }
+    override func mouseExited(with event: NSEvent) { layer?.backgroundColor = NSColor.clear.cgColor }
+    @objc private func clicked() { onSync?() }
+}
+
+struct ClaudeSyncResponse: Decodable {
+    let detail: String?
+    let error: String?
+    let details: String?
+    let result: SyncResult?
+    struct SyncResult: Decodable { let backup: String? }
 }
 
 // Copilot's single-path mark and Grok's glyph follow the current palette;
@@ -650,6 +708,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var hoverTimer: Timer?
     var menuOpen = false
     private var stateRequest = 0
+    private var claudeSyncPhase = "idle"
+    private var claudeSyncDetail = ""
+    private var claudeSyncGeneration = 0
     private var resetAlerts: [ResetAlert] = []
     private var deliveredResetIDs = Set<String>()
     private var sendingResetIDs = Set<String>()
@@ -963,7 +1024,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     menu.addItem(menuItemWithView(spacerView(height: 12)))
                 }
                 let accounts = (state?.accounts ?? []).filter { $0.provider == providerID }
-                menu.addItem(menuItemWithView(sectionHead(providerID, contentWidth: contentWidth)))
+                menu.addItem(menuItemWithView(sectionHead(providerID, contentWidth: contentWidth,
+                    syncPhase: claudeSyncPhase, onSync: { [weak self] in self?.syncClaudeSessions() })))
+                if providerID == "claude" && (claudeSyncPhase == "success" || claudeSyncPhase == "error") {
+                    let feedback = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 48))
+                    if claudeSyncPhase == "error" {
+                        let details = NSButton(title: "Sync failed · Details", target: self, action: #selector(showClaudeSyncError))
+                        details.isBordered = false
+                        details.contentTintColor = .systemRed
+                        details.frame = NSRect(x: edgeInset, y: 10, width: contentWidth, height: 26)
+                        feedback.addSubview(details)
+                    } else {
+                        let text = label("Claude sessions synced\n" + claudeSyncDetail,
+                            font: NSFont.systemFont(ofSize: 11), color: dimColor)
+                        text.maximumNumberOfLines = 2
+                        text.frame = NSRect(x: edgeInset, y: 5, width: contentWidth, height: 38)
+                        text.toolTip = claudeSyncDetail
+                        feedback.addSubview(text)
+                    }
+                    menu.addItem(menuItemWithView(feedback))
+                }
                 let card = providerCard(providerID: providerID, accounts: accounts,
                     contentWidth: contentWidth, showUsageBars: state?.menu_usage_bars ?? true)
                 menu.addItem(menuItemWithView(centered(card)))
@@ -1170,6 +1250,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     // MARK: actions
+
+    func syncClaudeSessions() {
+        guard claudeSyncPhase != "running" else { return }
+        claudeSyncGeneration += 1
+        let generation = claudeSyncGeneration
+        claudeSyncPhase = "running"
+        claudeSyncDetail = ""
+        rebuildMenu()
+        var request = URLRequest(url: hubURL.appendingPathComponent("api/claude/sync"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 90
+        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let body = data.flatMap { try? JSONDecoder().decode(ClaudeSyncResponse.self, from: $0) }
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200 && body?.detail != nil
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.claudeSyncPhase = ok ? "success" : "error"
+                self.claudeSyncDetail = ok ? (body?.detail ?? "No new sessions to share") :
+                    [body?.error, body?.details, error?.localizedDescription,
+                     body?.result?.backup.map { "Backup: " + $0 }].compactMap { $0 }.joined(separator: "\n")
+                if self.claudeSyncDetail.isEmpty { self.claudeSyncDetail = "Could not reach Switcher. Try again." }
+                self.rebuildMenu()
+                if ok {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                        guard self?.claudeSyncPhase == "success", self?.claudeSyncGeneration == generation else { return }
+                        self?.claudeSyncPhase = "idle"
+                        self?.rebuildMenu()
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    @objc func showClaudeSyncError() {
+        let alert = NSAlert()
+        alert.messageText = "Claude session sync did not complete"
+        alert.informativeText = claudeSyncDetail
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
 
     @objc func refreshUsage() {
         post(path: "api/usage/refresh") { [weak self] in

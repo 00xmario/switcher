@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"switcher/internal/claudesync"
 	"switcher/internal/codexcfg"
 	"switcher/internal/config"
 	"switcher/internal/login"
@@ -43,6 +44,7 @@ type API struct {
 	Port              int
 	CodexConfigPath   string // optional test override
 	probeCodexForTest func(context.Context) proxy.ProbeCodexResult
+	syncClaudeForTest func(context.Context, map[string]string) (claudesync.Result, error)
 
 	creditsMu    sync.Mutex
 	creditsCache map[string]creditsEntry
@@ -61,6 +63,7 @@ func (a *API) Register(mux *http.ServeMux) {
 		a.creditsCache = map[string]creditsEntry{}
 	}
 	mux.HandleFunc("GET /api/state", a.handleState)
+	mux.HandleFunc("POST /api/claude/sync", a.handleClaudeSync)
 	mux.HandleFunc("GET /api/cli-setup", a.handleCLISetup)
 	mux.HandleFunc("POST /api/cli-setup/codex/install", a.handleCLISetupInstall)
 	mux.HandleFunc("POST /api/cli-setup/codex/reselect", a.handleCLISetupReselect)

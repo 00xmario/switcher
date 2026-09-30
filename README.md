@@ -91,6 +91,23 @@ required; OpenCode Go uses its own API key.
   from the macOS keychain. The native CLI and Switcher then hold separate
   credential copies; refresh-token coexistence has not been established as
   a native CLI setup path.
+- **Claude Desktop session sync**: the small sync icon beside Claude in the
+  menu bar and web app makes new Claude Code chats discoverable across your
+  Desktop account indexes. It closes Claude Desktop, backs up every
+  `local_*.json` to a unique folder under
+  `~/.claude/desktop-session-sync-backups/`, copies only missing pointers,
+  then reopens Desktop. Existing pointers, archive/deletion markers, and
+  the actual transcripts under `~/.claude/projects/` are left alone.
+  The Go implementation follows the local `claude-sync` script's copy rules,
+  discovers account/workspace indexes automatically, and uses Switcher
+  account names when the account UUID matches. Empty indexes participate.
+  Both controls use the same loopback-only backend operation and report
+  added-pointer counts. On failure, Details includes the backup location
+  if one was created. Quit or backup failures stop the merge.
+- **Claude plan labels**: profile metadata distinguishes Max 5x, Max 20x,
+  and Pro in both UIs. Existing accounts receive plan metadata during usage
+  checks, at most hourly after success. Recheck retries a failed lookup.
+  A generic Max flag is displayed as Max rather than guessing a multiplier.
 - **Relogin per account**: sign in again in one click; the tokens overwrite
   the account in place, keeping its id, active slot, and history.
 - **Banked resets**: Codex usage-limit resets can be spent from the UI. A

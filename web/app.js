@@ -1,4 +1,13 @@
+import { createClaudeSync } from './claude-sync.js';
+
 const providersEl = document.getElementById('providers');
+const claudeSessionSync = createClaudeSync({
+  request: () => fetchWithCSRF('/api/claude/sync', { method: 'POST' }),
+  paint: () => {
+    const control = providersEl.querySelector('.claude-sync-control');
+    if (control) control.outerHTML = claudeSessionSync.html();
+  },
+});
 const themeButtons = document.querySelectorAll('[data-theme-choice]');
 
 let data = { accounts: [], order: [], hidden: [] };
@@ -52,7 +61,8 @@ const PROVIDER_NAMES = { codex: 'Codex', claude: 'Claude', grok: 'Grok', opencod
 // Plan tiers as each provider markets them. Keys are the stored plan
 // values.
 const PLAN_NAMES = {
-  max: 'Max 20x',
+  claude_max_5x: 'Max 5x', claude_max_20x: 'Max 20x', claude_max: 'Max', claude_pro: 'Pro',
+  max: 'Max',
   pro: 'Pro 20x',
   prolite: 'Pro 5x',
   plus: 'Plus',
@@ -442,6 +452,7 @@ function render() {
             <svg viewBox="0 0 12 18" aria-hidden="true"><circle cx="4" cy="3" r="1.5"/><circle cx="10" cy="3" r="1.5"/><circle cx="4" cy="9" r="1.5"/><circle cx="10" cy="9" r="1.5"/><circle cx="4" cy="15" r="1.5"/><circle cx="10" cy="15" r="1.5"/></svg>
           </span>
           <span class="logo logo-${providerID}">${LOGOS[providerID] || ''}</span>
+          ${providerID === 'claude' ? claudeSessionSync.html() : ''}
           <h2>${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</h2>
           <span class="count">${accounts.length}</span>
           <button class="add-provider" data-add="${providerID}">Add account</button>
@@ -454,7 +465,12 @@ function render() {
         </div>
       </section>`;
   });
+  // Keep an open sync-error disclosure and its focus through usage polls.
+  const syncControl = providersEl.querySelector('.claude-sync-control');
+  const syncFocus = syncControl?.contains(document.activeElement) ? document.activeElement : null;
   providersEl.innerHTML = html;
+  if (syncControl) providersEl.querySelector('.claude-sync-control')?.replaceWith(syncControl);
+  syncFocus?.focus({ preventScroll: true });
   if (focusedRecheck) {
     const card = [...providersEl.querySelectorAll('.account')].find(el => el.dataset.id === focusedRecheck);
     card?.querySelector('.recheck-btn')?.focus({ preventScroll: true });
@@ -607,6 +623,10 @@ document.getElementById('update-slot').addEventListener('click', (event) => {
 });
 
 providersEl.addEventListener('click', async (event) => {
+  if (event.target.closest('[data-claude-sync]')) {
+    await claudeSessionSync.run();
+    return;
+  }
   // Emails are blurred for shoulder-surfing privacy; clicking one toggles
   // a sticky reveal.
   const email = event.target.closest('.email');

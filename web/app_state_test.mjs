@@ -158,7 +158,7 @@ assert.equal((compactCard.match(/class="compact-credit"/g) || []).length, 2);
 assert.match(compactCard, /Banked reset expiry[\s\S]*Reset 1[\s\S]*title="Banked reset expires:/);
 
 let compactPage = false;
-const providersEl = { hidden: false, innerHTML: '', querySelectorAll: () => [] };
+const providersEl = { hidden: false, innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
 const renderContext = vm.createContext({
   data: { active: {}, compact_accounts: true, accounts: [
     { id: 'a', provider: 'codex' }, { id: 'b', provider: 'codex' },
