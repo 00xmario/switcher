@@ -224,7 +224,7 @@ function statusOf(account) {
   if (account.exhausted_until * 1000 > Date.now()) {
     return { cls: 'exhausted', label: 'Out of usage' };
   }
-  if (account.id === data.active?.[account.provider]) return { cls: 'active', label: 'Active' };
+  if (accountIsSelected(account)) return { cls: 'active', label: 'Active' };
   return { cls: '', label: 'Idle' };
 }
 
@@ -320,7 +320,7 @@ function windowHTML(win, providerID) {
 }
 
 function accountHTML(account) {
-  const isActive = account.id === data.active?.[account.provider];
+  const isActive = accountIsSelected(account);
   const status = statusOf(account);
   const recheckPending = pendingRechecks.has(account.id);
   const health = recheckPending
@@ -342,6 +342,7 @@ function accountHTML(account) {
           ${accountIdentityHTML(account, isActive)}
           <div class="meta">
             ${plan ? `<span>${escapeHTML(plan)}</span>` : ''}
+            ${account.native_switch_available && account.id === data.active?.claude && !isActive ? '<span>Proxy active</span>' : ''}
             ${status.cls === 'exhausted' ? '<span class="routing-warning">Out of usage</span>' : ''}
             ${account.reset_credits?.count > 0 ? `<span class="banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
           </div>
@@ -351,7 +352,7 @@ function accountHTML(account) {
           <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-label="Recheck account usage" title="Recheck usage" aria-disabled="${recheckPending}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
           </button>
-          ${isActive ? '' : '<button class="use" data-act="activate">Use this account</button>'}
+          ${isActive ? '' : `<button class="use" data-act="activate" ${account.native_switch_available ? 'title="Switch Claude Code’s native login and Switcher’s Claude proxy"' : ''}>${account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
           <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
         </div>
       </div>
@@ -388,7 +389,7 @@ function compactCreditsHTML(credits) {
 }
 
 function compactAccountHTML(account) {
-  const isActive = account.id === data.active?.[account.provider];
+  const isActive = accountIsSelected(account);
   const status = statusOf(account);
   const recheckPending = pendingRechecks.has(account.id);
   const health = recheckPending ? { condition: 'checking' } : (account.health || { condition: 'checking' });
@@ -415,7 +416,7 @@ function compactAccountHTML(account) {
         <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-disabled="${recheckPending}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>Refresh quota
         </button>
-        ${isActive ? '' : '<button class="use" data-act="activate">Use this account</button>'}
+        ${isActive ? '' : `<button class="use" data-act="activate">${account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
       </div>
     </div>`;
 }
@@ -427,10 +428,15 @@ function accountIdentityHTML(account, active) {
   </div>`;
 }
 
+function accountIsSelected(account) {
+  return account.native_switch_available ? account.native_active === true : account.id === data.active?.[account.provider];
+}
+
 function accountMenuHTML(account) {
   const mode = account.auto_use_reset || 'global';
   const labels = { global: 'Global', on: 'On', off: 'Off' };
   return `
+    ${account.native_switch_available ? `<button type="button" role="menuitem" data-act="activate" data-account-id="${escapeHTML(account.id)}">Use in Claude Code</button>` : ''}
     ${account.reset_credits?.count > 0 ? `<button type="button" role="menuitem" data-act="use-reset" data-account-id="${escapeHTML(account.id)}" data-credit-id="${escapeHTML(account.reset_credits.next_id || '')}" ${account.last_reset?.pending ? 'disabled title="Refreshing quota after the last reset"' : ''}>Use reset</button>` : ''}
     ${account.supports_banked_resets ? `
       <div class="menu-auto-reset" role="group" aria-label="Auto-use reset, currently ${account.auto_use_reset_effective ? 'on' : 'off'}">
@@ -713,8 +719,21 @@ async function runAccountAction(button) {
   if (!id) return;
   try {
     if (button.dataset.act === 'activate') {
-      await api(`/api/accounts/${id}/activate`, { method: 'POST' });
-      await refreshState();
+      button.disabled = true;
+      try {
+        const response = await fetchWithCSRF(`/api/accounts/${id}/activate`, { method: 'POST' });
+        const result = await response.json();
+        if (!response.ok) {
+          if (result.details) await confirmDialog({ title: result.error || 'Account switch failed',
+            message: [result.details, result.backup && `Backup: ${result.backup}`].filter(Boolean).join('\n'),
+            confirmLabel: 'Close', cancelLabel: 'Close', initialFocus: 'cancel' });
+          else throw new Error(result.error || 'Account switch failed');
+          return;
+        }
+        stateEpoch++;
+        if (result.native?.message) toast(result.native.message);
+        await refreshState();
+      } finally { button.disabled = false; }
     } else if (button.dataset.act === 'recheck') {
       pendingRechecks.set(id, { accepted: false });
       const account = data.accounts.find(a => a.id === id);
@@ -1661,7 +1680,9 @@ function lanStateText(status) {
 
 function cliSetupRowHTML(client) {
   const codex = client.id === 'codex' && client.capability === 'configure_user_file';
+  const claudeNative = client.id === 'claude-code' && client.capability === 'switch_native_login';
   const condition = client.configuration?.condition;
+  const nativeUnavailable = claudeNative && (client.stage === 'unavailable' || condition === 'unavailable');
   const descriptions = {
     ready: 'Configured in inspected user file',
     missing: 'No Switcher selection in inspected Codex config',
@@ -1671,7 +1692,7 @@ function cliSetupRowHTML(client) {
     other_provider: 'Another provider selected in file',
     misconfigured: 'Switcher entry differs from this server',
   };
-  const summary = codex ? (descriptions[condition] || 'Config status unknown')
+  const summary = claudeNative ? (nativeUnavailable ? 'Native login switching unavailable' : 'Native login switching available') : codex ? (descriptions[condition] || 'Config status unknown')
     : client.stage === 'protocol_validation_pending' ? 'Setup under validation' : 'Setup research';
   const readinessLabels = {
     oauth_coexistence_unverified: 'Native OAuth coexistence unverified',
@@ -1688,6 +1709,8 @@ function cliSetupRowHTML(client) {
     ? `${client.accounts.count} Switcher account${client.accounts.count === 1 ? '' : 's'} stored`
     : 'Switcher account count unavailable';
   let detail = 'Native CLI configuration has not been checked.';
+  if (claudeNative) detail = 'The account switch action writes Claude Code’s native login, preserving shared MCP credentials, project settings, and history. Running macOS sessions may take about 30 seconds to pick it up; reopen Code to apply immediately. This does not switch Claude Desktop’s signed-in account.';
+  if (nativeUnavailable) detail = client.next_step || 'Inspect the Claude Code login status before switching.';
   const verification = client.verification || { condition: 'not_tested' };
   let routeTest = 'Switcher route not tested; native CLI request not tested.';
   if (['last_success', 'historical'].includes(verification.condition) && Number.isFinite(verification.last_success)) {
@@ -1741,7 +1764,7 @@ function cliSetupRowHTML(client) {
     <div><strong>${escapeHTML(client.name)}</strong><span class="dim"> · ${escapeHTML(summary)}</span>
       <details class="cli-setup-details"><summary>${escapeHTML(count)}</summary>
         <p class="cli-setup-evidence">${escapeHTML(detail)}</p>
-        ${!codex ? `<p class="cli-setup-reason">${escapeHTML(readiness)}</p>` : ''}
+        ${!codex && !claudeNative ? `<p class="cli-setup-reason">${escapeHTML(readiness)}</p>` : ''}
         ${codex ? `<p class="cli-setup-evidence">${escapeHTML(routeTest)}</p>` : ''}
       </details></div>
     ${actions.length ? `<div class="cli-setup-actions">${actions.join('')}</div>` : ''}
@@ -1782,6 +1805,13 @@ async function renderSettings() {
         </div>
         <p class="settings-sub">Providers with several accounts show cards in two columns when space allows. Reset times and account actions stay available; single accounts fill the row.</p>
       </div>
+      ${status.claude_code ? `<section class="settings-card">
+        <h2>Claude Code login</h2>
+        <p class="settings-sub">${status.claude_code.available ? 'Claude account actions switch the native Claude Code login and Switcher proxy. Existing Code sessions may take about 30 seconds to update on macOS. Reopen Code for immediate application. Desktop sign-in is separate.' : 'Native switching is unavailable in this server environment.'}</p>
+        <div class="settings-row"><div><strong>${escapeHTML(status.claude_code.condition || 'Checking')}</strong><span class="dim">${status.claude_code.email ? ` · ${escapeHTML(status.claude_code.email)}` : ''}</span></div></div>
+        ${status.claude_code.message ? `<p class="settings-sub">${escapeHTML(status.claude_code.message)}</p>` : ''}
+        <p class="settings-sub">Native refresh tokens are synchronized with Code rather than refreshed independently. Local config, credentials, and switch journals are backed up under ~/.switcher/claude-native/. Use Claude Code /login then import to recover a revoked login. Avoid /logout when changing accounts because it can revoke the old refresh token.</p>
+      </section>` : ''}
       <div class="settings-card">
         <h2>Banked resets</h2>
         <div class="settings-row">

@@ -57,6 +57,9 @@ struct Account: Codable, Equatable {
     let exhausted_until: Double?
     let usage: Usage?
     let reset_credits: ResetCredits?
+    var native_switch_available: Bool? = nil
+    var native_active: Bool? = nil
+    var selected: Bool { native_switch_available == true ? native_active == true : active }
 }
 
 struct UpdateInfo: Codable, Equatable {
@@ -356,6 +359,14 @@ struct ClaudeSyncResponse: Decodable {
     let details: String?
     let result: SyncResult?
     struct SyncResult: Decodable { let backup: String? }
+}
+
+struct AccountActivationResponse: Decodable {
+    let error: String?
+    let details: String?
+    let backup: String?
+    let native: NativeResult?
+    struct NativeResult: Decodable { let message: String? }
 }
 
 func claudeSyncConfirmation() -> NSAlert {
@@ -758,6 +769,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var claudeSyncDetail = ""
     private var claudeSyncGeneration = 0
     private var claudeSyncConfirming = false
+    private var switchingAccountID: String?
+    private var nativeSwitchMessage = ""
     private var resetAlerts: [ResetAlert] = []
     private var deliveredResetIDs = Set<String>()
     private var sendingResetIDs = Set<String>()
@@ -1151,6 +1164,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 let accounts = (state?.accounts ?? []).filter { $0.provider == providerID }
                 menu.addItem(menuItemWithView(sectionHead(providerID, contentWidth: contentWidth,
                     syncPhase: claudeSyncPhase, onSync: { [weak self] in self?.syncClaudeSessions() })))
+                if providerID == "claude", !nativeSwitchMessage.isEmpty {
+                    let row = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 40))
+                    let note = label(nativeSwitchMessage, font: NSFont.systemFont(ofSize: 11), color: dimColor)
+                    note.maximumNumberOfLines = 2
+                    note.frame = NSRect(x: edgeInset, y: 5, width: contentWidth, height: 32)
+                    note.toolTip = nativeSwitchMessage
+                    row.addSubview(note)
+                    menu.addItem(menuItemWithView(row))
+                }
                 if providerID == "claude" && (claudeSyncPhase == "success" || claudeSyncPhase == "error") {
                     let feedback = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 48))
                     if claudeSyncPhase == "error" {
@@ -1265,9 +1287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
             let row = ClickableRow(frame: NSRect(x: 0, y: y, width: contentWidth, height: rowH))
             row.onClicked = { [weak self] in
-                self?.post(path: "api/accounts/\(account.id)/activate") { [weak self] in
-                    DispatchQueue.main.async { self?.fetchStateAsync() }
-                }
+                self?.activateAccount(account)
             }
 
             // Email + plan. Plans sit in one column per card: the email
@@ -1278,10 +1298,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let bankedText = bankedResetText(account.reset_credits) ?? ""
             let bankedFont = NSFont.systemFont(ofSize: 10.5)
             let bankedWidth = bankedText.isEmpty ? CGFloat(0) : textWidth(bankedText, font: bankedFont)
-            let exhausted = !account.active && (account.exhausted_until.map { $0 > Date().timeIntervalSince1970 } ?? false)
-            let titleFont = NSFont.systemFont(ofSize: 12.5, weight: account.active ? .medium : .regular)
-            let titleColor = account.active ? accentColor : inkColor
-            let trailingWidth = max(account.active ? 14 : 0, exhausted ? 90 : 0) +
+            let exhausted = !account.selected && (account.exhausted_until.map { $0 > Date().timeIntervalSince1970 } ?? false)
+            let titleFont = NSFont.systemFont(ofSize: 12.5, weight: account.selected ? .medium : .regular)
+            let titleColor = account.selected ? accentColor : inkColor
+            let trailingWidth = max(account.selected ? 14 : 0, exhausted ? 90 : 0) +
                 (bankedWidth > 0 ? bankedWidth + 8 : 0)
             let titleWidth = contentWidth - textX - cardInset - trailingWidth - 8
             let titleY = rowH - rowTopPad - titleHeight
@@ -1300,7 +1320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 let banked = label(bankedText, font: bankedFont, color: warnColor)
                 banked.alignment = .right
                 banked.toolTip = "Banked usage-limit resets available"
-                banked.frame = NSRect(x: contentWidth - cardInset - (account.active ? 22 : 0) - bankedWidth,
+                banked.frame = NSRect(x: contentWidth - cardInset - (account.selected ? 22 : 0) - bankedWidth,
                                       y: titleY, width: bankedWidth, height: titleHeight)
                 row.addSubview(banked)
             }
@@ -1348,7 +1368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 }
             }
 
-            if account.active {
+            if account.selected {
                 let check = NSImageView(frame: layout.checkmark)
                 check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
                 check.contentTintColor = accentColor
@@ -1379,6 +1399,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     // MARK: actions
+
+    func activateAccount(_ account: Account) {
+        guard switchingAccountID == nil else { return }
+        switchingAccountID = account.id
+        if account.native_switch_available == true {
+            nativeSwitchMessage = "Switching Claude Code login…"
+            rebuildMenu()
+        }
+        var request = URLRequest(url: hubURL.appendingPathComponent("api/accounts/\(account.id)/activate"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 90
+        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let body = data.flatMap { try? JSONDecoder().decode(AccountActivationResponse.self, from: $0) }
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.switchingAccountID = nil
+                self.nativeSwitchMessage = ok ? (body?.native?.message ?? "") : ""
+                self.rebuildMenu()
+                self.fetchStateAsync()
+                if !ok {
+                    let alert = NSAlert()
+                    alert.messageText = body?.error ?? "Could not switch account"
+                    alert.informativeText = [body?.details, body?.backup.map { "Backup: " + $0 }, error?.localizedDescription]
+                        .compactMap { $0 }.joined(separator: "\n")
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                } else if !self.nativeSwitchMessage.isEmpty {
+                    let message = self.nativeSwitchMessage
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                        guard self?.nativeSwitchMessage == message else { return }
+                        self?.nativeSwitchMessage = ""
+                        self?.rebuildMenu()
+                    }
+                }
+            }
+        }.resume()
+    }
 
     func syncClaudeSessions() {
         guard claudeSyncPhase != "running", !claudeSyncConfirming else { return }

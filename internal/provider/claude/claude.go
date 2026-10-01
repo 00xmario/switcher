@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"switcher/internal/claudecode"
 	"switcher/internal/provider"
 	"switcher/internal/store"
 )
@@ -38,8 +39,10 @@ const (
 
 // Provider implements provider.Provider for Claude.
 type Provider struct {
-	mu       sync.Mutex
-	verifier map[string]verifierEntry
+	mu          sync.Mutex
+	verifier    map[string]verifierEntry
+	Native      *claudecode.Manager
+	nativeError error
 }
 
 type verifierEntry struct {
@@ -142,11 +145,33 @@ func (p *Provider) LoginExchange(ctx context.Context, state, code string) (store
 	if err != nil {
 		return store.Account{}, err
 	}
-	return accountFromToken(tok)
+	account, err := accountFromToken(tok)
+	if err == nil && p.Native != nil {
+		if id := p.Native.ExistingID(claudecode.Identity{UUID: tok.Account.UUID, Email: account.Email, OrganizationUUID: tok.Organization.UUID}); id != "" {
+			account.ID = id
+		}
+	}
+	return account, err
 }
 
 // Refresh renews the account's tokens with a JSON refresh request.
 func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
+	if p.nativeError != nil {
+		return fmt.Errorf("%w: %v", provider.ErrNativeCredentialBusy, p.nativeError)
+	}
+	if p.Native != nil {
+		if err := p.Native.Refresh(ctx, a, p.refreshGrant); err != nil {
+			if errors.Is(err, provider.ErrReloginRequired) {
+				return err
+			}
+			return fmt.Errorf("%w: %v", provider.ErrNativeCredentialBusy, err)
+		}
+		return nil
+	}
+	return p.refreshGrant(ctx, a)
+}
+
+func (p *Provider) refreshGrant(ctx context.Context, a *store.Account) error {
 	if a.Token.RefreshToken == "" {
 		return fmt.Errorf("claude refresh: missing refresh token: %w", provider.ErrReloginRequired)
 	}
@@ -154,7 +179,6 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 		"client_id":     clientID,
 		"grant_type":    "refresh_token",
 		"refresh_token": a.Token.RefreshToken,
-		"scope":         scope,
 	})
 	if err != nil {
 		return fmt.Errorf("encode refresh request: %w", err)
@@ -175,10 +199,14 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 		return fmt.Errorf("refresh response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		if provider.RefreshCredentialRejected(resp.StatusCode, raw) {
-			return fmt.Errorf("refresh failed: http %d: %w", resp.StatusCode, provider.ErrReloginRequired)
+		var marker error
+		if definitiveGrantRejection(resp.StatusCode, raw) {
+			marker = claudecode.ErrGrantRejected
 		}
-		return fmt.Errorf("refresh failed: http %d", resp.StatusCode)
+		if provider.RefreshCredentialRejected(resp.StatusCode, raw) {
+			return fmt.Errorf("refresh failed: http %d: %w", resp.StatusCode, errors.Join(provider.ErrReloginRequired, marker))
+		}
+		return errors.Join(fmt.Errorf("refresh failed: http %d", resp.StatusCode), marker)
 	}
 	var tok struct {
 		AccessToken  string `json:"access_token"`
@@ -187,6 +215,9 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	}
 	if err := json.Unmarshal(raw, &tok); err != nil {
 		return fmt.Errorf("refresh response: %w", err)
+	}
+	if tok.AccessToken == "" || tok.ExpiresIn <= 0 {
+		return errors.New("Claude refresh response missing a usable successor token")
 	}
 	if tok.AccessToken != "" {
 		a.Token.AccessToken = tok.AccessToken
@@ -199,6 +230,23 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	}
 	a.LastRefresh = time.Now().Unix()
 	return nil
+}
+
+func definitiveGrantRejection(status int, body []byte) bool {
+	if status != 400 && status != 401 && status != 403 {
+		return false
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	switch payload.Error {
+	case "invalid_grant", "invalid_client", "invalid_request", "invalid_scope", "unauthorized_client":
+		return true
+	}
+	return false
 }
 
 // DeviceStart implements provider.Provider: claude has no device flow.
@@ -433,8 +481,11 @@ func accountFromToken(tok oauthToken) (store.Account, error) {
 	if acc.Email == "" {
 		return store.Account{}, errors.New("token response has no account email")
 	}
-	sum := sha256.Sum256([]byte(acc.Provider + "|" + acc.Email + "|" + tok.Account.UUID))
+	sum := sha256.Sum256([]byte(acc.Provider + "|" + acc.Email + "|" + tok.Account.UUID + "|" + tok.Organization.UUID))
 	acc.ID = fmt.Sprintf("%s-%x", acc.Provider, sum[:4])
+	identity, _ := json.Marshal(claudecode.Identity{UUID: tok.Account.UUID, Email: acc.Email, OrganizationUUID: tok.Organization.UUID, OrganizationName: tok.Organization.Name})
+	credential, _ := json.Marshal(map[string]any{"claudeAiOauth": map[string]any{"accessToken": tok.AccessToken, "refreshToken": tok.RefreshToken, "expiresAt": acc.Token.ExpiresAt * 1000, "scopes": strings.Fields(scope)}})
+	acc.ClaudeCode = &store.ClaudeCodeLogin{Credentials: credential, OAuthAccount: identity}
 	return acc, nil
 }
 
@@ -462,6 +513,7 @@ type claudeProfile struct {
 		Email string `json:"email"`
 	} `json:"account"`
 	Organization struct {
+		UUID          string `json:"uuid"`
 		Name          string `json:"name"`
 		Type          string `json:"organization_type"`
 		RateLimitTier string `json:"rate_limit_tier"`
@@ -476,6 +528,12 @@ type claudeProfile struct {
 // browser flow at all (the same trick T3 Code plays). The first import may
 // prompt the user to approve keychain access for the `security` tool.
 func (p *Provider) ImportFromKeychain(ctx context.Context) (store.Account, error) {
+	if p.nativeError != nil {
+		return store.Account{}, p.nativeError
+	}
+	if p.Native != nil {
+		return p.importNative(ctx)
+	}
 	out, err := exec.CommandContext(ctx, "security", "find-generic-password",
 		"-s", "Claude Code-credentials", "-w").Output()
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"switcher/internal/claudecode"
 	"time"
 
 	"switcher/internal/store"
@@ -58,6 +59,17 @@ func UsageStatusError(status int) error {
 // credential is missing or rejected. Callers should use errors.Is; the
 // surrounding error retains the provider and HTTP status for logs.
 var ErrReloginRequired = errors.New("relogin required")
+
+// Native credentials may be owned by Claude Code or temporarily unreadable.
+// This is not evidence that a refresh token died, and must not park accounts.
+var ErrNativeCredentialBusy = errors.New("native Claude credentials unavailable or managed by Claude Code")
+
+type NativeLoginProvider interface {
+	NativeEnabled() bool
+	NativeStatus() claudecode.Status
+	SwitchNative(context.Context, string, func(string) error) (claudecode.SwitchResult, error)
+	SyncNative(context.Context, *store.Account) (bool, error)
+}
 
 // RefreshCredentialRejected classifies token-endpoint responses, not usage
 // or upstream API responses. A 400 must carry a recognized OAuth error code;

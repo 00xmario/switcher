@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"switcher/internal/claudecode"
 	"switcher/internal/provider"
 	"switcher/internal/store"
 )
@@ -75,24 +76,26 @@ type usageLimitBody struct {
 
 // Manager owns the routing state and the forwarding handler.
 type Manager struct {
-	mu                sync.Mutex
-	store             *store.Store
-	providers         map[string]provider.Provider
-	active            map[string]string // provider -> active account id
-	exhausted         map[string]time.Time
-	lastUsage         map[string]provider.Usage
-	health            map[string]*healthState
-	generation        map[string]uint64 // retained across deletion and replacement
-	accountRevision   map[string]uint64 // credential writes, independent of queued-check generations
-	selectionRevision map[string]uint64 // manual and automatic active-account changes
-	syncing           atomic.Bool
-	probeBusy         atomic.Bool
-	probeBootID       string
-	probeClient       *http.Client // optional internal test seam; production uses a fresh direct client
-	refreshing        map[string]*sync.Mutex
-	order             []string // display order of provider sections
-	hidden            []string // providers dismissed from the UI
-	managementKey     string   // hub management key, kept in state.json
+	nativeActivation   sync.Mutex
+	mu                 sync.Mutex
+	store              *store.Store
+	providers          map[string]provider.Provider
+	active             map[string]string // provider -> active account id
+	exhausted          map[string]time.Time
+	lastUsage          map[string]provider.Usage
+	health             map[string]*healthState
+	generation         map[string]uint64 // retained across deletion and replacement
+	accountRevision    map[string]uint64 // credential writes, independent of queued-check generations
+	selectionRevision  map[string]uint64 // manual and automatic active-account changes
+	syncing            atomic.Bool
+	probeBusy          atomic.Bool
+	probeBootID        string
+	probeClient        *http.Client // optional internal test seam; production uses a fresh direct client
+	refreshing         map[string]*sync.Mutex
+	order              []string // display order of provider sections
+	hidden             []string // providers dismissed from the UI
+	managementKey      string   // hub management key, kept in state.json
+	nativeClaudeCommit string
 	// autoUseReset reports whether an exhausted account may spend a banked
 	// reset to stay in rotation. Nil means the feature is off: the proxy
 	// never spends credits unless the server wires the user's preference in.
@@ -156,24 +159,25 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		}
 	}
 	return &Manager{
-		store:             st,
-		providers:         providers,
-		active:            active,
-		exhausted:         exhausted,
-		lastUsage:         map[string]provider.Usage{},
-		health:            map[string]*healthState{},
-		generation:        map[string]uint64{},
-		accountRevision:   map[string]uint64{},
-		autoResetAt:       map[string]time.Time{},
-		planChecked:       map[string]time.Time{},
-		resetEvents:       map[string]ResetEvent{},
-		quotaRevision:     map[string]uint64{},
-		spentCredits:      map[string]map[string]int64{},
-		selectionRevision: map[string]uint64{},
-		probeBootID:       hex.EncodeToString(boot[:]),
-		order:             order,
-		hidden:            hidden,
-		managementKey:     state.ManagementKey,
+		store:              st,
+		providers:          providers,
+		active:             active,
+		exhausted:          exhausted,
+		lastUsage:          map[string]provider.Usage{},
+		health:             map[string]*healthState{},
+		generation:         map[string]uint64{},
+		accountRevision:    map[string]uint64{},
+		autoResetAt:        map[string]time.Time{},
+		planChecked:        map[string]time.Time{},
+		resetEvents:        map[string]ResetEvent{},
+		quotaRevision:      map[string]uint64{},
+		spentCredits:       map[string]map[string]int64{},
+		selectionRevision:  map[string]uint64{},
+		probeBootID:        hex.EncodeToString(boot[:]),
+		order:              order,
+		hidden:             hidden,
+		managementKey:      state.ManagementKey,
+		nativeClaudeCommit: state.NativeClaudeCommit,
 	}, nil
 }
 
@@ -280,16 +284,40 @@ func (m *Manager) ActiveID(providerID string) string {
 // only manual switch path; it succeeds even when the account is currently
 // marked exhausted (the user is in charge).
 func (m *Manager) Activate(id string) error {
+	return m.activateWithReceipt(id, "")
+}
+
+func (m *Manager) activateWithReceipt(id, receipt string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	account, err := m.store.Get(id)
 	if err != nil {
 		return err
 	}
+	previous, hadPrevious := m.active[account.Provider]
+	park, hadPark := m.exhausted[id]
+	revision := m.selectionRevision[account.Provider]
+	previousReceipt := m.nativeClaudeCommit
 	m.active[account.Provider] = id
 	m.selectionRevision[account.Provider]++
 	delete(m.exhausted, id)
-	return m.persistLocked()
+	if receipt != "" {
+		m.nativeClaudeCommit = receipt
+	}
+	if err := m.persistLocked(); err != nil {
+		if hadPrevious {
+			m.active[account.Provider] = previous
+		} else {
+			delete(m.active, account.Provider)
+		}
+		if hadPark {
+			m.exhausted[id] = park
+		}
+		m.selectionRevision[account.Provider] = revision
+		m.nativeClaudeCommit = previousReceipt
+		return err
+	}
+	return nil
 }
 
 // Remove forgets routing bookkeeping for a deleted account.
@@ -321,6 +349,8 @@ func (m *Manager) removeLocked(id string) {
 // DeleteAccount serializes deletion with token refresh and invalidates queued
 // usage results. Callers should use this instead of Store.Delete plus Remove.
 func (m *Manager) DeleteAccount(id string) error {
+	m.nativeActivation.Lock()
+	defer m.nativeActivation.Unlock()
 	lock := m.refreshLock(id)
 	lock.Lock()
 	defer lock.Unlock()
@@ -351,25 +381,50 @@ func (m *Manager) ResetAccount(id string) {
 // ReplaceAccount saves credentials under the same per-account lock used by
 // refreshes. Callers may Activate the account afterward if it is new.
 func (m *Manager) ReplaceAccount(a store.Account) error {
+	m.nativeActivation.Lock()
+	defer m.nativeActivation.Unlock()
 	lock := m.refreshLock(a.ID)
 	lock.Lock()
 	defer lock.Unlock()
+	return m.replaceAccountRecord(a, true)
+}
+
+func (m *Manager) replaceAccountRecord(a store.Account, post bool) error {
 	// Replacing credentials must not silently drop the user's per-account
 	// preferences: provider-built accounts never carry them, so keep the
 	// ones already on disk.
 	if existing, err := m.store.Get(a.ID); err == nil {
+		if backup, ok := m.providers[a.Provider].(interface{ BackupNativeAccount(store.Account) error }); ok && existing.Token.RefreshToken != a.Token.RefreshToken {
+			if err := backup.BackupNativeAccount(existing); err != nil {
+				return err
+			}
+		}
 		a.AutoUseReset = existing.AutoUseReset
 	}
-	return m.saveAccount(a)
+	if err := m.saveAccount(a); err != nil {
+		return err
+	}
+	if native, ok := m.providers[a.Provider].(interface{ NativeReplacement(store.Account) error }); ok && post {
+		if err := native.NativeReplacement(a); err != nil {
+			log.Printf("proxy: native refresh-recovery archive pending: %v", err)
+		}
+	}
+	return nil
 }
 
 // ReplaceReloginAccount checks identity and saves under the same account lock
 // used by deletion and refresh. The selected account cannot be recreated if
 // it was deleted while the provider sign-in was in flight.
 func (m *Manager) ReplaceReloginAccount(a *store.Account, target string) error {
+	m.nativeActivation.Lock()
+	defer m.nativeActivation.Unlock()
 	lock := m.refreshLock(target)
 	lock.Lock()
 	defer lock.Unlock()
+	return m.replaceReloginRecord(a, target, true)
+}
+
+func (m *Manager) replaceReloginRecord(a *store.Account, target string, post bool) error {
 	existing, err := m.store.Get(target)
 	if err != nil {
 		return ErrReloginTargetUnavailable
@@ -377,17 +432,47 @@ func (m *Manager) ReplaceReloginAccount(a *store.Account, target string) error {
 	if existing.Provider != a.Provider || !strings.EqualFold(existing.Email, a.Email) {
 		return ErrReloginIdentityMismatch
 	}
+	if a.Provider == "claude" {
+		if existing.Token.AccountID != "" && existing.Token.AccountID != a.Token.AccountID {
+			return ErrReloginIdentityMismatch
+		}
+		if existing.ClaudeCode != nil {
+			var oldIdentity, newIdentity claudecode.Identity
+			if json.Unmarshal(existing.ClaudeCode.OAuthAccount, &oldIdentity) != nil || a.ClaudeCode == nil || json.Unmarshal(a.ClaudeCode.OAuthAccount, &newIdentity) != nil || oldIdentity.OrganizationUUID != newIdentity.OrganizationUUID {
+				return ErrReloginIdentityMismatch
+			}
+		} else if existing.Token.RefreshToken != a.Token.RefreshToken && existing.Token.AccessToken != a.Token.AccessToken {
+			// A legacy slot's organization cannot be inferred from email.
+			// Capture its matching native lineage or add a separate account.
+			return ErrReloginIdentityMismatch
+		}
+	}
 	a.ID = existing.ID
+	if backup, ok := m.providers[a.Provider].(interface{ BackupNativeAccount(store.Account) error }); ok {
+		if err := backup.BackupNativeAccount(existing); err != nil {
+			return err
+		}
+	}
 	// A relogin refreshes credentials only. Keep the account's per-account
 	// preferences, which the provider never sets.
 	a.AutoUseReset = existing.AutoUseReset
-	return m.saveAccount(*a)
+	if err := m.saveAccount(*a); err != nil {
+		return err
+	}
+	if native, ok := m.providers[a.Provider].(interface{ NativeReplacement(store.Account) error }); ok && post {
+		if err := native.NativeReplacement(*a); err != nil {
+			log.Printf("proxy: native refresh-recovery archive pending: %v", err)
+		}
+	}
+	return nil
 }
 
 // UpdateAccount applies a per-account preference under the same lock token
 // rotation uses, so a concurrent refresh cannot be reverted by a stale save.
 // Credentials and cached usage are untouched: only the record changes.
 func (m *Manager) UpdateAccount(id string, mutate func(*store.Account) error) error {
+	m.nativeActivation.Lock()
+	defer m.nativeActivation.Unlock()
 	lock := m.refreshLock(id)
 	lock.Lock()
 	defer lock.Unlock()
@@ -589,8 +674,20 @@ func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, for
 	if !ok {
 		return provider.Usage{}
 	}
+	if err := m.syncNative(ctx, prov, &a); err != nil {
+		return m.recordUsage(id, gen, provider.Usage{}, false, err)
+	}
 	m.mu.Lock()
 	h := m.healthLocked(id)
+	if cadence, ok := prov.(interface{ UsagePollInterval() time.Duration }); ok && !force && time.Since(h.lastChecked) < cadence.UsagePollInterval() {
+		if staleSnapshot(m.lastUsage[id]) {
+			delete(m.lastUsage, id)
+			m.quotaRevision[id]++
+		}
+		cached := m.lastUsage[id]
+		m.mu.Unlock()
+		return cached
+	}
 	if !force && time.Now().Before(h.retryAt) {
 		if staleSnapshot(m.lastUsage[id]) {
 			delete(m.lastUsage, id)
@@ -833,7 +930,8 @@ func (m *Manager) persistLocked() error {
 	return m.store.SaveState(store.State{
 		Active: active, Exhausted: exhausted,
 		ProviderOrder: order, HiddenProviders: hidden,
-		ManagementKey: m.managementKey,
+		ManagementKey:      m.managementKey,
+		NativeClaudeCommit: m.nativeClaudeCommit,
 	})
 }
 
@@ -873,11 +971,20 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, pickErr.Error())
 			return
 		}
+		account, err = m.nativeForRequest(r.Context(), prov, account)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "Claude Code credentials could not be synchronized; check its native login")
+			return
+		}
 
 		if prov.IsExpired(account) && !refreshed[account.ID] {
 			refreshed[account.ID] = true
 			account, err = m.refreshForProxy(r.Context(), prov, account, false)
 			if err != nil {
+				if errors.Is(err, provider.ErrNativeCredentialBusy) {
+					writeError(w, http.StatusServiceUnavailable, err.Error())
+					return
+				}
 				log.Printf("proxy: refresh %s failed: %v", account.Email, err)
 				continue // pick() selects another account
 			}
@@ -896,6 +1003,10 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			drain(resp)
 			account, err = m.refreshForProxy(r.Context(), prov, account, true)
 			if err != nil {
+				if errors.Is(err, provider.ErrNativeCredentialBusy) {
+					writeError(w, http.StatusServiceUnavailable, err.Error())
+					return
+				}
 				log.Printf("proxy: refresh %s after 401 failed: %v", account.Email, err)
 				continue
 			}
@@ -971,7 +1082,9 @@ func (m *Manager) refreshForProxy(ctx context.Context, prov provider.Provider, p
 	m.mu.Unlock()
 	if err := prov.Refresh(ctx, &a); err != nil {
 		m.recordRefresh(a.ID, gen, err)
-		m.deactivate(a.ID)
+		if !errors.Is(err, provider.ErrNativeCredentialBusy) {
+			m.deactivate(a.ID)
+		}
 		return a, err
 	}
 	if err := m.store.Save(a); err != nil {

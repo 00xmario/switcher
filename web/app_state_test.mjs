@@ -163,6 +163,12 @@ assert.match(compactCard, /Banked reset expiry[\s\S]*Reset 1[\s\S]*title="Banked
 const activeCompact = accountContext.compactAccountHTML({ id: 'active-id', provider: 'codex', email: 'active@example.com', plan: 'pro' });
 assert.match(activeCompact, /class="identity-line"[\s\S]*class="email"[\s\S]*class="account-badge active-status"/);
 assert.doesNotMatch(activeCompact, /data-act="activate"/);
+const nativeNotSelected = accountContext.compactAccountHTML({ id: 'active-id', provider: 'claude', email: 'fixture@example.test', native_switch_available: true, native_active: false });
+assert.match(nativeNotSelected, /Use in Claude Code/);
+assert.doesNotMatch(nativeNotSelected, /account-badge active-status/);
+const nativeSelected = accountContext.compactAccountHTML({ id: 'native-claude', provider: 'claude', email: 'fixture@example.test', native_switch_available: true, native_active: true });
+assert.match(nativeSelected, /account-badge active-status/);
+assert.doesNotMatch(nativeSelected, /data-act="activate"/);
 
 let compactPage = false;
 const providersEl = { hidden: false, innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
@@ -286,6 +292,14 @@ assert.doesNotMatch(testedRoute, /Connected|native CLI verified/i);
 assert.match(cliContext.cliSetupRowHTML({ ...codexEvidence,
   verification: { condition: 'historical', last_success: reset, model: 'gpt-5.5' } }),
   /Historical Switcher route test:/);
+const claudeNativeRow = cliContext.cliSetupRowHTML({ id: 'claude-code', name: 'Claude Code', capability: 'switch_native_login', accounts: { evidence: 'known', count: 2 } });
+assert.match(claudeNativeRow, /Native login switching available/);
+assert.match(claudeNativeRow, /does not switch Claude Desktop/);
+assert.doesNotMatch(claudeNativeRow, /Setup research|Native OAuth coexistence unverified/);
+const blockedClaudeRow = cliContext.cliSetupRowHTML({ id: 'claude-code', name: 'Claude Code', capability: 'switch_native_login', stage: 'unavailable', configuration: { condition: 'unavailable' }, next_step: 'Remove the credential override <fixture> before switching.' });
+assert.match(blockedClaudeRow, /Native login switching unavailable/);
+assert.match(blockedClaudeRow, /Remove the credential override &lt;fixture&gt;/);
+assert.doesNotMatch(blockedClaudeRow, /Native login switching available|data-cli-action/);
 
 // Auto-use banked reset is a three-way per-account choice, offered only for
 // providers that actually bank resets.

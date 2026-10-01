@@ -52,6 +52,9 @@ var version = "dev"
 //go:embed web
 var webFS embed.FS
 
+//go:embed THIRD_PARTY_NOTICES.md
+var thirdPartyNotices string
+
 func main() {
 	port := flag.Int("port", config.DefaultPort, "port for the Switcher server (UI + proxy)")
 	flag.Parse()
@@ -95,6 +98,8 @@ func main() {
 
 	case len(args) > 0 && args[0] == "version":
 		fmt.Println("switcher " + version)
+	case len(args) > 0 && args[0] == "licenses":
+		fmt.Print(thirdPartyNotices)
 
 	default:
 		run(*port)
@@ -104,9 +109,13 @@ func main() {
 // run starts the OAuth callback listener and the main server, then blocks.
 func run(port int) {
 	st := store.New(config.Dir())
+	claudeProvider := claude.New()
+	if err := claudeProvider.ConfigureNative(st, config.Dir()); err != nil {
+		log.Printf("native Claude switching unavailable: %v", err)
+	}
 	registered := []provider.Provider{
 		codex.New(),
-		claude.New(),
+		claudeProvider,
 		grok.New(),
 		opencode.New(),
 		antigravity.New(),

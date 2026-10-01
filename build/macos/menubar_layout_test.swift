@@ -127,6 +127,12 @@ struct MenuBarLayoutTest {
                 UsageWindow(label: "Past", used_percent: 50, resets_at: now - 5),
                 UsageWindow(label: "Unknown", used_percent: 50, resets_at: nil),
             ]), reset_credits: ResetCredits(count: 1))
+        var nativeAccount = base
+        nativeAccount.native_switch_available = true
+        nativeAccount.native_active = false
+        guard !nativeAccount.selected else { fail("Proxy selection was mislabeled as a native login") }
+        nativeAccount.native_active = true
+        guard nativeAccount.selected else { fail("Observed native selection was not displayed") }
         guard bankedResetText(base.reset_credits) == "⚡ 1 banked",
               bankedResetText(nil) == nil,
               bankedResetText(ResetCredits(count: 0)) == nil else {

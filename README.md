@@ -2,9 +2,13 @@
 
 A tiny local tool for switching your AI CLI logins between accounts on demand.
 
-One active account serves all traffic. Switching happens **only** when you
-switch, or when the active account runs out of usage, in which case Switcher
-moves to another account and retries transparently.
+For CLI traffic routed through Switcher, one active account per provider serves
+the requests. Switch manually, or let Switcher retry with another account when
+the active one runs out of usage.
+
+Claude Code uses its native login directly. **Use in Claude Code** changes that
+login and the Claude proxy selection together. Automatic proxy failover does
+not change Claude Code's native login.
 
 ```
 codex CLI ──▶ Switcher (127.0.0.1:8787) ──▶ upstream, signed in as the active account
@@ -39,8 +43,9 @@ Switcher answers two questions instead:
 - **Switch me to another one** (yourself, with one click, or automatically
   when the active one is out of usage).
 
-One account is chosen, all traffic is billed to it, and that choice changes
-only when you switch or the active account reports a known exhaustion signal.
+Each provider's proxied traffic uses its selected account. That choice changes
+when you switch or the active account reports a known exhaustion signal. Claude
+Code's native selection is shown separately from the proxy selection.
 
 Protocol translation (letting a client speak one wire format to an upstream
 that speaks another) is deliberately left open. It is genuinely useful and
@@ -88,9 +93,24 @@ required; OpenCode Go uses its own API key.
   session logs (like ccusage does) and prices them with LiteLLM rates:
   daily cost chart, per-provider and per-model breakdowns, cache savings.
 - **Claude keychain import**: Switcher can copy Claude Code's stored login
-  from the macOS keychain. The native CLI and Switcher then hold separate
-  credential copies; refresh-token coexistence has not been established as
-  a native CLI setup path.
+  from the macOS keychain, or the native credentials file on Linux. The full
+  account-scoped wrapper and identity are preserved. Switcher synchronizes
+  the current native generation instead of independently refreshing a copy
+  of the active Claude Code login.
+- **Native Claude Code switching**: Claude account actions in the web and
+  menu bar apps write Code's native credential store and `oauthAccount`
+  config section, then select the same Switcher proxy account. Shared MCP
+  OAuth fields, project configuration, and transcripts stay in place.
+  The operation uses Claude Code's own refresh/config locks, creates private
+  backups, verifies writes, and rolls back partial failures. The native
+  active badge is separate from automatic proxy routing. Running macOS
+  sessions may take about 30 seconds to notice a switch; reopen Code for
+  immediate application. This changes Claude Code, not Claude Desktop's
+  signed-in account. Do not `/logout` first because it can revoke the old
+  saved refresh token. Machine-level switching and import require a local
+  connection. Same-store `CLAUDE_CONFIG_DIR` profiles are supported; split secure
+  storage and credential-overriding environment variables block the operation
+  with an explanation. See [the source analysis and comparison](docs/claude-swap-analysis.md).
 - **Claude Desktop session sync**: the small two-arrow sync icon after the Claude name in the
   menu bar and web app makes new Claude Code chats discoverable across your
   Desktop account indexes. Clicking it first asks for confirmation, with
@@ -111,7 +131,10 @@ required; OpenCode Go uses its own API key.
   checks, at most hourly after success. Recheck retries a failed lookup.
   A generic Max flag is displayed as Max rather than guessing a multiplier.
 - **Relogin per account**: sign in again in one click; the tokens overwrite
-  the account in place, keeping its id, active slot, and history.
+  the matching account in place, keeping its id, active slot, and history.
+  Claude identity includes its organization. Older Claude records must first
+  verify that identity from their saved token or matching native login; a new
+  organization is added separately rather than overwriting an unknown one.
 - **Banked resets**: Codex usage-limit resets can be spent from the UI. A
   compact count appears beside the account plan in the web UI and menu bar.
   **Auto-use** can spend one automatically when an account runs out, as a
@@ -169,7 +192,7 @@ upstream, and configuring that provider's own CLI are three different things.
 | Switcher provider | Account login | HTTP forwarding evidence | Native CLI setup |
 |---|---|---|---|
 | Codex | Browser OAuth | Fixed Codex route-probe fixture, not a full native CLI test | Codex user-file configuration; native request untested |
-| Claude | Browser OAuth or Claude Code keychain import | Messages, token counting, and SSE fixture | Not enabled; OAuth coexistence and effective CLI config unverified |
+| Claude | Browser OAuth or native Claude Code login import | Messages, token counting, and SSE fixture | Native credential/config switching with ownership and rollback fixtures; setup checks do not run a real native request |
 | OpenCode Go | Provider API key | Responses, chat, messages, and SSE fixture | Not enabled; v2 account, model, and transport unverified |
 | Grok Build | Device-code flow | HTTP session-service and SSE fixture only | Not enabled; entitlement and separate WebSocket relay unverified |
 | Antigravity (IDE) | Google OAuth with project onboarding | Full forwarding fixture not yet added | `agy` is a separate CLI; no verified setup |
@@ -184,8 +207,9 @@ GitHub Copilot sign-in stores the authorized GitHub identity first. Switcher
 obtains a short-lived Copilot API token when that account is used, so a
 temporary Copilot token-service failure does not discard a successful login.
 
-The `provider.Provider` interface (login, refresh, forward, usage) is the
-only integration point; a new provider is one package.
+The `provider.Provider` interface handles login, refresh, forwarding, and usage.
+Optional interfaces add native-login switching and provider-specific actions.
+A new provider lives in one package.
 
 ## Install
 
@@ -234,9 +258,10 @@ switcher install         # points the codex CLI at Switcher (idempotent, backs u
    expose the server to your LAN.
 4. For Codex, use `switcher install` or **Settings → CLI setup → Configure
    Codex** to point its user config at Switcher. Codex still needs its own
-   CLI sign-in. Other native CLIs are not configured by adding a provider
-   account to Switcher; their setup rows currently report stored accounts,
-   not a verified CLI connection.
+   CLI sign-in. For Claude, **Use in Claude Code** switches the native login
+   and the Claude proxy. Import its current native login to capture the full
+   credential and organization identity. Native metadata appears under
+   Settings → Claude Code login. Other native clients remain informational.
 
 `switcher uninstall` restores the previous Codex provider selection when
 Switcher recorded it during setup. Older, untracked configurations have no
@@ -267,13 +292,16 @@ readiness to decide on a release; it does not publish one by itself.
 
 | Situation | Behaviour |
 |---|---|
-| You click *Use this account* | marks it active from now on |
+| You click *Use this account* | selects that provider's proxy account |
+| You click *Use in Claude Code* locally | verifies and writes the native login, then commits the matching proxy selection; failure preserves or rolls back the original login |
 | No account was ever activated | the first usable account (by email order) serves traffic |
-| Active account returns 429 `usage_limit_reached` | mark it exhausted until the upstream reset time; switch to another usable account and retry the request transparently |
+| Active proxy account returns 429 `usage_limit_reached` | mark it exhausted until the upstream reset time; select another usable proxy account and retry the request transparently; native Claude Code selection stays as it was |
 | Every account is out of usage | no rotation; the upstream error is passed through |
 | A 429 that is *not* a usage-limit error (e.g. burst limit) | passed through, nothing marked, no switch |
-| Active account's token expired | refreshed via its refresh token before use |
-| Token refresh fails (account needs re-login) | parked for an hour; traffic moves to another account |
+| Stored token expired | refresh before use, except that native-owned Claude tokens are synchronized from Code |
+| Claude Code's current native token is still expired | defer to Code's refresh; do not consume a competing saved copy or mark the account dead |
+| Provider rejects a refresh credential and requires re-login | park the proxy account for an hour and try another account |
+| Claude refresh outcome is uncertain | retain its consumption intent; require successor recovery or a new login before another grant |
 
 ## Security model
 
@@ -307,11 +335,12 @@ Switcher; authentication resets to off.
 ## Layout
 
 ```
-main.go                  entry point + subcommands (serve / install / uninstall)
+main.go                  entry point + subcommands (serve / install / uninstall / licenses)
 internal/config/         paths and defaults
 internal/store/          account + state persistence (atomic JSON writes)
 internal/provider/       provider contract
 internal/provider/codex/ Codex OAuth + upstream details
+internal/claudecode/      native Claude Code stores, ownership, locks, and recovery
 internal/login/          browser login orchestration
 internal/proxy/          request forwarding + the switching rules
 internal/codexcfg/       codex config.toml installer (idempotent)
@@ -346,4 +375,5 @@ that is your business and your responsibility.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md).
+Run `switcher licenses` to read bundled notices from a plain binary.

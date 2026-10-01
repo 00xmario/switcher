@@ -199,6 +199,22 @@ func (a *API) handleCLISetup(w http.ResponseWriter, r *http.Request) {
 			}
 			client.Verification = a.codexProbeStatus()
 		}
+		if native, ok := a.Providers[target.provider].(provider.NativeLoginProvider); target.id == "claude-code" && ok && native.NativeEnabled() {
+			status := native.NativeStatus()
+			client.Capability = "switch_native_login"
+			client.Stage = "available"
+			client.ReasonCode = ""
+			client.NextStep = "Switch the native login from a Claude account card. Desktop sign-in is separate."
+			client.Configuration = cliSetupConfig{Condition: status.Condition, Scope: "native_login"}
+			if !status.Available || status.Condition == "unavailable" {
+				client.Stage = "unavailable"
+				client.ReasonCode = "native_store_unavailable"
+				client.NextStep = status.Message
+				if client.NextStep == "" {
+					client.NextStep = "Inspect the Claude Code login status before switching."
+				}
+			}
+		}
 		if accountsKnown {
 			count := counts[target.provider]
 			client.Accounts = cliSetupAccounts{Evidence: "known", Count: &count}
@@ -362,6 +378,8 @@ type accountView struct {
 	// AutoUseResetEffective is the resolved policy after applying the
 	// global preference to the override.
 	AutoUseResetEffective bool `json:"auto_use_reset_effective"`
+	NativeSwitchAvailable bool `json:"native_switch_available,omitempty"`
+	NativeActive          bool `json:"native_active,omitempty"`
 }
 
 // autoUseResetMode renders a per-account override for the API.
@@ -446,6 +464,10 @@ func viewBaseWithSettings(a *API, acc store.Account, preferences settings.Settin
 		v.ExhaustedUntil = until.Unix()
 	}
 	v.Usage, v.LastReset, v.QuotaRevision, v.QuotaEpoch = a.Proxy.QuotaSnapshot(acc.ID)
+	if native, ok := a.Providers[acc.Provider].(provider.NativeLoginProvider); ok && native.NativeEnabled() {
+		v.NativeSwitchAvailable = true
+		v.NativeActive = native.NativeStatus().ActiveID == acc.ID
+	}
 	return v
 }
 
@@ -546,6 +568,9 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"reset_notifications": preferences.ResetNotifications,
 		"compact_accounts":    preferences.CompactAccounts,
 	}
+	if native, ok := a.Providers["claude"].(provider.NativeLoginProvider); ok {
+		state["claude_code"] = native.NativeStatus()
+	}
 	if revealHubKey {
 		state["hub_management_key"] = a.ManagementKey
 	}
@@ -581,7 +606,22 @@ func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "provider has no import path"})
 		return
 	}
-	account, err := imp.ImportFromKeychain(r.Context())
+	var account store.Account
+	var err error
+	nativeImport := false
+	if native, ok := prov.(provider.NativeLoginProvider); ok && native.NativeEnabled() {
+		if !loopbackOnly(w, r) {
+			return
+		}
+		if body.ReloginOf != "" && !validID(body.ReloginOf) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid relogin account id"})
+			return
+		}
+		account, err = a.Proxy.ImportNative(r.Context(), prov, body.ReloginOf)
+		nativeImport = true
+	} else {
+		account, err = imp.ImportFromKeychain(r.Context())
+	}
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
@@ -592,9 +632,9 @@ func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.ReloginOf != "" {
+	if !nativeImport && body.ReloginOf != "" {
 		err = a.Proxy.ReplaceReloginAccount(&account, body.ReloginOf)
-	} else {
+	} else if !nativeImport {
 		err = a.Proxy.ReplaceAccount(account)
 	}
 	if errors.Is(err, proxy.ErrReloginTargetUnavailable) {
@@ -671,6 +711,9 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		"lan_ip":              LANAddress(),
 		"sessions":            a.Settings.SessionCount(),
 		"device_token_set":    a.Settings.HasDeviceToken(),
+	}
+	if native, ok := a.Providers["claude"].(provider.NativeLoginProvider); ok {
+		response["claude_code"] = native.NativeStatus()
 	}
 	// A valid session cookie re-learns its CSRF token (localStorage was
 	// cleared but the browser kept the cookie).
@@ -1036,15 +1079,30 @@ func (a *API) handleActivate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid account id", http.StatusBadRequest)
 		return
 	}
-	if err := a.Proxy.Activate(id); err != nil {
+	account, err := a.Store.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such account"})
+		return
+	}
+	if native, ok := a.Providers[account.Provider].(provider.NativeLoginProvider); ok && native.NativeEnabled() {
+		if !loopbackOnly(w, r) {
+			return
+		}
+	}
+	result, err := a.Proxy.ActivateForClient(r.Context(), id)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such account"})
+			return
+		}
+		if result != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "Claude Code login was not switched", "details": err.Error(), "backup": result.Backup})
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not activate account"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "active": id})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "active": id, "native": result})
 }
 
 // handleUsage answers with the cost/token summary for a window

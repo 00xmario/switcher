@@ -39,7 +39,19 @@ type Account struct {
 	// AutoUseReset is the per-account override for spending a banked reset
 	// when this account runs out of usage. Nil means "follow the global
 	// preference"; true and false force the behavior for this account.
-	AutoUseReset *bool `json:"auto_use_reset,omitempty"`
+	AutoUseReset *bool            `json:"auto_use_reset,omitempty"`
+	ClaudeCode   *ClaudeCodeLogin `json:"claude_code,omitempty"`
+	// ClaudeCodeRefreshPending marks an issued successor durably saved here
+	// when its recovery sidecar was unavailable. Native identity verification
+	// and recovery cleanup must finish before another grant can be consumed.
+	ClaudeCodeRefreshPending bool `json:"claude_code_refresh_pending,omitempty"`
+}
+
+// ClaudeCodeLogin preserves the native account-scoped credential fields and
+// identity. These are secret-bearing snapshots, never accountView fields.
+type ClaudeCodeLogin struct {
+	Credentials  json.RawMessage `json:"credentials"`
+	OAuthAccount json.RawMessage `json:"oauth_account"`
 }
 
 // AutoUseResetEnabled resolves the effective policy for spending a banked
@@ -56,11 +68,12 @@ func (a Account) AutoUseResetEnabled(global bool) bool {
 // which accounts are exhausted (until a unix timestamp), plus the user's
 // provider display order and hidden providers.
 type State struct {
-	Active          map[string]string `json:"active,omitempty"`
-	Exhausted       map[string]int64  `json:"exhausted,omitempty"`
-	ProviderOrder   []string          `json:"provider_order,omitempty"`
-	HiddenProviders []string          `json:"hidden_providers,omitempty"`
-	ManagementKey   string            `json:"management_key,omitempty"`
+	Active             map[string]string `json:"active,omitempty"`
+	Exhausted          map[string]int64  `json:"exhausted,omitempty"`
+	ProviderOrder      []string          `json:"provider_order,omitempty"`
+	HiddenProviders    []string          `json:"hidden_providers,omitempty"`
+	ManagementKey      string            `json:"management_key,omitempty"`
+	NativeClaudeCommit string            `json:"native_claude_commit,omitempty"`
 }
 
 // ErrNotFound is returned when an account ID does not exist.
