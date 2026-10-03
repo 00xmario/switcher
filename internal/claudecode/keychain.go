@@ -65,18 +65,31 @@ func securityQuote(value string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value) + `"`
 }
 
-func (k SystemKeychain) Write(ctx context.Context, service string, value []byte) error {
+func keychainWriteLine(service string, value []byte) (string, error) {
 	if strings.ContainsAny(service+keychainUser(), "\n\r\x00") {
-		return errors.New("invalid native Keychain item identifier")
+		return "", errors.New("invalid native Keychain item identifier")
 	}
 	line := fmt.Sprintf("add-generic-password -U -a %s -s %s -X %s\n", securityQuote(keychainUser()), securityQuote(service), hex.EncodeToString(value))
 	// Unlike upstream's long-payload fallback, never put OAuth/MCP secrets in
 	// process arguments. Refuse before changing anything if security -i would
 	// truncate its fixed-size line buffer.
 	if len(line) > 4032 {
-		return errors.New("native credentials exceed the secure Keychain stdin limit; use Claude Code login for this profile")
+		return "", errors.New("native credentials exceed the secure Keychain stdin limit; use Claude Code login for this profile")
 	}
-	_, err := k.run(ctx, []string{"-i"}, []byte(line))
+	return line, nil
+}
+
+func (k SystemKeychain) Validate(service string, value []byte) error {
+	_, err := keychainWriteLine(service, value)
+	return err
+}
+
+func (k SystemKeychain) Write(ctx context.Context, service string, value []byte) error {
+	line, err := keychainWriteLine(service, value)
+	if err != nil {
+		return err
+	}
+	_, err = k.run(ctx, []string{"-i"}, []byte(line))
 	if err != nil {
 		return errors.New("could not write Claude Code Keychain credentials")
 	}

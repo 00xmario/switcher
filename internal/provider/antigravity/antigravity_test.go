@@ -424,8 +424,8 @@ func TestParseRateLimit(t *testing.T) {
 		t.Fatalf("parked until %v, want the latest exhausted reset around %v", until, want)
 	}
 
-	if _, exhausted := p.ParseRateLimit(context.Background(), acc, http.StatusInternalServerError, []byte(`{"error":"RESOURCE_EXHAUSTED"}`)); !exhausted {
-		t.Fatal("RESOURCE_EXHAUSTED body must mark the account exhausted")
+	if _, exhausted := p.ParseRateLimit(context.Background(), acc, http.StatusInternalServerError, []byte(`{"error":{"status":"RESOURCE_EXHAUSTED"}}`)); !exhausted {
+		t.Fatal("structured RESOURCE_EXHAUSTED with confirmed depleted quota must exhaust the account")
 	}
 	if _, exhausted := p.ParseRateLimit(context.Background(), acc, http.StatusBadRequest, nil); exhausted {
 		t.Fatal("other statuses must never exhaust the account")

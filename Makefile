@@ -1,13 +1,24 @@
 BINARY := switcher
 VERSION ?= $(shell cat VERSION 2>/dev/null || echo dev)
 
-.PHONY: build test vet verify benchmark-menu install run dev clean
+.PHONY: build test test-usage-update vet verify benchmark-menu install run dev clean
 
 build:
 	go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(BINARY) .
 
 test:
 	gofmt -l . && go vet ./... && go test ./...
+
+# Fixture-only analytics/update regressions, with downloads and toolchain
+# installation disabled. Go caches and HOME are private to this run.
+test-usage-update:
+	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		export HOME="$$tmp" TMPDIR="$$tmp" GOPATH="$$tmp/go" \
+			GOMODCACHE="$$tmp/go/pkg/mod" GOCACHE="$$tmp/cache" \
+			GOENV=off GOWORK=off GOFLAGS= GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off; \
+		go test -mod=readonly ./internal/usage ./internal/update; \
+		go test -mod=readonly -race ./internal/usage ./internal/update; \
+		go vet -mod=readonly ./internal/usage ./internal/update
 
 vet:
 	go vet ./...
@@ -25,6 +36,8 @@ verify:
 	node web/account-updates_test.mjs
 	node web/account-updates_motion_test.mjs
 	node web/themes_test.mjs
+	node --check web/desktop-relay.js
+	node web/desktop-relay_test.mjs
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
 			build/macos/menubar_layout_test.swift -o "$$tmp/switcher-layout-test"; \

@@ -19,9 +19,11 @@ import (
 	"switcher/internal/claudesync"
 	"switcher/internal/codexcfg"
 	"switcher/internal/config"
+	"switcher/internal/desktoprelay"
 	"switcher/internal/login"
 	"switcher/internal/provider"
 	"switcher/internal/proxy"
+	"switcher/internal/sessionmeta"
 	"switcher/internal/settings"
 	"switcher/internal/store"
 	"switcher/internal/update"
@@ -30,21 +32,38 @@ import (
 	"syscall"
 )
 
+// UpdateChecker separates metadata refresh from installation and lets route
+// tests supply an updater without network, subprocess, or restart effects.
+type UpdateChecker interface {
+	State() update.State
+	Check(context.Context) (update.State, error)
+	InstallAndRestart() error
+}
+
 // API wraps the JSON API the web UI talks to.
 type API struct {
-	Store             *store.Store
-	Logins            *login.Manager
-	Proxy             *proxy.Manager
-	Providers         map[string]provider.Provider
-	ManagementKey     string
-	Version           string
-	Updater           *update.Checker
-	Usage             *usage.Service
-	Settings          *settings.Store
-	Port              int
-	CodexConfigPath   string // optional test override
-	probeCodexForTest func(context.Context) proxy.ProbeCodexResult
-	syncClaudeForTest func(context.Context, map[string]string) (claudesync.Result, error)
+	Store        *store.Store
+	Logins       *login.Manager
+	Proxy        *proxy.Manager
+	DesktopRelay *desktoprelay.Manager
+	// DesktopSessionMetadata is the same explicit, lazy index supplied to the
+	// relay's trusted conversation resolver. GET only decorates response copies.
+	// Nil disables display lookup; the manager may still verify saved associations
+	// through its current/historical trusted resolver, without acquiring credentials.
+	DesktopSessionMetadata *sessionmeta.Index
+	// DesktopSettingsPath is supplied by main. Empty disables settings access.
+	DesktopSettingsPath   string
+	RestartDesktopForTest func(context.Context) error // test-only app-control override
+	Providers             map[string]provider.Provider
+	ManagementKey         string
+	Version               string
+	Updater               UpdateChecker
+	Usage                 *usage.Service
+	Settings              *settings.Store
+	Port                  int
+	CodexConfigPath       string // optional test override
+	probeCodexForTest     func(context.Context) proxy.ProbeCodexResult
+	syncClaudeForTest     func(context.Context, map[string]string) (claudesync.Result, error)
 
 	creditsMu     sync.Mutex
 	creditsCache  map[string]creditsEntry
@@ -78,6 +97,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/cli-setup/codex/test", a.handleCodexRouteTest)
 	mux.HandleFunc("POST /api/login", a.handleLoginStart)
 	a.registerAuthRoutes(mux)
+	a.registerDesktopRelayRoutes(mux)
 	mux.HandleFunc("POST /api/login/import", a.handleLoginImport)
 	mux.HandleFunc("GET /api/login/{state}", a.handleLoginPoll)
 	mux.HandleFunc("POST /api/accounts/{id}/activate", a.handleActivate)
@@ -90,6 +110,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/{id}/use-reset", a.handleUseReset)
 	mux.HandleFunc("PATCH /api/accounts/{id}", a.handleAccountPatch)
 	mux.HandleFunc("POST /api/update", a.handleUpdate)
+	mux.HandleFunc("POST /api/update/check", a.handleUpdateCheck)
 	mux.HandleFunc("PATCH /api/providers/order", a.handleProviderOrder)
 	mux.HandleFunc("POST /api/providers/{id}/hide", a.handleProviderHide)
 	mux.HandleFunc("POST /api/providers/{id}/show", a.handleProviderShow)
@@ -552,10 +573,9 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 	if hidden == nil {
 		hidden = []string{}
 	}
-	// The management key is only disclosed to cookie-authenticated
-	// browsers (or when auth is off): a device token is the same trust
-	// tier as the local files, so it earns the state but not the key.
-	revealHubKey := AuthKind(r) != AuthDevice
+	// Only local browsers receive the independent management key. Devices
+	// and LAN sessions receive public state without another control authority.
+	revealHubKey := AuthKind(r) != AuthDevice && desktopRelayLocalRequest(r)
 	state := map[string]any{
 		"active":              a.Proxy.ActiveAll(),
 		"accounts":            views,
@@ -567,6 +587,7 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"menu_usage_bars":     preferences.MenuUsageBars == nil || *preferences.MenuUsageBars,
 		"reset_notifications": preferences.ResetNotifications,
 		"compact_accounts":    preferences.CompactAccounts,
+		"desktop_relay":       a.desktopRelayStatus(),
 	}
 	if native, ok := a.Providers["claude"].(provider.NativeLoginProvider); ok {
 		state["claude_code"] = native.NativeStatus()
@@ -588,6 +609,9 @@ type importer interface {
 // provider has no importer and 409 when there is nothing to import, so the
 // web UI can fall back to the browser flow.
 func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
+	if !loopbackOnly(w, r) {
+		return
+	}
 	var body struct {
 		Provider  string `json:"provider"`
 		ReloginOf string `json:"relogin_of"`
@@ -610,9 +634,6 @@ func (a *API) handleLoginImport(w http.ResponseWriter, r *http.Request) {
 	var err error
 	nativeImport := false
 	if native, ok := prov.(provider.NativeLoginProvider); ok && native.NativeEnabled() {
-		if !loopbackOnly(w, r) {
-			return
-		}
 		if body.ReloginOf != "" && !validID(body.ReloginOf) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid relogin account id"})
 			return
@@ -673,14 +694,18 @@ func (a *API) registerAuthRoutes(mux *http.ServeMux) {
 // loopbackOnly refuses requests that did not arrive on a loopback socket.
 // The socket is the authority: a LAN client can spoof Host: 127.0.0.1, but
 // it cannot spoof its source address. The Host check stays as a second gate.
-func loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
+func isLoopbackRequest(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	ip := net.ParseIP(host)
 	loopback := ip != nil && ip.IsLoopback()
-	if !loopback || !isLocalHost(r.Host, "") {
+	return loopback && isLocalHost(r.Host, "")
+}
+
+func loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
+	if !isLoopbackRequest(r) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only local requests may change credentials"})
 		return false
 	}
@@ -689,13 +714,26 @@ func loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
 
 func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	st := a.Settings.Load()
-	if !isLocalHost(r.Host, "") {
-		// Pre-auth info disclosure: a LAN client only learns whether auth
-		// is on and a password exists.
-		writeJSON(w, http.StatusOK, map[string]any{
+	authenticated := AuthKind(r) != ""
+	cookieAuthenticated := false
+	if cookie, err := r.Cookie(sessionCookie); err == nil && a.Settings.ValidateSession(cookie.Value) {
+		authenticated = true
+		cookieAuthenticated = true
+	}
+	if token, err := a.Settings.ReadDeviceToken(); err == nil && subtleEqual(r.Header.Get("Authorization"), "Bearer "+token) {
+		authenticated = true
+	}
+	if !isLoopbackRequest(r) || (a.Settings.Enabled() && !authenticated) {
+		// Before authentication, disclose only whether login is required.
+		// Host alone never grants machine metadata to a LAN socket.
+		response := map[string]any{
 			"auth_enabled": a.Settings.Enabled(),
 			"password_set": a.Settings.HasPassword(),
-		})
+		}
+		if cookieAuthenticated {
+			response["csrf"] = a.Settings.CSRFToken()
+		}
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	response := map[string]any{
@@ -717,7 +755,7 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// A valid session cookie re-learns its CSRF token (localStorage was
 	// cleared but the browser kept the cookie).
-	if cookie, err := r.Cookie(sessionCookie); err == nil && a.Settings.ValidateSession(cookie.Value) {
+	if cookieAuthenticated {
 		response["csrf"] = a.Settings.CSRFToken()
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -737,17 +775,22 @@ func (a *API) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		return
 	}
-	if !a.Settings.VerifyPassword(body.Password) {
+	proof, ok := a.Settings.VerifyPasswordForSession(body.Password)
+	if !ok {
 		a.Settings.RecordFailure()
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "wrong password"})
 		return
 	}
-	a.Settings.ResetFailures()
-	token, err := a.Settings.NewSession()
+	token, csrf, err := a.Settings.NewVerifiedSession(proof)
+	if errors.Is(err, settings.ErrCredentialsChanged) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not create session"})
 		return
 	}
+	a.Settings.ResetFailures()
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
@@ -757,12 +800,15 @@ func (a *API) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   r.TLS != nil,
 		MaxAge:   int((24 * time.Hour * 7).Seconds()),
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "csrf": a.Settings.CSRFToken()})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "csrf": csrf})
 }
 
 func (a *API) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookie); err == nil {
-		a.Settings.DeleteSession(cookie.Value)
+		if err := a.Settings.DeleteSession(cookie.Value); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save logout; repair session storage and retry"})
+			return
+		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -797,22 +843,16 @@ func (a *API) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		return
 	}
-	if a.Settings.HasPassword() {
-		if err := a.Settings.ChangePassword(body.Current, body.Next); err != nil {
-			if strings.Contains(err.Error(), "wrong password") {
-				// A wrong current password is a failed verification attempt.
-				a.Settings.RecordFailure()
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
-				return
-			}
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
+	if err := a.Settings.ChangePassword(body.Current, body.Next); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, settings.ErrWrongPassword) {
+			a.Settings.RecordFailure()
+			status = http.StatusUnauthorized
+		} else if errors.Is(err, settings.ErrCredentialsChanged) || errors.Is(err, settings.ErrPasswordAlreadySet) {
+			status = http.StatusConflict
 		}
-	} else {
-		if err := a.Settings.SetPassword(body.Next); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
 	}
 	a.Settings.ResetFailures()
 	// Ensure the device token file so the menu bar app can authenticate.
@@ -835,19 +875,20 @@ func (a *API) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		return
 	}
-	if !a.Settings.VerifyPassword(body.Password) {
-		a.Settings.RecordFailure()
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "wrong password"})
+	if err := a.Settings.DisableAuthWithPassword(body.Password); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, settings.ErrWrongPassword) {
+			a.Settings.RecordFailure()
+			status = http.StatusUnauthorized
+		} else if errors.Is(err, settings.ErrCredentialsChanged) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	a.Settings.ResetFailures()
-	if err := a.Settings.DisableAuth(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	// Disabling auth tears down the LAN listener too: re-exec so the new
-	// topology takes effect instead of leaving an unauthenticated LAN
-	// listener up until the next restart.
+	// The LAN gate already rejects traffic. Re-exec releases the bound LAN
+	// socket and applies the saved local-only listener topology.
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		restartSelf()
@@ -1221,12 +1262,29 @@ func (a *API) UpdateState() update.State {
 // exec-restart replaces the process image, so the response may never
 // reach the client; the UI polls /api/state until the new version shows.
 func (a *API) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if a.Updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "updates unavailable"})
+		return
+	}
 	if err := a.Updater.InstallAndRestart(); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	// Unreachable: InstallAndRestart never returns on success.
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (a *API) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if a.Updater == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "updates unavailable"})
+		return
+	}
+	state, err := a.Updater.Check(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "could not check for updates", "update": state})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "update": state})
 }
 
 func (a *API) handleProviderOrder(w http.ResponseWriter, r *http.Request) {
@@ -1237,7 +1295,10 @@ func (a *API) handleProviderOrder(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	a.Proxy.ReorderProviders(body.Order)
+	if err := a.Proxy.ReorderProviders(body.Order); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save provider order"})
+		return
+	}
 	order, _ := a.Proxy.Providers()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "order": order})
 }
@@ -1248,7 +1309,10 @@ func (a *API) handleProviderHide(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid provider id", http.StatusBadRequest)
 		return
 	}
-	a.Proxy.HideProvider(id)
+	if err := a.Proxy.HideProvider(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not hide provider"})
+		return
+	}
 	_, hidden := a.Proxy.Providers()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "hidden": hidden})
 }
@@ -1259,7 +1323,10 @@ func (a *API) handleProviderShow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid provider id", http.StatusBadRequest)
 		return
 	}
-	a.Proxy.ShowProvider(id)
+	if err := a.Proxy.ShowProvider(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not show provider"})
+		return
+	}
 	order, hidden := a.Proxy.Providers()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "order": order, "hidden": hidden})
 }
@@ -1409,5 +1476,7 @@ func restartSelf() {
 	}
 	log.Printf("settings: restarting in place for the new listener topology")
 	time.Sleep(200 * time.Millisecond)
-	_ = syscall.Exec(current, os.Args, os.Environ())
+	if err := syscall.Exec(current, os.Args, os.Environ()); err != nil {
+		log.Printf("settings: restart failed: %v", err)
+	}
 }

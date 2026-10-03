@@ -41,6 +41,12 @@ func (p *nativeClaudeFixture) SyncNative(ctx context.Context, a *store.Account) 
 
 func TestNativeClaudeActivationAuthLocalityAndActualCredentialWrite(t *testing.T) {
 	home, data := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte("model_provider = \"other\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	configHome := filepath.Join(home, ".claude")
 	if err := os.MkdirAll(configHome, 0700); err != nil {
 		t.Fatal(err)
@@ -80,7 +86,8 @@ func TestNativeClaudeActivationAuthLocalityAndActualCredentialWrite(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	api := &API{Store: st, Proxy: manager, Settings: prefs, Providers: map[string]provider.Provider{"claude": p}}
+	api := &API{Store: st, Proxy: manager, Settings: prefs, Providers: map[string]provider.Provider{"claude": p},
+		CodexConfigPath: filepath.Join(t.TempDir(), "config.toml")}
 	mux := http.NewServeMux()
 	api.Register(mux)
 	gate := (&AuthGate{Store: prefs}).Wrap(mux)
@@ -163,6 +170,9 @@ func TestNativeClaudeActivationAuthLocalityAndActualCredentialWrite(t *testing.T
 		t.Fatal(err)
 	}
 	for _, client := range setup.Clients {
+		if client.ID == "codex" && client.Configuration.Condition != "missing" {
+			t.Fatal("Codex setup did not inspect the isolated empty fixture")
+		}
 		if client.ID == "claude-code" && (client.Stage != "unavailable" || client.NextStep != p.statusOverride.Message) {
 			t.Fatal("failed native initialization was advertised as available")
 		}

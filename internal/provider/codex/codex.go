@@ -111,6 +111,7 @@ func (p *Provider) AddByKey(ctx context.Context, key string) (store.Account, err
 // account identity from the id_token claims.
 func (p *Provider) LoginExchange(ctx context.Context, state, code string) (store.Account, error) {
 	p.mu.Lock()
+	p.gcVerifiersLocked()
 	entry, ok := p.verifier[state]
 	if ok {
 		delete(p.verifier, state)
@@ -158,6 +159,9 @@ func (p *Provider) UpstreamURL(path string) string {
 
 // ApplyAuth sets the headers Codex's backend expects for OAuth requests.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
+	req.Header.Del("X-Api-Key")
+	req.Header.Del("X-Goog-Api-Key")
+	req.Header.Del("ChatGPT-Account-Id")
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", codexUserAgent)
@@ -187,25 +191,28 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamBase+"/usage", nil)
 	if err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: build request: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: build request: %w", provider.ErrUsageUnavailable, err)
 	}
 	if err := p.ApplyAuth(req, a); err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: auth: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: auth: %w", provider.ErrUsageUnavailable, err)
 	}
 	req.Header.Set("User-Agent", codexUserAgent)
 	req.Header.Set("originator", "codex_cli_rs")
 
 	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return provider.Usage{}, provider.UsageStatusError(resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: read body: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: read body: %w", provider.ErrUsageUnavailable, err)
+	}
+	if len(raw) > 1<<20 {
+		return provider.Usage{}, fmt.Errorf("%w: response body too large", provider.ErrUsageUnavailable)
 	}
 
 	var parsed struct {
@@ -259,6 +266,9 @@ const codexUserAgent = "codex_cli_rs/0.154.0 (Mac OS 26.0.0; arm64)"
 // exhaustion as a 429 whose body carries error.type "usage_limit_reached"
 // and an upstream reset timestamp.
 func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
+	if ctx.Err() != nil || len(body) > 8<<10 {
+		return time.Time{}, false
+	}
 	var parsed struct {
 		Error struct {
 			Type     string `json:"type"`
@@ -300,9 +310,12 @@ func (p *Provider) ListResetCredits(ctx context.Context, a store.Account) ([]pro
 		return nil, fmt.Errorf("list reset credits: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return nil, fmt.Errorf("list reset credits: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return nil, errors.New("list reset credits: response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("list reset credits: http %d", resp.StatusCode)
@@ -364,9 +377,12 @@ func (p *Provider) ConsumeResetCredit(ctx context.Context, a store.Account, cred
 		return "", fmt.Errorf("consume reset credit: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return "", fmt.Errorf("consume reset credit: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return "", errors.New("consume reset credit: response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("consume reset credit: http %d", resp.StatusCode)
@@ -433,9 +449,12 @@ func tokenRequest(ctx context.Context, form url.Values) (oauthToken, error) {
 		return oauthToken{}, fmt.Errorf("token request: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return oauthToken{}, fmt.Errorf("token request: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return oauthToken{}, errors.New("token response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		if form.Get("grant_type") == "refresh_token" && provider.RefreshCredentialRejected(resp.StatusCode, raw) {

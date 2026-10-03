@@ -42,12 +42,12 @@ assert.equal(failure.elements['login-submit'].disabled, false);
 // Expired sessions must navigate away from app.js, not inject a DOM overlay.
 const appScript = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 const start = appScript.indexOf('function authLocked() {');
-const end = appScript.indexOf('\n// fetchWithCSRF', start);
+const end = appScript.indexOf('\nasync function fetchWithCSRF', start);
 assert.ok(start >= 0 && end > start);
 const removed = [];
 const navigated = [];
 const auth = vm.createContext({
-  authState: { locked: false }, stateTimer: 123, usageTimer: 456,
+  authState: { locked: false }, sessionCSRF: '', stateTimer: 123, usageTimer: 456,
   clearInterval: () => {}, clearTimeout: () => {},
   localStorage: { removeItem: key => removed.push(key) },
   location: { replace: path => navigated.push(path) },

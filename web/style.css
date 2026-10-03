@@ -385,10 +385,11 @@ html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
   flex-wrap: wrap;
 }
 .who { flex: 1; min-width: 0; }
-.identity-line { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.identity-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 9px; min-width: 0; }
 .identity-line .email { flex: 0 1 auto; min-width: 0; display: block; }
 .account-badge { display: inline-flex; align-items: center; gap: 4px; flex: none; padding: 2px 6px; border: 1px solid var(--selection-border); border-radius: 5px; color: var(--accent); background: var(--accent-soft); font-size: 11px; font-weight: 600; line-height: 1.5; white-space: nowrap; }
 .account-badge svg { width: 12px; height: 12px; }
+.account-badge.proxy-status { color: var(--dim); border-color: var(--border-strong); background: var(--surface-2); }
 .account-state { flex: none; color: var(--dim); font-size: 11px; }
 .routing-warning { color: var(--warn); font-size: 12px; }
 .who .email {
@@ -917,6 +918,75 @@ html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
 .settings-row .dim { color: var(--dim); font-weight: 400; font-size: 13px; }
 .settings-row button { padding: 7px 12px; font-size: 13px; }
 .settings-row button.danger { color: var(--danger); border-color: var(--danger); }
+.desktop-relay-card { min-width: 0; overflow-wrap: anywhere; grid-column: 1 / -1; gap: 16px; }
+.desktop-relay-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.desktop-relay-card .desktop-relay-header h2 { font-size: 18px; letter-spacing: -.02em; }
+.desktop-relay-subtitle { margin: 2px 0 0; color: var(--dim); font-size: 13px; }
+.desktop-relay-header button, .desktop-relay-controls button { padding: 7px 11px; font-size: 12px; }
+.desktop-relay-caption { max-width: 72ch; }
+.desktop-relay-feedback:empty { display: none; }
+.desktop-relay-primary { color: var(--accent); border-color: var(--accent); }
+.desktop-relay-setup-status { font-size: 12px; font-weight: 500; color: var(--dim); }
+.desktop-relay-details > summary, .desktop-relay-advanced > summary, .desktop-relay-diagnostics > summary { cursor: pointer; font-size: 12px; color: var(--dim); }
+.desktop-relay-card summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.desktop-relay-details .settings-sub { margin-top: 8px; }
+.desktop-relay-advanced, .desktop-relay-details { border-top: 1px solid var(--border); padding-top: 12px; }
+.desktop-relay-advanced-body { display: flex; flex-direction: column; gap: 14px; padding-top: 14px; }
+.desktop-relay-card .desktop-relay-evidence { font-size: 12px; }
+.desktop-relay-status, .desktop-relay-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.desktop-relay-badge { padding: 2px 7px; border: 1px solid var(--border); border-radius: 5px; color: var(--dim); font-size: 12px; }
+.desktop-relay-override { color: var(--accent); border-color: var(--selection-border); background: var(--accent-soft); }
+.desktop-relay-partial { color: var(--warn); }
+.desktop-relay-card .settings-sub { line-height: 1.5; overflow-wrap: anywhere; }
+.desktop-relay-card label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; min-width: 0; }
+.desktop-relay-card select, .desktop-relay-card textarea { width: 100%; min-width: 0; padding: 9px 12px; font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--button-radius, 10px); }
+.desktop-relay-card textarea { resize: vertical; font-family: ui-monospace, monospace; font-size: 12px; }
+.desktop-relay-card :is(a, code, textarea):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.desktop-relay-card h3 { margin: 0; font-size: 14px; }
+.desktop-relay-setup, .desktop-relay-task { display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 18px 0; border-top: 1px solid var(--border); min-width: 0; }
+.desktop-relay-task:last-child { padding-bottom: 0; }
+.desktop-relay-task-heading { display: flex; align-items: baseline; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; }
+.desktop-relay-task-heading strong { overflow-wrap: anywhere; min-width: 0; font-size: 15px; font-weight: 600; }
+.desktop-relay-task-badges { display: flex; flex-wrap: wrap; gap: 5px; }
+.desktop-relay-task-badges .desktop-relay-badge { font-size: 10px; padding: 1px 6px; }
+.desktop-relay-task-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; color: var(--dim); font-size: 12px; }
+.desktop-relay-project { color: var(--text); }
+.desktop-relay-disambiguator { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
+.desktop-relay-responding { color: var(--accent); }
+.desktop-relay-selection { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.desktop-relay-selection .desktop-relay-account { flex: 0 1 320px; width: min(320px, 100%); color: var(--dim); font-size: 12px; }
+.desktop-relay-selection select { padding: 8px 10px; font-size: 13px; background: var(--surface); }
+.desktop-relay-selection button { min-height: 38px; padding: 8px 12px; font-size: 12px; }
+.desktop-relay-selection button:not(:disabled) { color: var(--accent); border-color: var(--selection-border); }
+.desktop-relay-card .desktop-relay-selected { font-size: 12px; }
+.desktop-relay-card .desktop-relay-response, .desktop-relay-card .desktop-relay-selection-help { font-size: 12px; }
+.desktop-relay-card .desktop-relay-response-failed { color: var(--danger); }
+.desktop-relay-card .desktop-relay-association-warning { color: var(--warn); font-size: 12px; }
+.desktop-relay-members { display: grid; gap: 12px; margin-top: 14px; }
+.desktop-relay-member { display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--border); padding-top: 12px; min-width: 0; }
+.desktop-relay-conversations { display: flex; flex-direction: column; gap: 12px; }
+.desktop-relay-totals { margin: 0; color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+.desktop-relay-idle { margin: 0; color: var(--text); font-size: 14px; }
+.desktop-relay-empty { padding: 12px 0; }
+.desktop-relay-recent > summary { cursor: pointer; font-size: 13px; font-weight: 500; padding: 5px 0; }
+.desktop-relay-recent-help { margin: 8px 0 12px; }
+.desktop-relay-card .desktop-relay-switch-help { font-size: 12px; max-width: 84ch; }
+.desktop-relay-diagnostics { margin-top: 2px; }
+.desktop-relay-diagnostics dl { display: grid; gap: 6px; margin: 10px 0 0; font-size: 12px; }
+.desktop-relay-diagnostics dl > div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; }
+.desktop-relay-diagnostics dt { color: var(--dim); }
+.desktop-relay-diagnostics dd { margin: 0; }
+@media (max-width: 520px) {
+  .desktop-relay-card { padding: 18px; }
+  .desktop-relay-header { align-items: flex-start; }
+  .desktop-relay-header .desktop-relay-status { gap: 6px; }
+  .desktop-relay-selection .desktop-relay-account { flex-basis: 100%; width: 100%; }
+  .desktop-relay-selection button { min-height: 40px; }
+}
+.desktop-relay-card code { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
+.desktop-relay-scopes .settings-row { flex-wrap: wrap; }
+.desktop-relay-scopes code { display: block; margin-top: 4px; }
+.desktop-relay-source { align-self: flex-start; font-size: 13px; }
 .cli-setup-row { align-items: flex-start; flex-wrap: wrap; }
 .cli-setup-row button { flex: none; }
 .cli-setup-row > .cli-setup-actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin-left: auto; }
@@ -969,3 +1039,11 @@ html[data-theme="dark"] .menu-logo.monochrome img { filter: invert(1); }
 .switch-wrap input:disabled + .switch-visual { opacity: .55; cursor: default; }
 
 .menu-logo svg { width: 18px; height: 18px; display: block; }
+.logout-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.logout-card { width: min(420px, 100%); padding: 28px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--card-radius); }
+.logout-card p { color: var(--dim); margin: 14px 0 22px; }
+.logout-card button { color: var(--accent); border-color: var(--accent); }
+@media (prefers-reduced-motion: reduce) {
+  .update-banner.updating::after, #usage-refresh.spinning svg,
+  .recheck-btn.busy svg, .confirm-overlay, .confirm-modal { animation: none; }
+}

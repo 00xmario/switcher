@@ -6,10 +6,155 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
+func runMenuActionRegressionFixtures() {
+    func response(_ status: Int) -> HTTPURLResponse {
+        HTTPURLResponse(url: URL(string: "https://fixture.invalid/state")!, statusCode: status,
+            httpVersion: nil, headerFields: nil)!
+    }
+    func fixtureState(_ update: UpdateInfo? = nil) -> AppState {
+        AppState(accounts: [], order: [], hidden: [], version: "fixture-1",
+            update: update, menu_usage_bars: true, reset_notifications: true)
+    }
+    var requests: [URLRequest] = []
+    var completions: [(Data?, URLResponse?, Error?) -> Void] = []
+    var errors: [String] = []
+    var saved: [ResetAlertLedger] = []
+    var runtime = MenuRuntime()
+    runtime.request = { request, completion in requests.append(request); completions.append(completion) }
+    runtime.deviceToken = { "fixture-device-token" }
+    runtime.saveLedger = { saved.append($0) }
+    runtime.showError = { title, message in errors.append(title + ": " + message) }
+    let delegate = AppDelegate(runtime: runtime)
+    delegate.applyMenuState(fixtureState(UpdateInfo(latest: "fixture-1", update_available: false)))
+    let stalePoll = delegate.beginStateRequest()
+    delegate.runUpdate()
+    guard requests.count == 1, requests[0].url?.path == "/api/update/check",
+          requests[0].httpMethod == "POST",
+          requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer fixture-device-token" else {
+        fail("Check for updates must request authenticated metadata without installation")
+    }
+    completions.removeFirst()(Data(#"{"status":"ok","update":{"latest":"fixture-2","update_available":true}}"#.utf8), response(200), nil)
+    guard delegate.cachedState?.update?.update_available == true,
+          !delegate.acceptStateResponse(fixtureState(), serial: stalePoll) else {
+        fail("A successful update check must refresh the install action")
+    }
+    requests.removeAll(); completions.removeAll()
+    delegate.runUpdate()
+    guard requests.count == 1, requests[0].url?.path == "/api/update" else { fail("An explicit available update must use installation") }
+    completions.removeFirst()(Data(#"{"error":{"message":"fixture active update"}}"#.utf8), response(409), nil)
+    guard errors.last?.contains("fixture active update") == true else { fail("Native update HTTP errors were swallowed") }
+    requests.removeAll(); completions.removeAll()
+    delegate.refreshUsage()
+    delegate.refreshUsage()
+    guard requests.count == 1, requests[0].url?.path == "/api/usage/refresh" else { fail("Native usage refresh must deduplicate while pending") }
+    completions.removeFirst()(Data(#"{"error":{"message":"fixture refresh rejected"}}"#.utf8), response(500), nil)
+    guard errors.last?.contains("fixture refresh rejected") == true else { fail("Native refresh HTTP errors were swallowed") }
+    requests.removeAll(); completions.removeAll()
+    delegate.refreshUsage()
+    guard requests.count == 1 else { fail("Failed refresh did not release the retry control") }
+    completions.removeFirst()(nil, nil, URLError(.timedOut))
+    guard errors.last?.localizedLowercase.contains("timed out") == true else { fail("Native refresh timeout was not reported") }
+
+    let alert = ResetAlert(id: "fixture-reset", accountID: "fixture-account", providerID: "codex",
+        provider: "Codex", window: "Weekly", date: Date().addingTimeInterval(-60))
+    let ledger = ResetAlertLedger(alerts: [alert], deliveredIDs: [])
+    delegate.restoreResetLedger(ledger)
+    delegate.cachedState = nil
+    saved.removeAll(); requests.removeAll()
+    delegate.deliverDueResetAlerts()
+    guard delegate.resetAlertLedger == ledger, saved.isEmpty, requests.isEmpty else {
+        fail("Unknown startup state erased persisted alerts or attempted delivery")
+    }
+
+    var launched = 0, terminated = 0, quitCalls = 0
+    var exits: [(UUID) -> Void] = []
+    var tasks: [(TimeInterval, () -> Void)] = []
+    runtime.request = { _, completion in completion(nil, nil, URLError(.cannotConnectToHost)) }
+    runtime.schedule = { delay, task in tasks.append((delay, task)) }
+    runtime.launchServer = { exit in
+        launched += 1; exits.append(exit)
+        return OwnedServer(id: UUID(), terminate: { terminated += 1 })
+    }
+    runtime.terminateApplication = { quitCalls += 1 }
+    let owned = AppDelegate(runtime: runtime)
+    owned.ensureServerRunning()
+    guard launched == 1, let initialID = owned.serverProcess?.id else { fail("Fixture initial child was not owned") }
+    owned.applyMenuState(fixtureState())
+    exits[0](initialID)
+    guard owned.cachedState == nil else { fail("Owned child exit left stale account cards") }
+    for delay in [1.0, 2.0, 4.0] {
+        guard let index = tasks.firstIndex(where: { $0.0 == delay }) else { fail("Missing bounded recovery delay \(delay)") }
+        tasks.remove(at: index).1()
+        guard let id = owned.serverProcess?.id else { fail("Recovery did not own its replacement child") }
+        exits[0](initialID)
+        guard owned.serverProcess?.id == id else { fail("A stale child exit discarded its replacement") }
+        exits.last!(id)
+    }
+    guard launched == 4, !tasks.contains(where: { [1.0, 2.0, 4.0].contains($0.0) }), terminated == 0 else {
+        fail("Crash recovery was unbounded or terminated a process")
+    }
+
+    tasks.removeAll(); launched = 0; exits.removeAll()
+    let quitting = AppDelegate(runtime: runtime)
+    quitting.ensureServerRunning()
+    guard let quitID = quitting.serverProcess?.id else { fail("Quit fixture missing owned child") }
+    quitting.quit()
+    exits[0](quitID)
+    for (_, task) in tasks { task() }
+    guard launched == 1, terminated == 1, quitCalls == 1 else { fail("Deliberate quit restarted its server") }
+
+    tasks.removeAll(); launched = 0; terminated = 0; quitCalls = 0; exits.removeAll()
+    let queuedQuit = AppDelegate(runtime: runtime)
+    queuedQuit.ensureServerRunning()
+    guard let queuedID = queuedQuit.serverProcess?.id else { fail("Queued quit fixture missing its child") }
+    exits[0](queuedID)
+    queuedQuit.quit()
+    for (_, task) in tasks { task() }
+    guard launched == 1, terminated == 0, quitCalls == 1 else { fail("Quit failed to fence queued recovery") }
+
+    tasks.removeAll(); launched = 0; terminated = 0; exits.removeAll()
+    let systemQuit = AppDelegate(runtime: runtime)
+    systemQuit.ensureServerRunning()
+    guard let systemID = systemQuit.serverProcess?.id else { fail("System quit fixture missing its child") }
+    systemQuit.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+    exits[0](systemID)
+    for (_, task) in tasks { task() }
+    guard launched == 1, terminated == 1 else { fail("Application termination failed to stop only its owned child") }
+
+    var externalRuntime = runtime
+    externalRuntime.request = { _, completion in completion(nil, response(401), nil) }
+    let external = AppDelegate(runtime: externalRuntime)
+    launched = 0; terminated = 0
+    external.ensureServerRunning()
+    external.quit()
+    guard launched == 0, terminated == 0 else { fail("An existing external listener was spawned over or terminated") }
+
+    var delayedProbe: ((Data?, URLResponse?, Error?) -> Void)?
+    var probingRuntime = runtime
+    probingRuntime.request = { _, completion in delayedProbe = completion }
+    let probing = AppDelegate(runtime: probingRuntime)
+    launched = 0; tasks.removeAll()
+    probing.ensureServerRunning()
+    probing.quit()
+    delayedProbe?(nil, nil, URLError(.cannotConnectToHost))
+    for (_, task) in tasks { task() }
+    guard launched == 0 else { fail("A probe completed after quit and launched a child") }
+
+    let inert = MenuRuntime()
+    var inertError: Error?
+    inert.request(URLRequest(url: URL(string: "https://fixture.invalid/")!)) { _, _, error in inertError = error }
+    guard (inertError as NSError?)?.domain == "SwitcherFixture", inert.deviceToken() == nil,
+          !inert.alertsEnabled(), (try? inert.loadLedger())?.alerts.isEmpty == true else { fail("Fixture runtime defaults were not inert") }
+    do { _ = try inert.launchServer { _ in fail("Inert runtime launched a child") }; fail("Inert launch did not refuse process creation") }
+    catch { guard (error as NSError).domain == "SwitcherFixture" else { fail("Unexpected inert launch error") } }
+    print("Native update check, refresh errors, unknown reset ledger, bounded owned recovery, and deliberate quit: OK")
+}
+
 @main
 struct MenuBarLayoutTest {
     static func main() {
         _ = NSApplication.shared
+        runMenuActionRegressionFixtures()
         guard planNames["claude_max_5x"] == "Max 5x",
               planNames["claude_max_20x"] == "Max 20x",
               planNames["claude_max"] == "Max" else { fail("Claude Max tiers must not be inferred from a generic max flag") }
@@ -133,6 +278,16 @@ struct MenuBarLayoutTest {
         guard !nativeAccount.selected else { fail("Proxy selection was mislabeled as a native login") }
         nativeAccount.native_active = true
         guard nativeAccount.selected else { fail("Observed native selection was not displayed") }
+        let nativeDelegate = AppDelegate()
+        func fieldTexts(_ view: NSView) -> [String] {
+            (view as? NSTextField).map { [$0.stringValue] } ?? view.subviews.flatMap(fieldTexts)
+        }
+        nativeAccount.native_active = false
+        let proxyFields = fieldTexts(nativeDelegate.providerCard(providerID: "claude", accounts: [nativeAccount], contentWidth: contentWidth, showUsageBars: true))
+        guard proxyFields.contains("Claude Code idle · Proxy active") else { fail("Native menu hid the independent proxy selection") }
+        nativeAccount.native_active = true
+        let bothFields = fieldTexts(nativeDelegate.providerCard(providerID: "claude", accounts: [nativeAccount], contentWidth: contentWidth, showUsageBars: true))
+        guard bothFields.contains("Claude Code active · Proxy active") else { fail("Native menu conflated matching native/proxy selections") }
         guard bankedResetText(base.reset_credits) == "⚡ 1 banked",
               bankedResetText(nil) == nil,
               bankedResetText(ResetCredits(count: 0)) == nil else {

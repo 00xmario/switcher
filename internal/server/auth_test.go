@@ -528,6 +528,12 @@ func TestCompactAccountViewPersistsWithoutChangingNetworkSettings(t *testing.T) 
 		}
 		authRequest := httptest.NewRequest(http.MethodGet, "/api/auth/status", nil)
 		authRequest.Host = "127.0.0.1:8787"
+		authRequest.RemoteAddr = "127.0.0.1:1234"
+		device, err := preferences.EnsureDeviceToken()
+		if err != nil {
+			t.Fatal(err)
+		}
+		authRequest.Header.Set("Authorization", "Bearer "+device)
 		authStatus := httptest.NewRecorder()
 		a.handleAuthStatus(authStatus, authRequest)
 		if err := json.Unmarshal(authStatus.Body.Bytes(), &value); err != nil || value.CompactAccounts != enabled {

@@ -45,6 +45,9 @@ type Account struct {
 	// when its recovery sidecar was unavailable. Native identity verification
 	// and recovery cleanup must finish before another grant can be consumed.
 	ClaudeCodeRefreshPending bool `json:"claude_code_refresh_pending,omitempty"`
+	// ClaudeCodeRefreshRecovery retains the native-store preimage when an
+	// issued successor must also repair its live credential store on recovery.
+	ClaudeCodeRefreshRecovery json.RawMessage `json:"claude_code_refresh_recovery,omitempty"`
 }
 
 // ClaudeCodeLogin preserves the native account-scoped credential fields and

@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"switcher/internal/claudecode"
 	"switcher/internal/provider"
@@ -64,6 +65,7 @@ func (m *Manager) syncNative(ctx context.Context, prov provider.Provider, a *sto
 	if !ok || !native.NativeEnabled() {
 		return nil
 	}
+	beforeAccess, beforeRefresh := a.Token.AccessToken, a.Token.RefreshToken
 	changed, err := native.SyncNative(ctx, a)
 	if err != nil {
 		return err
@@ -75,6 +77,13 @@ func (m *Manager) syncNative(ctx context.Context, prov provider.Provider, a *sto
 		m.mu.Lock()
 		m.accountRevision[a.ID]++
 		m.quotaRevision[a.ID]++
+		if beforeAccess != a.Token.AccessToken || beforeRefresh != a.Token.RefreshToken {
+			h := m.healthLocked(a.ID)
+			h.relogin = false
+			h.lastChecked, h.lastSuccess, h.retryAt = time.Time{}, time.Time{}, time.Time{}
+			delete(m.lastUsage, a.ID)
+			delete(m.planChecked, a.ID)
+		}
 		m.mu.Unlock()
 	}
 	return nil

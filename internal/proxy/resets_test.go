@@ -131,16 +131,21 @@ func TestParkCannotFollowAConcurrentRedemption(t *testing.T) {
 func TestQuotaRemovalAdvancesPublishedRevision(t *testing.T) {
 	m := newManager(t, nil, account("a"))
 	stale := provider.Usage{Available: true, Windows: []provider.UsageWindow{{Label: "Session", UsedPercent: 100, ResetsAt: 1}}}
-	m.recordUsage("a", 0, stale, true, nil)
+	unrolled := provider.Usage{Available: true, Windows: []provider.UsageWindow{{Label: "Session", UsedPercent: 100, ResetsAt: time.Now().Add(time.Hour).Unix()}}}
+	m.recordUsage("a", 0, unrolled, true, nil)
 	_, _, before, _ := m.QuotaSnapshot("a")
+	m.mu.Lock()
+	m.lastUsage["a"] = stale // fixture simulates the provider-reported rollover
+	m.mu.Unlock()
 	m.recordUsage("a", 0, provider.Usage{}, false, provider.ErrUsageUnavailable)
 	usage, _, after, _ := m.QuotaSnapshot("a")
 	if usage != nil || after <= before {
 		t.Fatal("removing an expired snapshot did not advance revision")
 	}
-	m.recordUsage("a", 0, stale, true, nil)
+	m.recordUsage("a", 0, unrolled, true, nil)
 	_, _, before, _ = m.QuotaSnapshot("a")
 	m.mu.Lock()
+	m.lastUsage["a"] = stale
 	m.healthLocked("a").retryAt = time.Now().Add(time.Hour)
 	m.mu.Unlock()
 	m.refreshAccount(context.Background(), "a", 0, false)

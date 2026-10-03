@@ -503,7 +503,7 @@ func TestRefreshSaveFailureKeepsReloginAndLastGoodUsage(t *testing.T) {
 	assertCondition(t, m, "usage_current")
 }
 
-func TestProxySaveFailureFallsBackWithoutForwardingRotatedToken(t *testing.T) {
+func TestProxySaveFailurePreservesRoutingWithoutForwardingRotatedToken(t *testing.T) {
 	for _, expired := range []bool{true, false} {
 		t.Run(fmt.Sprintf("expired=%t", expired), func(t *testing.T) {
 			var forwarded atomic.Int32
@@ -535,12 +535,12 @@ func TestProxySaveFailureFallsBackWithoutForwardingRotatedToken(t *testing.T) {
 			m.mu.Lock()
 			m.healthLocked("a").relogin = true
 			m.mu.Unlock()
-			if status := doRequest(t, m, "/v1/responses").Code; status != http.StatusOK {
-				t.Fatalf("fallback status = %d, want 200", status)
+			if status := doRequest(t, m, "/v1/responses").Code; status != http.StatusServiceUnavailable {
+				t.Fatalf("storage-failure status = %d, want 503", status)
 			}
-			wantForwarded := int32(1)
+			wantForwarded := int32(0)
 			if !expired {
-				wantForwarded = 2 // initial 401, then account b
+				wantForwarded = 1 // initial 401 only; no unrelated account is billed
 			}
 			if got := forwarded.Load(); got != wantForwarded {
 				t.Fatalf("forwarded %d requests, want %d", got, wantForwarded)
@@ -548,8 +548,11 @@ func TestProxySaveFailureFallsBackWithoutForwardingRotatedToken(t *testing.T) {
 			if got := refreshed.Load(); got != 1 {
 				t.Fatalf("refresh attempts = %d, want 1", got)
 			}
-			if got := m.ActiveID("fake"); got != "b" {
-				t.Fatalf("active = %q, want b", got)
+			if got := m.ActiveID("fake"); got != "a" {
+				t.Fatalf("active = %q, want a", got)
+			}
+			if _, parked := m.Exhausted("a"); parked {
+				t.Fatal("storage failure was classified as account exhaustion")
 			}
 			assertCondition(t, m, "needs_relogin")
 			saved, err := m.store.Get("a")
@@ -585,8 +588,8 @@ func TestProxySaveFailureWithNoFallbackStopsAfterOneRefresh(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("refresh attempts = %d, want 1", got)
 	}
-	if _, parked := m.Exhausted("a"); !parked {
-		t.Fatal("account was not parked after failed token save")
+	if _, parked := m.Exhausted("a"); parked {
+		t.Fatal("failed token save parked an account without credential rejection")
 	}
 }
 

@@ -26,6 +26,16 @@ var (
 	UserinfoURL = "https://www.googleapis.com/oauth2/v2/userinfo?alt=json"
 )
 
+// Project discovery provenance is stored in Account.Token.Extra by the
+// Google providers. A failed lookup does not invalidate the login tokens;
+// relogin callers may retain a matching account's known nonempty project.
+// No upstream error text or credential is stored in this metadata.
+const (
+	ProjectDiscoveryStatusKey  = "project_discovery_status"
+	ProjectDiscoveryDiscovered = "discovered"
+	ProjectDiscoveryFailed     = "failed"
+)
+
 // Token is the subset of Google's token response Switcher stores.
 type Token struct {
 	AccessToken  string `json:"access_token"`
@@ -69,9 +79,12 @@ func Userinfo(ctx context.Context, accessToken string) (string, error) {
 		return "", fmt.Errorf("google userinfo: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return "", fmt.Errorf("google userinfo: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return "", errors.New("google userinfo: response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("google userinfo failed: http %d", resp.StatusCode)
@@ -101,9 +114,12 @@ func postToken(ctx context.Context, form url.Values) (Token, error) {
 		return Token{}, fmt.Errorf("google token request: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return Token{}, fmt.Errorf("google token response: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return Token{}, errors.New("google token response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		if form.Get("grant_type") == "refresh_token" && provider.RefreshCredentialRejected(resp.StatusCode, raw) {
@@ -173,9 +189,12 @@ func postOnboard(ctx context.Context, accessToken, target, userAgent, apiClient 
 		return fmt.Errorf("onboardUser: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return fmt.Errorf("onboardUser: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return errors.New("onboardUser: response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("onboardUser failed: http %d", resp.StatusCode)

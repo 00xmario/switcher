@@ -41,10 +41,15 @@ type ratesSnapshot struct {
 // otherwise; on fetch failure the stale table still answers. The second
 // return value is "fresh", "cached", or "unavailable".
 func LoadRates(path string, client *http.Client) (RateTable, string) {
+	table, status, _ := loadRatesAt(path, client, time.Now())
+	return table, status
+}
+
+func loadRatesAt(path string, client *http.Client, now time.Time) (RateTable, string, time.Time) {
 	var snap ratesSnapshot
 	if data, err := os.ReadFile(path); err == nil && json.Unmarshal(data, &snap) == nil &&
-		snap.Document != nil && time.Since(time.UnixMilli(snap.FetchedAtMs)) < ratesTTL {
-		return snap.Document, "cached"
+		snap.Document != nil && now.Sub(time.UnixMilli(snap.FetchedAtMs)) >= 0 && now.Sub(time.UnixMilli(snap.FetchedAtMs)) < ratesTTL {
+		return snap.Document, "cached", time.UnixMilli(snap.FetchedAtMs)
 	}
 	if client == nil {
 		client = http.DefaultClient
@@ -53,29 +58,29 @@ func LoadRates(path string, client *http.Client) (RateTable, string) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, RatesURL, nil)
 	if err != nil {
-		return snap.Document, "unavailable"
+		return snap.Document, "unavailable", time.UnixMilli(snap.FetchedAtMs)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return snap.Document, "unavailable"
+		return snap.Document, "unavailable", time.UnixMilli(snap.FetchedAtMs)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return snap.Document, "unavailable"
+		return snap.Document, "unavailable", time.UnixMilli(snap.FetchedAtMs)
 	}
 	var raw map[string]rawRate
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&raw); err != nil {
-		return snap.Document, "unavailable"
+		return snap.Document, "unavailable", time.UnixMilli(snap.FetchedAtMs)
 	}
 	table := buildTable(raw)
 	if len(table) == 0 {
-		return snap.Document, "unavailable"
+		return snap.Document, "unavailable", time.UnixMilli(snap.FetchedAtMs)
 	}
-	out := ratesSnapshot{FetchedAtMs: time.Now().UnixMilli(), Document: table}
+	out := ratesSnapshot{FetchedAtMs: now.UnixMilli(), Document: table}
 	if data, err := json.Marshal(out); err == nil {
 		_ = os.WriteFile(path, data, 0o644)
 	}
-	return table, "fresh"
+	return table, "fresh", now
 }
 
 type rawRate struct {

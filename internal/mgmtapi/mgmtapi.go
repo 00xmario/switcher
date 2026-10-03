@@ -12,7 +12,9 @@ package mgmtapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -134,6 +136,15 @@ var allowedControlPlaneHosts = map[string]bool{
 	"chatgpt.com":       true,
 }
 
+func allowedControlPlaneURL(u *url.URL) bool {
+	return u.Scheme == "https" && u.User == nil && u.Opaque == "" &&
+		(u.Port() == "" || u.Port() == "443") && allowedControlPlaneHosts[strings.ToLower(u.Hostname())]
+}
+
+func sameControlPlaneOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Hostname(), b.Hostname()) && a.Scheme == b.Scheme
+}
+
 func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 	var req apiCallRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
@@ -149,8 +160,8 @@ func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid url"})
 		return
 	}
-	if !allowedControlPlaneHosts[strings.ToLower(parsed.Hostname())] {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "url host is not allowed"})
+	if !allowedControlPlaneURL(parsed) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "url must use an allowed HTTPS origin"})
 		return
 	}
 
@@ -158,9 +169,19 @@ func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid auth_index"})
 		return
 	}
-	account, err := a.Store.Get(req.AuthIndex)
+	if a.Proxy == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "account manager unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	account, err := a.Proxy.PrepareAccount(ctx, req.AuthIndex)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown auth_index"})
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown auth_index"})
+		} else {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "account credentials unavailable"})
+		}
 		return
 	}
 
@@ -168,23 +189,6 @@ func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 	if method == "" {
 		method = http.MethodGet
 	}
-	if method == "" {
-		method = http.MethodGet
-	}
-	var bodyReader io.Reader
-	if len(req.Data) > 0 && string(req.Data) != "null" {
-		bodyReader = bytes.NewReader(req.Data)
-	}
-	httpReq, err := http.NewRequestWithContext(r.Context(), method, req.URL, bodyReader)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request"})
-		return
-	}
-	token := account.Token.AccessToken
-	for key, value := range req.Header {
-		httpReq.Header.Set(key, strings.ReplaceAll(value, "$TOKEN$", token))
-	}
-
 	// Redirects re-validate the allowlist, and headers that carried the
 	// account token are stripped on any cross-host hop so the token can
 	// never leak to a host the allowlist did not bless.
@@ -198,22 +202,64 @@ func (a *API) handleAPICall(w http.ResponseWriter, r *http.Request) {
 		if len(via) > 3 {
 			return fmt.Errorf("too many redirects")
 		}
-		if !allowedControlPlaneHosts[strings.ToLower(req.URL.Hostname())] {
-			return fmt.Errorf("redirect host %s is not allowed", req.URL.Hostname())
+		if !allowedControlPlaneURL(req.URL) {
+			return fmt.Errorf("redirect origin is not allowed")
 		}
-		for _, name := range tokenHeaderNames {
-			req.Header.Del(name)
+		for _, previous := range via {
+			if !sameControlPlaneOrigin(req.URL, previous.URL) {
+				for _, name := range tokenHeaderNames {
+					req.Header.Del(name)
+				}
+				break
+			}
 		}
 		return nil
 	}}
-	resp, err := client.Do(httpReq)
+	call := func(account store.Account) (*http.Response, error) {
+		var bodyReader io.Reader
+		if len(req.Data) > 0 && string(req.Data) != "null" {
+			bodyReader = bytes.NewReader(req.Data)
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range req.Header {
+			httpReq.Header.Set(key, strings.ReplaceAll(value, "$TOKEN$", account.Token.AccessToken))
+		}
+		return client.Do(httpReq)
+	}
+	resp, err := call(account)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream request failed"})
 		return
 	}
+	// A redirected request no longer represents authentication at the original
+	// endpoint. Never refresh the original account based on a cross-origin 401.
+	tokenWasSent := false
+	if resp.Request != nil && sameControlPlaneOrigin(resp.Request.URL, parsed) {
+		for _, name := range tokenHeaderNames {
+			if strings.Contains(resp.Request.Header.Get(name), account.Token.AccessToken) {
+				tokenWasSent = true
+			}
+		}
+	}
+	if resp.StatusCode == http.StatusUnauthorized && tokenWasSent {
+		_ = resp.Body.Close()
+		account, err = a.Proxy.RefreshAccountAfter401(ctx, account.ID, account.Token.AccessToken)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "account credentials could not be refreshed"})
+			return
+		}
+		resp, err = call(account)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "upstream request failed"})
+			return
+		}
+	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20+1))
+	if err != nil || len(raw) > 4<<20 {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "could not read upstream response"})
 		return
 	}
@@ -237,7 +283,10 @@ func (a *API) handleResetQuota(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown auth_index"})
 		return
 	}
-	a.Proxy.ClearExhausted(account.ID)
+	if err := a.Proxy.ClearExhausted(account.ID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "quota state could not be saved"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":     "ok",
 		"auth_index": req.AuthIndex,

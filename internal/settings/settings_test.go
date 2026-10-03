@@ -91,7 +91,9 @@ func TestSessionsLifecycle(t *testing.T) {
 	if s.ValidateSession("attacker-controlled-value") {
 		t.Fatal("arbitrary string validated as a session")
 	}
-	s.DeleteSession(token)
+	if err := s.DeleteSession(token); err != nil {
+		t.Fatal(err)
+	}
 	if s.ValidateSession(token) {
 		t.Fatal("deleted session still valid")
 	}
@@ -206,11 +208,16 @@ func TestDisableAuthClearsEverything(t *testing.T) {
 	}
 }
 
-func TestCorruptSettingsFailOpen(t *testing.T) {
+func TestCorruptSettingsFailClosed(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "settings.json"), []byte("{not json"), 0o600)
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	s := New(dir)
-	if s.Enabled() || s.HasPassword() {
-		t.Fatal("corrupt settings must fail open to the historic behavior")
+	if !s.Enabled() || s.HasPassword() {
+		t.Fatal("corrupt initial settings must require auth without inventing a password")
+	}
+	if _, err := s.Snapshot(); err == nil {
+		t.Fatal("corrupt settings error was hidden")
 	}
 }

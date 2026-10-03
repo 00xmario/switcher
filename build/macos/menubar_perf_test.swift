@@ -3,8 +3,7 @@ import AppKit
 @main
 struct MenuPerformanceTest {
     static func main() {
-        let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)
+        _ = NSApplication.shared
         let delegate = AppDelegate()
         let now = Date().timeIntervalSince1970
         let providers = ["claude", "claude", "codex", "codex", "opencode", "copilot"]
@@ -14,7 +13,8 @@ struct MenuPerformanceTest {
         delegate.cachedState = AppState(accounts: providers.enumerated().map { index, provider in
             Account(id: "fixture-\(index)", provider: provider, email: "account\(index)@example.test",
                 plan: provider == "claude" ? "claude_max_5x" : "pro", active: index % 2 == 0,
-                exhausted_until: nil, usage: Usage(available: true, windows: windows), reset_credits: nil)
+                exhausted_until: nil, usage: Usage(available: true, windows: windows), reset_credits: nil,
+                native_switch_available: provider == "claude", native_active: provider == "claude" && index == 1)
         }, order: ["claude", "codex", "opencode", "copilot"], hidden: [], version: "benchmark",
            update: nil, menu_usage_bars: true, reset_notifications: false)
         func measure(_ label: String, _ count: Int, _ action: () -> Void) {

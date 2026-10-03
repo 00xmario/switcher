@@ -62,6 +62,15 @@ func New(paths Paths, dataRoot string, st AccountStore, keys Keychain, profile P
 		lockWait: 9 * time.Second, volatileSuccessors: map[string]successor{}, status: Status{Available: true, Condition: "checking", ConfigPath: paths.ConfigFile}}
 }
 
+// Account files are file-synced by Store.Save. Recovery cleanup must also wait
+// for their atomic rename to be durable, even when no sidecar could be written.
+func (m *Manager) saveAccount(a store.Account) error {
+	if err := m.store.Save(a); err != nil {
+		return err
+	}
+	return syncPrivateDirectory(filepath.Join(filepath.Dir(m.dataRoot), "accounts"))
+}
+
 func (m *Manager) Status() Status { m.statusMu.Lock(); defer m.statusMu.Unlock(); return m.status }
 
 func (m *Manager) SetReceiptReader(reader func(string) (bool, error)) {
@@ -117,6 +126,9 @@ func (s snapshot) credential() []byte {
 func (m *Manager) readSnapshot(ctx context.Context) (snapshot, error) {
 	var s snapshot
 	var err error
+	if err := checkLocks(ctx); err != nil {
+		return s, err
+	}
 	if s.Config, err = readPrivate(m.paths.ConfigFile); err != nil {
 		return s, err
 	}
@@ -138,6 +150,9 @@ func (m *Manager) readSnapshot(ctx context.Context) (snapshot, error) {
 			}
 		}
 	}
+	if err := validateSnapshotSize(s); err != nil {
+		return s, err
+	}
 	if len(s.credential()) > 0 {
 		if _, err := parseOAuth(s.credential()); err != nil {
 			return s, err
@@ -147,16 +162,25 @@ func (m *Manager) readSnapshot(ctx context.Context) (snapshot, error) {
 	if s.Keychain.Exists {
 		m.backend = "keychain"
 	}
-	return s, nil
+	return s, checkLocks(ctx)
+}
+
+func validateSnapshotSize(s snapshot) error {
+	for _, value := range []fileValue{s.Config, s.File, s.Keychain, s.ManagedKey} {
+		if len(value.Data) > nativeFileLimit {
+			return errors.New("native Claude store exceeds its bounded storage limit")
+		}
+	}
+	return nil
 }
 
 func (m *Manager) inspect(ctx context.Context) (snapshot, error) {
-	unlock, err := m.locks(ctx)
+	locked, unlock, err := m.locks(ctx)
 	if err != nil {
 		return snapshot{}, err
 	}
 	defer unlock()
-	return m.readSnapshot(ctx)
+	return m.readSnapshot(locked)
 }
 
 func (m *Manager) owner(ctx context.Context, s snapshot, accounts []store.Account) (Identity, error) {
@@ -212,6 +236,9 @@ func (m *Manager) CaptureAndStore(ctx context.Context, save func(*store.Account)
 func (m *Manager) capture(ctx context.Context, save func(*store.Account) error) (store.Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.recoverActiveRefreshes(ctx); err != nil {
+		return store.Account{}, err
+	}
 	s, err := m.inspect(ctx)
 	if err != nil {
 		return store.Account{}, err
@@ -224,12 +251,12 @@ func (m *Manager) capture(ctx context.Context, save func(*store.Account) error) 
 	if err != nil || identity.UUID == "" || identity.Email == "" {
 		return store.Account{}, identityError()
 	}
-	unlock, err := m.locks(ctx)
+	locked, unlock, err := m.locks(ctx)
 	if err != nil {
 		return store.Account{}, err
 	}
 	defer unlock()
-	current, err := m.readSnapshot(ctx)
+	current, err := m.readSnapshot(locked)
 	if err != nil {
 		return store.Account{}, err
 	}
@@ -253,6 +280,9 @@ func (m *Manager) capture(ctx context.Context, save func(*store.Account) error) 
 		return store.Account{}, err
 	}
 	if save != nil {
+		if err := checkLocks(locked); err != nil {
+			return store.Account{}, err
+		}
 		if err := save(&a); err != nil {
 			return store.Account{}, err
 		}
@@ -309,6 +339,9 @@ func (m *Manager) Synchronize(ctx context.Context, a *store.Account) (bool, erro
 			return false, err
 		}
 	}
+	if _, err := m.recoverNativeRefresh(ctx, a); err != nil {
+		return false, err
+	}
 	s, err := m.inspect(ctx)
 	if err != nil {
 		m.unavailable(err)
@@ -340,12 +373,12 @@ func (m *Manager) Synchronize(ctx context.Context, a *store.Account) (bool, erro
 		after, _ := json.Marshal(a)
 		return !bytes.Equal(before, after), nil
 	}
-	unlock, err := m.locks(ctx)
+	locked, unlock, err := m.locks(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer unlock()
-	current, err := m.readSnapshot(ctx)
+	current, err := m.readSnapshot(locked)
 	if err != nil {
 		return false, err
 	}
@@ -365,18 +398,30 @@ func (m *Manager) Synchronize(ctx context.Context, a *store.Account) (bool, erro
 }
 
 // Refresh is the sole refresh-grant gate once the native bridge is enabled.
-// Active native credentials belong to Claude Code; inactive grants are
-// consumed under the same native locks, then durably saved before returning.
+// Refresh consumes only a verified current generation under Claude's locks.
+// Active successors also update the native stores before those locks release.
 func (m *Manager) Refresh(ctx context.Context, a *store.Account, grant Grant) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.refresh(ctx, a, grant)
 }
 
+// RefreshAfter401 can force only the access-token generation actually rejected
+// by the caller. A newer locked native generation is adopted without a POST.
+func (m *Manager) RefreshAfter401(ctx context.Context, a *store.Account, rejectedAccessToken string, grant Grant) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rejectedAccessToken == "" {
+		return ErrConflict
+	}
+	return m.refreshGeneration(ctx, a, grant, rejectedAccessToken)
+}
+
 type successor struct {
-	Account         store.Account `json:"account"`
-	Predecessor     string        `json:"predecessor"`
-	RequireIdentity bool          `json:"require_identity,omitempty"`
+	Account         store.Account  `json:"account"`
+	Predecessor     string         `json:"predecessor"`
+	RequireIdentity bool           `json:"require_identity,omitempty"`
+	Native          *nativeRefresh `json:"native,omitempty"`
 }
 
 func (m *Manager) successorPath(id string) string {
@@ -384,11 +429,22 @@ func (m *Manager) successorPath(id string) string {
 }
 
 func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) error {
+	return m.refreshGeneration(ctx, a, grant, "")
+}
+
+func (m *Manager) refreshGeneration(ctx context.Context, a *store.Account, grant Grant, rejectedAccessToken string) error {
 	if err := m.checkPending(); err != nil {
+		return err
+	}
+	advanced, err := m.reloadAccountGeneration(a)
+	if err != nil {
 		return err
 	}
 	if a.ClaudeCodeRefreshPending {
 		return m.recoverAccountSuccessor(ctx, a)
+	}
+	if recovered, err := m.recoverNativeRefresh(ctx, a); err != nil || recovered {
+		return err
 	}
 	pre, err := m.inspect(ctx)
 	if err != nil {
@@ -408,17 +464,26 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 			return err
 		}
 	}
-	unlock, err := m.locks(ctx)
+	locked, unlock, err := m.locks(ctx)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	current, err := m.readSnapshot(ctx)
+	current, err := m.readSnapshot(locked)
 	if err != nil {
 		return err
 	}
 	if !reflect.DeepEqual(pre, current) {
 		return ErrConflict
+	}
+	changed, err := m.reloadAccountGeneration(a)
+	if err != nil {
+		return err
+	}
+	advanced = advanced || changed
+	if a.ClaudeCodeRefreshPending {
+		unlock()
+		return m.recoverAccountSuccessor(ctx, a)
 	}
 	oauth, _ := parseOAuth(current.credential())
 	if owns(owner, *a) || family(oauth, *a) {
@@ -430,11 +495,18 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 			if err := applyNative(a, current.credential(), owner); err != nil {
 				return err
 			}
-			if fresh(*a, time.Minute) {
+			if fresh(*a, time.Minute) && (rejectedAccessToken == "" || a.Token.AccessToken != rejectedAccessToken) {
 				return nil
 			}
+			return m.refreshNativeLocked(locked, a, current, grant)
 		}
 		return ErrNativeOwned
+	}
+	if advanced && fresh(*a, time.Minute) {
+		return nil
+	}
+	if rejectedAccessToken != "" && a.Token.AccessToken != rejectedAccessToken {
+		return nil
 	}
 	if saved, ok := m.volatileSuccessors[a.ID]; ok {
 		if a.Token.RefreshToken != saved.Predecessor && a.Token.RefreshToken != saved.Account.Token.RefreshToken {
@@ -447,7 +519,7 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 				return err
 			}
 			saved.Account.AutoUseReset = a.AutoUseReset
-			if err := m.store.Save(saved.Account); err != nil {
+			if err := m.saveAccount(saved.Account); err != nil {
 				return errors.New("Claude refresh successor is retained in memory; keep Switcher running until storage is repaired")
 			}
 			*a = saved.Account
@@ -457,7 +529,7 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 			return nil
 		}
 	}
-	if raw, err := readPrivate(m.successorPath(a.ID)); err != nil {
+	if raw, err := readRecovery(m.successorPath(a.ID)); err != nil {
 		return err
 	} else if raw.Exists {
 		var saved successor
@@ -474,7 +546,7 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 				return err
 			}
 			saved.Account.AutoUseReset = a.AutoUseReset
-			if err := m.store.Save(saved.Account); err != nil {
+			if err := m.saveAccount(saved.Account); err != nil {
 				return errors.New("refreshed Claude token is preserved but could not be saved")
 			}
 			*a = saved.Account
@@ -493,7 +565,10 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 	if err := m.beginRefresh(predecessor, a.ID); err != nil {
 		return err
 	}
-	grantCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	if err := checkLocks(locked); err != nil {
+		return err
+	}
+	grantCtx, cancel := context.WithTimeout(locked, 8*time.Second)
 	defer cancel()
 	if err := grant(grantCtx, a); err != nil {
 		if errors.Is(err, ErrGrantRejected) {
@@ -520,9 +595,10 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 	if saved.RequireIdentity {
 		// Preserve issued bytes before a profile request, then release native
 		// mutation locks while resolving the successor's organization.
-		if err := writePrivate(m.successorPath(a.ID), fileValue{Data: raw, Exists: true}); err != nil {
+		if err := writeRecovery(m.successorPath(a.ID), fileValue{Data: raw, Exists: true}); err != nil {
 			a.ClaudeCodeRefreshPending = true
-			if err := m.store.Save(*a); err != nil {
+			a.ClaudeCodeRefreshRecovery = inactiveRecovery(predecessor)
+			if err := m.saveAccount(*a); err != nil {
 				return errors.New("Claude refresh succeeded; successor retained in memory and consume fence preserved. Keep Switcher running until storage is repaired")
 			}
 		}
@@ -534,16 +610,33 @@ func (m *Manager) refresh(ctx context.Context, a *store.Account, grant Grant) er
 		m.volatileSuccessors[a.ID] = saved
 		raw, _ = json.Marshal(saved)
 	}
-	if err := writePrivate(m.successorPath(a.ID), fileValue{Data: raw, Exists: true}); err != nil {
+	if err := writeRecovery(m.successorPath(a.ID), fileValue{Data: raw, Exists: true}); err != nil {
 		// Preserve the successor in the existing account store if the sidecar
 		// cannot be created, rather than discard a consumed refresh grant.
 		a.ClaudeCodeRefreshPending = true
+		unlock()
 		return m.recoverAccountSuccessor(ctx, a)
 	}
-	if err := m.store.Save(*a); err != nil {
+	if err := m.saveAccount(*a); err != nil {
 		return errors.New("refreshed Claude token was preserved for recovery; account save failed")
 	}
 	return m.clearRefreshRecovery(a.ID)
+}
+
+func (m *Manager) reloadAccountGeneration(a *store.Account) (bool, error) {
+	latest, err := m.store.Get(a.ID)
+	if err != nil {
+		return false, err
+	}
+	if latest.Provider != a.Provider || latest.Token.AccountID != a.Token.AccountID || !strings.EqualFold(latest.Email, a.Email) ||
+		(latest.ClaudeCode != nil && a.ClaudeCode != nil && !sameIdentity(accountIdentity(latest), accountIdentity(*a))) {
+		return false, ErrConflict
+	}
+	if latest.Token.AccessToken == a.Token.AccessToken && latest.Token.RefreshToken == a.Token.RefreshToken {
+		return false, nil
+	}
+	*a = latest
+	return true, nil
 }
 
 func (m *Manager) verifySuccessor(ctx context.Context, saved *successor) error {
@@ -573,6 +666,21 @@ func (m *Manager) verifySuccessor(ctx context.Context, saved *successor) error {
 // cleanup completes so a restart never turns recovery into a second grant.
 func (m *Manager) recoverAccountSuccessor(ctx context.Context, a *store.Account) error {
 	saved := successor{Account: *a, RequireIdentity: a.ClaudeCode == nil}
+	if len(a.ClaudeCodeRefreshRecovery) != 0 {
+		var inactive inactiveRefresh
+		if json.Unmarshal(a.ClaudeCodeRefreshRecovery, &inactive) != nil {
+			return ErrConflict
+		}
+		if !inactive.Inactive {
+			var native nativeRefresh
+			if json.Unmarshal(a.ClaudeCodeRefreshRecovery, &native) != nil {
+				return ErrConflict
+			}
+			saved.Native = &native
+			return m.finishNativeRefresh(ctx, a, saved)
+		}
+		saved.Predecessor = inactive.Predecessor
+	}
 	if retained, ok := m.volatileSuccessors[a.ID]; ok && !retained.RequireIdentity &&
 		retained.Account.ID == a.ID && retained.Account.Token.AccountID == a.Token.AccountID &&
 		strings.EqualFold(retained.Account.Email, a.Email) &&
@@ -585,8 +693,17 @@ func (m *Manager) recoverAccountSuccessor(ctx context.Context, a *store.Account)
 	if err := m.verifySuccessor(ctx, &saved); err != nil {
 		return err
 	}
+	if repaired, err := m.repairInactiveNative(ctx, a, saved); err != nil || repaired {
+		return err
+	}
+	return m.finishAccountSuccessor(a, saved)
+}
+
+func (m *Manager) finishAccountSuccessor(a *store.Account, saved successor) error {
+	saved.Account.AutoUseReset = a.AutoUseReset
 	saved.Account.ClaudeCodeRefreshPending = true
-	if err := m.store.Save(saved.Account); err != nil {
+	saved.Account.ClaudeCodeRefreshRecovery = inactiveRecovery(saved.Predecessor)
+	if err := m.saveAccount(saved.Account); err != nil {
 		return errors.New("Claude refresh successor could not be saved; keep Switcher running until storage is repaired")
 	}
 	*a = saved.Account
@@ -594,7 +711,8 @@ func (m *Manager) recoverAccountSuccessor(ctx context.Context, a *store.Account)
 		return err
 	}
 	saved.Account.ClaudeCodeRefreshPending = false
-	if err := m.store.Save(saved.Account); err != nil {
+	saved.Account.ClaudeCodeRefreshRecovery = nil
+	if err := m.saveAccount(saved.Account); err != nil {
 		return err
 	}
 	*a = saved.Account
@@ -645,7 +763,7 @@ type journal struct {
 
 func (m *Manager) pendingPath() string { return filepath.Join(m.dataRoot, "pending.json") }
 func (m *Manager) checkPending() error {
-	value, err := readPrivate(m.pendingPath())
+	value, err := readRecovery(m.pendingPath())
 	if err != nil {
 		return err
 	}
@@ -686,6 +804,12 @@ func validTransition(current, before, after snapshot) bool {
 }
 
 func (m *Manager) writeSnapshot(ctx context.Context, s snapshot) error {
+	if err := validateSnapshotSize(s); err != nil {
+		return err
+	}
+	if err := checkLocks(ctx); err != nil {
+		return err
+	}
 	if m.paths.Keychain {
 		if s.Keychain.Exists {
 			if err := m.keys.Write(ctx, m.paths.Service, s.Keychain.Data); err != nil {
@@ -695,6 +819,9 @@ func (m *Manager) writeSnapshot(ctx context.Context, s snapshot) error {
 			return err
 		}
 		if m.paths.Service == "Claude Code-credentials" {
+			if err := checkLocks(ctx); err != nil {
+				return err
+			}
 			if s.ManagedKey.Exists {
 				if err := m.keys.Write(ctx, "Claude Code", s.ManagedKey.Data); err != nil {
 					return err
@@ -704,14 +831,14 @@ func (m *Manager) writeSnapshot(ctx context.Context, s snapshot) error {
 			}
 		}
 	}
-	if err := writePrivate(m.paths.CredentialsFile, s.File); err != nil {
+	if err := writeLocked(ctx, m.paths.CredentialsFile, s.File); err != nil {
 		return err
 	}
-	return writePrivate(m.paths.ConfigFile, s.Config)
+	return writeLocked(ctx, m.paths.ConfigFile, s.Config)
 }
 
 func (m *Manager) recover(ctx context.Context) error {
-	value, err := readPrivate(m.pendingPath())
+	value, err := readRecovery(m.pendingPath())
 	if err != nil || !value.Exists {
 		return err
 	}
@@ -750,13 +877,16 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	result := SwitchResult{}
-	unlock, err := m.locks(ctx)
+	locked, unlock, err := m.locks(ctx)
 	if err != nil {
 		return result, err
 	}
-	err = m.recover(ctx)
+	err = m.recover(locked)
 	unlock()
 	if err != nil {
+		return result, err
+	}
+	if err := m.recoverActiveRefreshes(ctx); err != nil {
 		return result, err
 	}
 	initial, err := m.inspect(ctx)
@@ -794,12 +924,12 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 	configured, _ := identityOf(initial.Config.Data)
 	configBefore, _ := object(initial.Config.Data)
 	if owns(owner, target) && sameIdentity(configured, owner) && !initial.ManagedKey.Exists && len(configBefore["primaryApiKey"]) == 0 {
-		unlock, err := m.locks(ctx)
+		locked, unlock, err := m.locks(ctx)
 		if err != nil {
 			return result, err
 		}
 		defer unlock()
-		current, err := m.readSnapshot(ctx)
+		current, err := m.readSnapshot(locked)
 		if err != nil {
 			return result, err
 		}
@@ -813,7 +943,13 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 		if err := applyNative(&target, current.credential(), owner); err != nil {
 			return result, err
 		}
-		if err := m.store.Save(target); err != nil {
+		if err := checkLocks(locked); err != nil {
+			return result, err
+		}
+		if err := m.saveAccount(target); err != nil {
+			return result, err
+		}
+		if err := checkLocks(locked); err != nil {
 			return result, err
 		}
 		if err := commit(""); err != nil {
@@ -824,11 +960,11 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 		return result, nil
 	}
 	if owns(owner, target) {
-		unlock, err := m.locks(ctx)
+		locked, unlock, err := m.locks(ctx)
 		if err != nil {
 			return result, err
 		}
-		current, err := m.readSnapshot(ctx)
+		current, err := m.readSnapshot(locked)
 		if err != nil {
 			unlock()
 			return result, err
@@ -846,7 +982,9 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 			unlock()
 			return result, err
 		}
-		err = m.store.Save(target)
+		if err = checkLocks(locked); err == nil {
+			err = m.saveAccount(target)
+		}
 		unlock()
 		if err != nil {
 			return result, err
@@ -895,12 +1033,15 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 	} else {
 		next.File = fileValue{Data: credential, Exists: true}
 	}
-	unlock, err = m.locks(ctx)
+	if err := validateSnapshotSize(next); err != nil {
+		return result, err
+	}
+	locked, unlock, err = m.locks(ctx)
 	if err != nil {
 		return result, err
 	}
 	defer unlock()
-	current, err := m.readSnapshot(ctx)
+	current, err := m.readSnapshot(locked)
 	if err != nil {
 		return result, err
 	}
@@ -917,7 +1058,10 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 			if err := applyNative(&a, current.credential(), owner); err != nil {
 				return result, err
 			}
-			if err := m.store.Save(a); err != nil {
+			if err := checkLocks(locked); err != nil {
+				return result, err
+			}
+			if err := m.saveAccount(a); err != nil {
 				return result, err
 			}
 			break
@@ -934,34 +1078,40 @@ func (m *Manager) SwitchWithReceipt(ctx context.Context, id string, commit func(
 	result.Backup = backup
 	saved := journal{Version: 1, Paths: m.paths, TargetID: id, Before: initial, After: next, Backup: backup, Receipt: rand.Text()}
 	raw, _ := json.Marshal(saved)
-	if err := writePrivate(filepath.Join(backup, "snapshot.json"), fileValue{Data: raw, Exists: true}); err != nil {
+	if err := writeRecovery(filepath.Join(backup, "snapshot.json"), fileValue{Data: raw, Exists: true}); err != nil {
 		return result, err
 	}
-	if err := writePrivate(m.pendingPath(), fileValue{Data: raw, Exists: true}); err != nil {
+	if err := writeRecovery(m.pendingPath(), fileValue{Data: raw, Exists: true}); err != nil {
 		return result, err
 	}
-	if err := m.writeSnapshot(ctx, next); err != nil {
-		return result, m.rollback(saved, err)
+	if err := m.writeSnapshot(locked, next); err != nil {
+		return result, m.rollback(locked, saved, err)
 	}
-	verified, err := m.readSnapshot(ctx)
+	verified, err := m.readSnapshot(locked)
 	if err != nil || !reflect.DeepEqual(verified, next) {
-		return result, m.rollback(saved, errors.New("native Claude writes did not verify"))
+		return result, m.rollback(locked, saved, errors.New("native Claude writes did not verify"))
 	}
 	// Save account-owned target wrapper separately from live shared state.
 	ownCredential, err := credentialsFor(target, nil)
 	if err != nil {
-		return result, m.rollback(saved, err)
+		return result, m.rollback(locked, saved, err)
 	}
 	target.ClaudeCode = &store.ClaudeCodeLogin{Credentials: ownCredential, OAuthAccount: identityData}
-	if err := m.store.Save(target); err != nil {
-		return result, m.rollback(saved, err)
+	if err := checkLocks(locked); err != nil {
+		return result, err
+	}
+	if err := m.saveAccount(target); err != nil {
+		return result, m.rollback(locked, saved, err)
+	}
+	if err := checkLocks(locked); err != nil {
+		return result, err
 	}
 	if err := commit(saved.Receipt); err != nil {
-		return result, m.rollback(saved, err)
+		return result, m.rollback(locked, saved, err)
 	}
 	saved.Committed = true
 	raw, _ = json.Marshal(saved)
-	if err := writePrivate(m.pendingPath(), fileValue{Data: raw, Exists: true}); err != nil {
+	if err := writeRecovery(m.pendingPath(), fileValue{Data: raw, Exists: true}); err != nil {
 		result.Message = "Claude Code login switched; recovery metadata cleanup is pending"
 	} else {
 		_ = writePrivate(m.pendingPath(), fileValue{})
@@ -989,18 +1139,21 @@ func (m *Manager) retireSuccessor(a store.Account) error {
 	if current.Token.RefreshToken != a.Token.RefreshToken {
 		return ErrConflict
 	}
+	if err := m.verifyRetirementGeneration(a); err != nil {
+		return err
+	}
 	if saved, ok := m.volatileSuccessors[a.ID]; ok {
 		raw, err := json.Marshal(saved)
 		if err != nil {
 			return err
 		}
 		archive := filepath.Join(m.dataRoot, "generations", a.ID+"-retired-volatile-refresh-"+rand.Text()+".json")
-		if err := writePrivate(archive, fileValue{Data: raw, Exists: true}); err != nil {
+		if err := writeRecovery(archive, fileValue{Data: raw, Exists: true}); err != nil {
 			return err
 		}
 	}
 	for _, path := range []string{m.successorPath(a.ID), m.intentPath(a.ID)} {
-		value, err := readPrivate(path)
+		value, err := readRecovery(path)
 		if err != nil {
 			return err
 		}
@@ -1008,7 +1161,7 @@ func (m *Manager) retireSuccessor(a store.Account) error {
 			continue
 		}
 		archive := filepath.Join(m.dataRoot, "generations", a.ID+"-retired-refresh-"+rand.Text()+".json")
-		if err := writePrivate(archive, value); err != nil {
+		if err := writeRecovery(archive, value); err != nil {
 			return err
 		}
 		if err := writePrivate(path, fileValue{}); err != nil {
@@ -1042,7 +1195,7 @@ func (m *Manager) BackupAccount(a store.Account) error {
 		return err
 	}
 	path := filepath.Join(m.dataRoot, "generations", a.ID+"-"+time.Now().Format("20060102-150405")+"-"+rand.Text()+".json")
-	return writePrivate(path, fileValue{Data: raw, Exists: true})
+	return writeRecovery(path, fileValue{Data: raw, Exists: true})
 }
 
 // Keep legacy IDs during metadata backfill without conflating organizations.
@@ -1067,8 +1220,8 @@ func (m *Manager) ExistingID(identity Identity) string {
 	return ""
 }
 
-func (m *Manager) rollback(saved journal, cause error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+func (m *Manager) rollback(locked context.Context, saved journal, cause error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(locked), 20*time.Second)
 	defer cancel()
 	current, err := m.readSnapshot(ctx)
 	if err == nil && reflect.DeepEqual(current, saved.Before) {

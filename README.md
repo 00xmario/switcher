@@ -77,7 +77,10 @@ required; OpenCode Go uses its own API key.
   stale for five minutes, or when a rejected refresh credential needs a
   relogin. Recheck one account without waiting on the page or switching it.
   A quota endpoint that returns HTTP 429 pauses automatic checks for five
-  minutes; Recheck can try sooner. This does not affect request routing.
+  minutes; Recheck can try sooner. A rotated native token clears the previous
+  credential's health and polling backoff. Expired usage windows are hidden
+  individually during an outage; remaining valid windows stay visible.
+  Usage polling failures do not change request routing.
 - **Reset alerts**: opt in under Settings → Menu bar to receive macOS
   notifications at provider-reported usage-window reset times. Switcher
   remembers pending alerts across menu app restarts and catches up within a
@@ -96,7 +99,9 @@ required; OpenCode Go uses its own API key.
   from the macOS keychain, or the native credentials file on Linux. The full
   account-scoped wrapper and identity are preserved. Switcher synchronizes
   the current native generation instead of independently refreshing a copy
-  of the active Claude Code login.
+  of the active Claude Code login. If that native generation expires while
+  Code is idle, Switcher refreshes the locked live credential, saves the
+  successor back to the native stores, then fetches current usage.
 - **Native Claude Code switching**: Claude account actions in the web and
   menu bar apps write Code's native credential store and `oauthAccount`
   config section, then select the same Switcher proxy account. Shared MCP
@@ -111,6 +116,40 @@ required; OpenCode Go uses its own API key.
   connection. Same-store `CLAUDE_CONFIG_DIR` profiles are supported; split secure
   storage and credential-overriding environment variables block the operation
   with an explanation. See [the source analysis and comparison](docs/claude-swap-analysis.md).
+- **Claude Desktop task relay, fixture-tested preview**: Settings includes an
+  opt-in authenticated loopback relay for future local Desktop Code tasks.
+  Click **Configure Claude Desktop** to start the relay, create its profile,
+  back up the current settings, and merge the proxy and process-local CA fields.
+  Restart Desktop explicitly when current work is finished, then choose an
+  account for an observed task. **Remove Desktop setup** restores the previous
+  connection fields while retaining other settings. The selection
+  applies to subsequent requests; an already admitted stream keeps its account.
+  Peer tasks and unbound requests keep their caller credentials. Messages,
+  tool results, signed thinking, unknown fields, and SSE are forwarded in the
+  native Anthropic protocol without model or body translation. Selected
+  server-thread requests require a full-history retry before forwarding.
+  Configure preserves unrelated Claude settings and never restarts Desktop
+  automatically. The separate restart button asks for confirmation. No system
+  trust root is installed. Advanced controls retain manual profile setup.
+  The default relay port is `8789`, configurable with `--desktop-relay-port`.
+  Real Desktop traffic has been observed through the relay; complete
+  target-account billing and task continuity remain unverified. See
+  [setup and validation](docs/desktop-relay-usage.md), the
+  [module contract](docs/desktop-relay-module.md), and the
+  [five-project source comparison](docs/desktop-reference-map.md).
+  The conversation list shows saved chat titles and project names when an
+  exact session match is available. Requests in progress appear first; idle
+  sessions are collapsed under **Recent conversations** with last-request
+  times. **Default: Claude sign-in** keeps the conversation's original
+  credentials. An account override is optional and applies only to that
+  conversation. Title lookup reads saved metadata, not message transcripts.
+  Verified Desktop conversation identities group related internal request
+  sessions, so an explicit whole-conversation selection follows later verified
+  aliases. A legacy single-ID override is marked **Partially applied** until
+  it is applied to the conversation. **Last upstream response** reports the
+  credential route, model, HTTP status, and response time separately from the
+  selected account. Desktop's sign-in and usage display remain on the original
+  account; a chat answer about quota is not billing evidence.
 - **Claude Desktop session sync**: the small two-arrow sync icon after the Claude name in the
   menu bar and web app makes new Claude Code chats discoverable across your
   Desktop account indexes. Clicking it first asks for confirmation, with
@@ -151,6 +190,8 @@ required; OpenCode Go uses its own API key.
   Manual requests are tied to the displayed credit ID, so a delayed response
   or repeated click cannot silently spend the next credit. Quota refreshes
   are bounded, and late responses cannot overwrite a newer balance.
+  Expired access tokens are refreshed before credit operations, with at most
+  one authentication retry and the original credit ID kept throughout.
 - **Account actions**: Recheck and account switching stay on the account card.
   Use the ⋯ menu for a banked reset, relogin, or removal.
 - **Compact account view**: a single switch under Settings → Display puts
@@ -172,7 +213,11 @@ required; OpenCode Go uses its own API key.
   shows every account's quota from one place.
 - **Menu bar app**: the macOS app supervises the server, shows every
   account's usage and plan, switches, refreshes, and updates itself. The
-  Copilot mark follows the menu's light or dark appearance.
+  Copilot mark follows the menu's light or dark appearance. It retries an
+  unexpectedly exited server that it started at most three times; an existing
+  external server is never adopted or terminated. **Check for updates** fetches
+  release metadata only. Installation is a separate explicit action that
+  verifies the asset checksum and version before atomic replacement.
 - **CLI setup status**: Settings checks the inspected Codex user config for
   Switcher's URL and lists stored Switcher accounts separately from native
   CLI configuration. Configure Codex can update that file; no native CLI
@@ -298,9 +343,10 @@ readiness to decide on a release; it does not publish one by itself.
 | Active proxy account returns 429 `usage_limit_reached` | mark it exhausted until the upstream reset time; select another usable proxy account and retry the request transparently; native Claude Code selection stays as it was |
 | Every account is out of usage | no rotation; the upstream error is passed through |
 | A 429 that is *not* a usage-limit error (e.g. burst limit) | passed through, nothing marked, no switch |
-| Stored token expired | refresh before use, except that native-owned Claude tokens are synchronized from Code |
-| Claude Code's current native token is still expired | defer to Code's refresh; do not consume a competing saved copy or mark the account dead |
+| Stored token expired | refresh before use; native Claude tokens are first synchronized with the live store |
+| Claude Code's current native token is still expired | refresh that verified live generation under Claude's locks, save the successor to native storage and Switcher, then fetch usage; never consume an independent backup copy |
 | Provider rejects a refresh credential and requires re-login | park the proxy account for an hour and try another account |
+| Refresh fails transiently | preserve the selected account and report the failure; do not switch identities |
 | Claude refresh outcome is uncertain | retain its consumption intent; require successor recovery or a new login before another grant |
 
 ## Security model
@@ -316,12 +362,18 @@ readiness to decide on a release; it does not publish one by itself.
   without a browser. When enabled, unauthenticated browsers receive only a
   standalone login page; the Accounts page, its assets, and dashboard APIs
   require a valid session. Logout and expired sessions return to that page.
+  Password rotation invalidates prior credential-generation sessions. Sessions
+  saved by older builds require a fresh login after upgrading. Settings read
+  or parse errors fail closed, and logout reports a failed durable revocation
+  rather than acknowledging success before it is saved.
 - **LAN exposure, opt-in and TLS-only.** Once a password is set, a
   second listener can bind the LAN IP; it is always TLS (self-signed
   ECDSA certificate, regenerated automatically when your IP changes) and
   the local listener stays plain HTTP so the CLIs need no changes. Know
   the edges: the CLI proxy paths and the management-key hub stay reachable
   on the LAN, so only enable this on networks you trust.
+  Disabling authentication or invalidating LAN prerequisites denies dashboard
+  access immediately, including while a restart is pending or fails.
 - Hardened headers everywhere: CSP (no inline script, form-action self),
   nosniff, no-referrer. State-changing requests from a non-loopback socket
   are refused for credential routes.
@@ -341,6 +393,7 @@ internal/store/          account + state persistence (atomic JSON writes)
 internal/provider/       provider contract
 internal/provider/codex/ Codex OAuth + upstream details
 internal/claudecode/      native Claude Code stores, ownership, locks, and recovery
+internal/desktoprelay/    opt-in Desktop CONNECT/TLS relay and per-task selection
 internal/login/          browser login orchestration
 internal/proxy/          request forwarding + the switching rules
 internal/codexcfg/       codex config.toml installer (idempotent)
@@ -352,6 +405,10 @@ web/                     dependency-free frontend (served from the binary)
 ```
 
 ## Development
+
+See the [documentation index](docs/README.md) for Desktop routing contracts,
+verification limits, and the five pinned reference repositories retained for
+future implementation work.
 
 ```sh
 make dev      # run with the frontend served from web/ (SWITCHER_DEV=1)

@@ -33,7 +33,10 @@ const (
 )
 
 // Provider implements provider.Provider for Grok.
-type Provider struct{}
+type Provider struct {
+	// wait is an internal timer seam for device-flow regressions.
+	wait func(context.Context, time.Duration) error
+}
 
 // New returns a ready-to-register Grok provider.
 func New() *Provider { return &Provider{} }
@@ -84,6 +87,11 @@ func (p *Provider) DeviceStart(ctx context.Context) (provider.LoginInfo, func(ct
 	if device.DeviceCode == "" || device.VerificationURI == "" {
 		return provider.LoginInfo{}, nil, errors.New("device code response incomplete")
 	}
+	ttl := 30 * time.Minute
+	if device.ExpiresIn > 0 && device.ExpiresIn < int64(ttl/time.Second) {
+		ttl = time.Duration(device.ExpiresIn) * time.Second
+	}
+	deadline := time.Now().Add(ttl)
 
 	state := device.DeviceCode // opaque handle for login polling
 	info := provider.LoginInfo{
@@ -93,7 +101,7 @@ func (p *Provider) DeviceStart(ctx context.Context) (provider.LoginInfo, func(ct
 		State:           state,
 	}
 	poll := func(ctx context.Context) (store.Account, error) {
-		return p.pollForToken(ctx, discovery.TokenEndpoint, device.DeviceCode, device.Interval)
+		return p.pollForToken(ctx, discovery.TokenEndpoint, device.DeviceCode, device.Interval, deadline)
 	}
 	return info, poll, nil
 }
@@ -102,18 +110,24 @@ func (p *Provider) DeviceStart(ctx context.Context) (provider.LoginInfo, func(ct
 // user authorizes, the code expires, or the context ends. While waiting,
 // xAI answers with HTTP 400 carrying error "authorization_pending": that
 // is the protocol working, not a failure.
-func (p *Provider) pollForToken(ctx context.Context, tokenEndpoint, deviceCode string, interval int64) (store.Account, error) {
-	intervalDur := time.Duration(interval) * time.Second
-	if intervalDur < 5*time.Second {
-		intervalDur = 5 * time.Second
+func (p *Provider) pollForToken(ctx context.Context, tokenEndpoint, deviceCode string, interval int64, deadline time.Time) (store.Account, error) {
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	intervalDur := time.Duration(min(max(interval, 5), 30*60)) * time.Second
+	wait := p.wait
+	if wait == nil {
+		wait = waitForPoll
 	}
-	deadline := time.Now().Add(30 * time.Minute)
 
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
+	for {
+		if err := ctx.Err(); err != nil {
+			return store.Account{}, err
+		}
+		if err := wait(ctx, intervalDur); err != nil {
+			return store.Account{}, err
+		}
+		if ctx.Err() != nil {
 			return store.Account{}, ctx.Err()
-		case <-time.After(intervalDur):
 		}
 
 		form := url.Values{
@@ -137,22 +151,34 @@ func (p *Provider) pollForToken(ctx context.Context, tokenEndpoint, deviceCode s
 			return store.Account{}, fmt.Errorf("device token response: %w", err)
 		}
 		switch {
-		case payload.AccessToken != "":
+		case status == http.StatusOK && payload.AccessToken != "":
 			return accountFromToken(oauthToken{
 				AccessToken:  payload.AccessToken,
 				RefreshToken: payload.RefreshToken,
 				IDToken:      payload.IDToken,
 				ExpiresIn:    payload.ExpiresIn,
 			})
-		case payload.Error == "authorization_pending" || payload.Error == "slow_down":
+		case payload.Error == "authorization_pending":
 			continue // keep polling
+		case payload.Error == "slow_down":
+			intervalDur += 5 * time.Second
 		case payload.Error != "":
 			return store.Account{}, fmt.Errorf("device flow failed: %s", payload.Error)
 		default:
 			return store.Account{}, fmt.Errorf("device token poll: unexpected http %d", status)
 		}
 	}
-	return store.Account{}, errors.New("device flow timed out")
+}
+
+func waitForPoll(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
 }
 
 // postFormLenient posts a form and returns the body for ANY status: the
@@ -169,9 +195,12 @@ func postFormLenient(ctx context.Context, target string, form url.Values) (int, 
 		return 0, nil, fmt.Errorf("grok token request: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return resp.StatusCode, nil, fmt.Errorf("grok token response: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return resp.StatusCode, nil, errors.New("grok token response body too large")
 	}
 	return resp.StatusCode, raw, nil
 }
@@ -246,6 +275,7 @@ func (p *Provider) UpstreamURL(path string) string {
 // ApplyAuth sets the headers the Grok chat proxy expects.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
 	req.Header.Del("X-Api-Key")
+	req.Header.Del("X-Goog-Api-Key")
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
 	req.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
 	return nil
@@ -265,22 +295,25 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		upstreamBase+"/billing?format=credits", nil)
 	if err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: build request: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: build request: %w", provider.ErrUsageUnavailable, err)
 	}
 	if err := p.ApplyAuth(req, a); err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: auth: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: auth: %w", provider.ErrUsageUnavailable, err)
 	}
 	resp, err := provider.OAuthHTTPClient.Do(req)
 	if err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return provider.Usage{}, provider.UsageStatusError(resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
-		return provider.Usage{}, fmt.Errorf("%w: read body: %v", provider.ErrUsageUnavailable, err)
+		return provider.Usage{}, fmt.Errorf("%w: read body: %w", provider.ErrUsageUnavailable, err)
+	}
+	if len(raw) > 1<<20 {
+		return provider.Usage{}, fmt.Errorf("%w: response body too large", provider.ErrUsageUnavailable)
 	}
 
 	var parsed struct {
@@ -344,9 +377,12 @@ func discover(ctx context.Context) (*struct {
 		return nil, fmt.Errorf("grok discovery: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return nil, fmt.Errorf("grok discovery: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return nil, errors.New("grok discovery: response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("grok discovery failed: http %d", resp.StatusCode)
@@ -376,9 +412,12 @@ func postForm(ctx context.Context, target string, form url.Values) ([]byte, erro
 		return nil, fmt.Errorf("grok token request: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return nil, fmt.Errorf("grok token response: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return nil, errors.New("grok token response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("grok token request failed: http %d", resp.StatusCode)

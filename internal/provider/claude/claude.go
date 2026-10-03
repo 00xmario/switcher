@@ -171,6 +171,31 @@ func (p *Provider) Refresh(ctx context.Context, a *store.Account) error {
 	return p.refreshGrant(ctx, a)
 }
 
+// RefreshAfter401 is optional to proxy callers. It preserves the rejected
+// generation across native reconciliation so an unexpired 401 is refreshed,
+// while another client's already-issued successor never consumes twice.
+func (p *Provider) RefreshAfter401(ctx context.Context, a *store.Account, rejectedAccessToken string) error {
+	if p.nativeError != nil {
+		return fmt.Errorf("%w: %v", provider.ErrNativeCredentialBusy, p.nativeError)
+	}
+	if rejectedAccessToken == "" {
+		return provider.ErrNativeCredentialBusy
+	}
+	if p.Native != nil {
+		if err := p.Native.RefreshAfter401(ctx, a, rejectedAccessToken, p.refreshGrant); err != nil {
+			if errors.Is(err, provider.ErrReloginRequired) {
+				return err
+			}
+			return fmt.Errorf("%w: %v", provider.ErrNativeCredentialBusy, err)
+		}
+		return nil
+	}
+	if a.Token.AccessToken != rejectedAccessToken {
+		return nil
+	}
+	return p.refreshGrant(ctx, a)
+}
+
 func (p *Provider) refreshGrant(ctx context.Context, a *store.Account) error {
 	if a.Token.RefreshToken == "" {
 		return fmt.Errorf("claude refresh: missing refresh token: %w", provider.ErrReloginRequired)
@@ -392,29 +417,67 @@ func parseTimeOrZero(s *string) int64 {
 	return 0
 }
 
-// ParseRateLimit implements provider.Provider. Claude reports subscription
-// exhaustion as a 429 on /v1/messages; the reset time comes from the usage
-// endpoint, falling back to a one hour park.
+// ParseRateLimit distinguishes subscription exhaustion from burst throttling.
+// An unavailable usage endpoint alone is not evidence against the account.
 func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
 	if status != http.StatusTooManyRequests {
 		return time.Time{}, false
 	}
+	exhausted := explicitSubscriptionExhaustion(body)
 	usage, err := p.Usage(ctx, a)
 	if err != nil {
-		return time.Now().Add(time.Hour), true
+		if exhausted {
+			return time.Now().Add(time.Hour), true
+		}
+		return time.Time{}, false
 	}
 	var latest time.Time
+	now := time.Now()
 	for _, w := range usage.Windows {
-		if w.UsedPercent >= 100 && w.ResetsAt > 0 {
-			if t := time.Unix(w.ResetsAt, 0); t.After(latest) {
+		// No request model reaches this interface. Scoped model quota cannot
+		// establish account-wide exhaustion or its reset time.
+		if w.Label != "Session" && w.Label != "Weekly" {
+			continue
+		}
+		if w.UsedPercent < 100 {
+			continue
+		}
+		if w.ResetsAt == 0 {
+			exhausted = true
+			continue
+		}
+		if t := time.Unix(w.ResetsAt, 0); t.After(now) {
+			exhausted = true
+			if t.After(latest) {
 				latest = t
 			}
 		}
+	}
+	if !exhausted {
+		return time.Time{}, false
 	}
 	if latest.IsZero() {
 		return time.Now().Add(time.Hour), true
 	}
 	return latest, true
+}
+
+func explicitSubscriptionExhaustion(body []byte) bool {
+	var payload struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if len(body) > 8<<10 || json.Unmarshal(body, &payload) != nil {
+		return false
+	}
+	var code string
+	if json.Unmarshal(payload.Error, &code) == nil {
+		return code == "usage_limit_reached"
+	}
+	var detail struct {
+		Type string `json:"type"`
+		Code string `json:"code"`
+	}
+	return json.Unmarshal(payload.Error, &detail) == nil && (detail.Type == "usage_limit_reached" || detail.Code == "usage_limit_reached")
 }
 
 // oauthToken mirrors the token endpoint response, which embeds the account

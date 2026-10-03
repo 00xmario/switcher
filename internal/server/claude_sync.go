@@ -10,6 +10,13 @@ func (a *API) handleClaudeSync(w http.ResponseWriter, r *http.Request) {
 	if !loopbackOnly(w, r) {
 		return
 	}
+	// Sync and relay restart both quit and reopen the same app. Keep their
+	// machine-level operations from interleaving within this server.
+	if !desktopAppOperation.TryLock() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Claude Desktop operation already running"})
+		return
+	}
+	defer desktopAppOperation.Unlock()
 	accounts, err := a.Store.List()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not read account names"})

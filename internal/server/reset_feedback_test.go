@@ -57,7 +57,7 @@ func (p *feedbackProvider) Usage(ctx context.Context, a store.Account) (provider
 
 func TestResetRepliesBeforeQuotaFetchAndRemovesCreditImmediately(t *testing.T) {
 	st := store.New(t.TempDir())
-	account := store.Account{ID: "fake-a", Provider: "fake", Email: "fixture@example.test"}
+	account := store.Account{ID: "fake-a", Provider: "fake", Email: "fixture@example.test", Token: store.Token{AccessToken: "fixture-reset-access"}}
 	if err := st.Save(account); err != nil {
 		t.Fatal(err)
 	}

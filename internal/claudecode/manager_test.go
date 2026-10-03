@@ -22,6 +22,7 @@ type memoryKeychain struct {
 	reads, writes, deletes int
 	readErr                error
 	failDelete             string
+	writeErr               error
 }
 
 func (k *memoryKeychain) Read(ctx context.Context, key string) ([]byte, bool, error) {
@@ -35,6 +36,9 @@ func (k *memoryKeychain) Write(ctx context.Context, key string, value []byte) er
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.writes++
+	if k.writeErr != nil {
+		return k.writeErr
+	}
 	k.values[key] = append([]byte(nil), value...)
 	return nil
 }
@@ -302,21 +306,264 @@ func TestNativeKeychainReadErrorNeverConsumesFileFallback(t *testing.T) {
 	}
 }
 
-func TestOwnedExpiredCredentialIsNeverRefreshedBySwitcher(t *testing.T) {
-	h := newHarness(t, false)
-	live, _ := object(rawCredential("a"))
-	oauth, _ := object(live["claudeAiOauth"])
-	oauth["expiresAt"] = encoded(int64(1000))
-	live["claudeAiOauth"] = encoded(oauth)
-	if err := writePrivate(h.paths.CredentialsFile, fileValue{Data: encoded(live), Exists: true}); err != nil {
+func expireNativeFixture(t *testing.T, h *harness) {
+	t.Helper()
+	live, err := h.manager.inspect(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	a, _ := h.accounts.Get("claude-a")
-	if err := h.manager.Refresh(context.Background(), &a, h.manager.grant); !errors.Is(err, ErrNativeOwned) {
-		t.Fatalf("owned refresh: %v", err)
+	credential, _ := object(live.credential())
+	oauth, _ := object(credential["claudeAiOauth"])
+	oauth["expiresAt"] = encoded(int64(1000))
+	credential["claudeAiOauth"] = encoded(oauth)
+	raw := encoded(credential)
+	if err := writePrivate(h.paths.CredentialsFile, fileValue{Data: raw, Exists: true}); err != nil {
+		t.Fatal(err)
 	}
-	if h.grants != 0 {
-		t.Fatal("Switcher competed with native Claude Code for the refresh grant")
+	if h.paths.Keychain {
+		h.keys.values[h.paths.Service] = raw
+	}
+}
+
+func TestOwnedExpiredCredentialRefreshesLiveGenerationUnderNativeLocks(t *testing.T) {
+	for _, keychain := range []bool{false, true} {
+		t.Run(intText(map[bool]int{false: 0, true: 1}[keychain]), func(t *testing.T) {
+			h := newHarness(t, keychain)
+			expireNativeFixture(t, h)
+			before, _ := h.manager.inspect(context.Background())
+			a, _ := h.accounts.Get("claude-a")
+			a.Token.RefreshToken = "rt-stale-backup"
+			grant := h.manager.grant
+			if err := h.manager.Refresh(context.Background(), &a, func(ctx context.Context, a *store.Account) error {
+				if a.Token.RefreshToken != "rt-a" {
+					t.Fatal("native refresh used the stale stored copy")
+				}
+				for _, path := range []string{filepath.Join(h.paths.ConfigHome, ".oauth_refresh.lock"), h.paths.ConfigHome + ".lock", h.paths.ConfigFile + ".lock"} {
+					if info, err := os.Stat(path); err != nil || !info.IsDir() {
+						t.Fatal("native locks were not held across the grant")
+					}
+				}
+				return grant(ctx, a)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			after, _ := h.manager.inspect(context.Background())
+			oauth, _ := parseOAuth(after.credential())
+			if oauth.RefreshToken != "rt-successor" || h.grants != 1 || !bytes.Equal(before.Config.Data, after.Config.Data) {
+				t.Fatal("native refresh did not advance credentials without changing config")
+			}
+			oldFields, _ := object(before.credential())
+			newFields, _ := object(after.credential())
+			for _, field := range sharedKeys {
+				if !bytes.Equal(oldFields[field], newFields[field]) {
+					t.Fatal("native refresh lost shared credential state")
+				}
+			}
+			if err := h.manager.Refresh(context.Background(), &a, h.manager.grant); err != nil || h.grants != 1 {
+				t.Fatal("fresh locked native generation was refreshed twice")
+			}
+		})
+	}
+}
+
+func TestNativeRefreshWriteFailureRecoversAfterRestartWithoutRepost(t *testing.T) {
+	h := newHarness(t, true)
+	expireNativeFixture(t, h)
+	a, _ := h.accounts.Get("claude-a")
+	h.keys.writeErr = errors.New("fixture Keychain write failed")
+	if err := h.manager.Refresh(context.Background(), &a, h.manager.grant); err == nil {
+		t.Fatal("native write failure hidden")
+	}
+	if h.grants != 1 {
+		t.Fatal("fixture grant not consumed")
+	}
+	h.keys.writeErr = nil
+	restarted := New(h.paths, filepath.Dir(h.manager.dataRoot), h.accounts, h.keys, h.manager.profile, h.manager.grant)
+	a, _ = h.accounts.Get(a.ID)
+	if _, err := restarted.Synchronize(context.Background(), &a); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := restarted.inspect(context.Background())
+	oauth, _ := parseOAuth(current.credential())
+	if h.grants != 1 || oauth.RefreshToken != "rt-successor" || a.Token.RefreshToken != oauth.RefreshToken {
+		t.Fatal("restart recovery reposted or lost the native successor")
+	}
+}
+
+func TestNativeRefreshDoesNotOverwriteForeignUpdateDuringGrant(t *testing.T) {
+	h := newHarness(t, false)
+	expireNativeFixture(t, h)
+	a, _ := h.accounts.Get("claude-a")
+	grant := h.manager.grant
+	if err := h.manager.Refresh(context.Background(), &a, func(ctx context.Context, a *store.Account) error {
+		if err := grant(ctx, a); err != nil {
+			return err
+		}
+		return writePrivate(h.paths.CredentialsFile, fileValue{Data: rawCredential("b"), Exists: true})
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("foreign update during grant: %v", err)
+	}
+	current, _ := h.manager.inspect(context.Background())
+	oauth, _ := parseOAuth(current.credential())
+	if oauth.RefreshToken != "rt-b" || h.grants != 1 || h.manager.volatileSuccessors[a.ID].Account.Token.RefreshToken != "rt-successor" {
+		t.Fatal("foreign update or issued successor was lost")
+	}
+}
+
+func TestNativeRefreshFallbackPreservesNativeRepairAcrossRestart(t *testing.T) {
+	h := newHarness(t, true)
+	expireNativeFixture(t, h)
+	a, _ := h.accounts.Get("claude-a")
+	grant := h.manager.grant
+	blocked := filepath.Join(h.manager.dataRoot, "successors")
+	h.keys.writeErr = errors.New("fixture native write unavailable")
+	if err := h.manager.Refresh(context.Background(), &a, func(ctx context.Context, a *store.Account) error {
+		if err := grant(ctx, a); err != nil {
+			return err
+		}
+		return os.WriteFile(blocked, []byte("fixture sidecar unavailable"), 0600)
+	}); err == nil {
+		t.Fatal("pending native repair hidden")
+	}
+	a, _ = h.accounts.Get(a.ID)
+	if !a.ClaudeCodeRefreshPending || len(a.ClaudeCodeRefreshRecovery) == 0 || a.Token.RefreshToken != "rt-successor" {
+		t.Fatal("durable account fallback lost native repair metadata")
+	}
+	if err := os.Remove(blocked); err != nil {
+		t.Fatal(err)
+	}
+	h.keys.writeErr = nil
+	restarted := New(h.paths, filepath.Dir(h.manager.dataRoot), h.accounts, h.keys, h.manager.profile, h.manager.grant)
+	if _, err := restarted.Synchronize(context.Background(), &a); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := restarted.inspect(context.Background())
+	oauth, _ := parseOAuth(current.credential())
+	if h.grants != 1 || oauth.RefreshToken != "rt-successor" || a.ClaudeCodeRefreshPending || len(a.ClaudeCodeRefreshRecovery) != 0 {
+		t.Fatal("native fallback did not finalize without another grant")
+	}
+}
+
+func TestCaptureRepairsPendingNativeRefreshBeforeRetiringRecovery(t *testing.T) {
+	h := newHarness(t, true)
+	expireNativeFixture(t, h)
+	a, _ := h.accounts.Get("claude-a")
+	h.keys.writeErr = errors.New("fixture native write failed")
+	if err := h.manager.Refresh(context.Background(), &a, h.manager.grant); err == nil {
+		t.Fatal("fixture did not retain successor")
+	}
+	if _, err := h.manager.CaptureAndStore(context.Background(), func(a *store.Account) error { return h.accounts.Save(*a) }); err == nil {
+		t.Fatal("import accepted a consumed native predecessor")
+	}
+	if len(h.manager.volatileSuccessors) != 1 {
+		t.Fatal("failed import retired issued bytes")
+	}
+	h.keys.writeErr = nil
+	imported, err := h.manager.CaptureAndStore(context.Background(), func(a *store.Account) error { return h.accounts.Save(*a) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.Token.RefreshToken != "rt-successor" || h.grants != 1 {
+		t.Fatal("import replaced or reposted the issued native generation")
+	}
+}
+
+func TestSwitchAwayRepairsOutgoingNativeRefreshFirst(t *testing.T) {
+	h := newHarness(t, true)
+	expireNativeFixture(t, h)
+	a, _ := h.accounts.Get("claude-a")
+	h.keys.writeErr = errors.New("fixture native write failed")
+	if err := h.manager.Refresh(context.Background(), &a, h.manager.grant); err == nil {
+		t.Fatal("fixture did not retain native recovery")
+	}
+	h.keys.writeErr = nil
+	if _, err := h.manager.Switch(context.Background(), "claude-b", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := h.accounts.Get(a.ID)
+	current, _ := h.manager.inspect(context.Background())
+	oauth, _ := parseOAuth(current.credential())
+	if stored.Token.RefreshToken != "rt-successor" || oauth.RefreshToken != "rt-b" || h.grants != 1 {
+		t.Fatal("switch away stranded or replaced outgoing native successor")
+	}
+}
+
+type boundedMemoryKeychain struct{ *memoryKeychain }
+
+func (k boundedMemoryKeychain) Validate(service string, value []byte) error {
+	return (SystemKeychain{}).Validate(service, value)
+}
+
+func TestNativeRefreshPreflightsDeterministicallyUnwritableKeychainPayload(t *testing.T) {
+	h := newHarness(t, true)
+	expireNativeFixture(t, h)
+	fields, _ := object(h.keys.values[h.paths.Service])
+	fields["mcpOAuth"] = encoded(strings.Repeat("fixture-large-shared-field", 200))
+	h.keys.values[h.paths.Service] = encoded(fields)
+	h.manager.keys = boundedMemoryKeychain{h.keys}
+	a, _ := h.accounts.Get("claude-a")
+	if err := h.manager.Refresh(context.Background(), &a, h.manager.grant); err == nil {
+		t.Fatal("guaranteed native writer failure was not preflighted")
+	}
+	if h.grants != 0 || h.keys.writes != 0 {
+		t.Fatal("unwritable wrapper consumed the native grant")
+	}
+}
+
+func TestNativeRefreshRecoveryPreservesUnrelatedConfigChanges(t *testing.T) {
+	h := newHarness(t, true)
+	expireNativeFixture(t, h)
+	before, _ := h.manager.inspect(context.Background())
+	a, _ := h.accounts.Get("claude-a")
+	if err := h.manager.Refresh(context.Background(), &a, h.manager.grant); err != nil {
+		t.Fatal(err)
+	}
+	// Represent interruption after the successor was saved but before cleanup.
+	saved := successor{Account: a, Predecessor: "rt-a", Native: &nativeRefresh{Paths: h.paths, Before: before}}
+	if err := writePrivate(h.manager.successorPath(a.ID), fileValue{Data: encoded(saved), Exists: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.manager.beginRefresh("rt-a", a.ID); err != nil {
+		t.Fatal(err)
+	}
+	config, _ := object(before.Config.Data)
+	config["projects"] = encoded(map[string]any{"new-project": map[string]any{"trusted": true}})
+	updated := encoded(config)
+	if err := writePrivate(h.paths.ConfigFile, fileValue{Data: updated, Exists: true}); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(h.paths, filepath.Dir(h.manager.dataRoot), h.accounts, h.keys, h.manager.profile, h.manager.grant)
+	if _, err := restarted.Synchronize(context.Background(), &a); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := restarted.inspect(context.Background())
+	if !bytes.Equal(current.Config.Data, updated) || h.grants != 1 {
+		t.Fatal("config update was reverted or triggered another grant")
+	}
+}
+
+func TestAmbiguousNativeGrantImportCannotClearConsumeFence(t *testing.T) {
+	h := newHarness(t, false)
+	expireNativeFixture(t, h)
+	a, _ := h.accounts.Get("claude-a")
+	posts := 0
+	grant := func(context.Context, *store.Account) error {
+		posts++
+		return errors.New("fixture lost refresh response")
+	}
+	if err := h.manager.Refresh(context.Background(), &a, grant); err == nil {
+		t.Fatal("ambiguous grant was accepted")
+	}
+	if _, err := h.manager.CaptureAndStore(context.Background(), func(a *store.Account) error { return h.accounts.Save(*a) }); err == nil {
+		t.Fatal("unchanged-native import retired an uncertain consume fence")
+	}
+	intent, err := readPrivate(h.manager.intentPath(a.ID))
+	if err != nil || !intent.Exists {
+		t.Fatal("import removed the uncertain consumption intent")
+	}
+	a, _ = h.accounts.Get(a.ID)
+	if err := h.manager.Refresh(context.Background(), &a, grant); err == nil || posts != 1 {
+		t.Fatal("import allowed the possibly consumed predecessor to be posted again")
 	}
 }
 

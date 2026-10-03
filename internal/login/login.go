@@ -42,6 +42,8 @@ var ErrUnknown = errors.New("unknown or expired login attempt")
 type pending struct {
 	provider      provider.Provider
 	reloginTarget string
+	kind          string
+	completing    bool
 	done          chan struct{}
 	started       time.Time
 }
@@ -79,7 +81,7 @@ func (m *Manager) Start(ctx context.Context, prov provider.Provider, reloginTarg
 	if err != nil {
 		return Handle{}, fmt.Errorf("start login: %w", err)
 	}
-	m.track(info.State, prov, reloginTarget)
+	m.track(info.State, prov, reloginTarget, "browser")
 	return Handle{State: info.State, URL: info.URL, Kind: info.Kind}, nil
 }
 
@@ -91,7 +93,7 @@ func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider, relog
 	if err != nil {
 		return Handle{}, fmt.Errorf("start device login: %w", err)
 	}
-	p := m.track(info.State, prov, reloginTarget)
+	p := m.track(info.State, prov, reloginTarget, "device")
 	go func() {
 		account, err := poll(ctx)
 		if err == nil && m.persist != nil {
@@ -106,8 +108,8 @@ func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider, relog
 		m.gcResultsLocked()
 		m.results[info.State] = result{account: account, err: err, at: time.Now()}
 		delete(m.pending, info.State)
-		m.mu.Unlock()
 		close(p.done)
+		m.mu.Unlock()
 	}()
 	return Handle{State: info.State, Kind: info.Kind, VerificationURL: info.VerificationURL, UserCode: info.UserCode}, nil
 }
@@ -117,28 +119,18 @@ func (m *Manager) StartDevice(ctx context.Context, prov provider.Provider, relog
 // so completion never depends on anyone polling.
 func (m *Manager) Complete(ctx context.Context, state, code string) error {
 	m.mu.Lock()
-	p, ok := m.pending[state]
-	delete(m.pending, state)
-	m.mu.Unlock()
-	if !ok {
-		// The callback can arrive without a usable state (OpenAI omits it,
-		// Anthropic puts it in a fragment): a single in-flight login is the
-		// one being completed.
-		if state == "" {
-			state = m.SinglePending()
-		}
-		if state == "" {
-			log.Printf("login: callback rejected, %d pending, none resolvable", len(m.pendingStates()))
-			return ErrUnknown
-		}
-		m.mu.Lock()
-		p, ok = m.pending[state]
-		delete(m.pending, state)
-		m.mu.Unlock()
-		if !ok {
-			return ErrUnknown
-		}
+	m.gcLocked()
+	if state == "" {
+		state = m.singlePendingLocked()
 	}
+	p, ok := m.pending[state]
+	if !ok || p.kind != "browser" || p.completing {
+		m.mu.Unlock()
+		return ErrUnknown
+	}
+	// Claim the callback once, but leave the attempt pollable during exchange.
+	p.completing = true
+	m.mu.Unlock()
 	log.Printf("login: completing flow for %s (state %.8s...)", p.provider.ID(), state)
 
 	account, err := p.provider.LoginExchange(ctx, state, code)
@@ -156,8 +148,9 @@ func (m *Manager) Complete(ctx context.Context, state, code string) error {
 	m.mu.Lock()
 	m.gcResultsLocked()
 	m.results[state] = result{account: account, err: err, at: time.Now()}
-	m.mu.Unlock()
+	delete(m.pending, state)
 	close(p.done)
+	m.mu.Unlock()
 	return err
 }
 
@@ -191,10 +184,10 @@ func (m *Manager) Outcome(state string, wait time.Duration) (account store.Accou
 }
 
 // track records a new pending flow.
-func (m *Manager) track(state string, prov provider.Provider, reloginTarget string) *pending {
+func (m *Manager) track(state string, prov provider.Provider, reloginTarget, kind string) *pending {
 	m.mu.Lock()
 	m.gcLocked()
-	p := &pending{provider: prov, reloginTarget: reloginTarget, done: make(chan struct{}), started: time.Now()}
+	p := &pending{provider: prov, reloginTarget: reloginTarget, kind: kind, completing: kind == "device", done: make(chan struct{}), started: time.Now()}
 	m.pending[state] = p
 	m.mu.Unlock()
 	return p
@@ -207,12 +200,21 @@ func (m *Manager) track(state string, prov provider.Provider, reloginTarget stri
 func (m *Manager) SinglePending() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.pending) == 1 {
-		for state := range m.pending {
-			return state
+	m.gcLocked()
+	return m.singlePendingLocked()
+}
+
+func (m *Manager) singlePendingLocked() string {
+	var found string
+	for state, p := range m.pending {
+		if p.kind == "browser" && !p.completing {
+			if found != "" {
+				return ""
+			}
+			found = state
 		}
 	}
-	return ""
+	return found
 }
 
 // pendingStates lists the tracked pending login states.
@@ -230,7 +232,7 @@ func (m *Manager) pendingStates() []string {
 func (m *Manager) gcLocked() {
 	now := time.Now()
 	for state, p := range m.pending {
-		if now.Sub(p.started) > pendingTTL {
+		if !p.completing && now.Sub(p.started) > pendingTTL {
 			delete(m.pending, state)
 		}
 	}

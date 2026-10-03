@@ -6,12 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"switcher/internal/claudecode"
 	"switcher/internal/provider"
+	"switcher/internal/provider/claude"
 	"switcher/internal/store"
 )
 
@@ -195,4 +197,83 @@ func TestNativeOwnedRefreshIsNotClassifiedAsDeadAccount(t *testing.T) {
 	if m.AccountHealth("a").Condition == "needs_relogin" {
 		t.Fatal("ownership deferral reported as a revoked credential")
 	}
+}
+
+func TestNativeExpiredLoginRecheckReplacesStaleUsage(t *testing.T) {
+	home, data := t.TempDir(), t.TempDir()
+	paths := claudecode.Paths{Home: home, ConfigHome: filepath.Join(home, ".claude"), ConfigFile: filepath.Join(home, ".claude.json"), CredentialsFile: filepath.Join(home, ".claude", ".credentials.json")}
+	identity := claudecode.Identity{UUID: "fixture-user", Email: "fixture@example.test", OrganizationUUID: "fixture-org"}
+	identityJSON, _ := json.Marshal(identity)
+	credential := []byte(`{"claudeAiOauth":{"accessToken":"fixture-expired-access","refreshToken":"fixture-live-refresh","expiresAt":1000},"mcpOAuth":{"fixture":"keep"}}`)
+	st := store.New(data)
+	a := store.Account{ID: "claude-fixture", Provider: "claude", Email: identity.Email, Token: store.Token{AccountID: identity.UUID, AccessToken: "fixture-expired-access", RefreshToken: "fixture-live-refresh", ExpiresAt: 1}, ClaudeCode: &store.ClaudeCodeLogin{Credentials: credential, OAuthAccount: identityJSON}}
+	if err := st.Save(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.ConfigHome, 0700); err != nil {
+		t.Fatal(err)
+	}
+	config, _ := json.Marshal(map[string]any{"oauthAccount": identity, "projects": map[string]any{"fixture": "keep"}})
+	if err := os.WriteFile(paths.ConfigFile, config, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.CredentialsFile, credential, 0600); err != nil {
+		t.Fatal(err)
+	}
+	grants, usageCalls := 0, 0
+	p := claude.New()
+	grant := func(ctx context.Context, a *store.Account) error {
+		grants++
+		if a.Token.RefreshToken != "fixture-live-refresh" {
+			t.Error("grant consumed a backup instead of the live native generation")
+		}
+		a.Token.AccessToken, a.Token.RefreshToken = "fixture-new-access", "fixture-new-refresh"
+		a.Token.ExpiresAt = time.Now().Add(time.Hour).Unix()
+		return nil
+	}
+	p.Native = claudecode.New(paths, data, st, nil, func(context.Context, string) (claudecode.Identity, error) { return identity, nil }, grant)
+	fixture := &nativeUsageFixture{Provider: p, grant: grant, usage: func(ctx context.Context, a store.Account) (provider.Usage, error) {
+		usageCalls++
+		if a.Token.AccessToken != "fixture-new-access" {
+			return provider.Usage{}, provider.ErrUsageAuthRequired
+		}
+		return provider.Usage{Available: true, Windows: []provider.UsageWindow{{Label: "Session", UsedPercent: 0}, {Label: "Weekly", UsedPercent: 0}}}, nil
+	}}
+	m, err := New(st, map[string]provider.Provider{"claude": fixture}, []string{"claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.lastUsage[a.ID] = provider.Usage{Available: true, Windows: []provider.UsageWindow{{Label: "Session", UsedPercent: 41}, {Label: "Weekly", UsedPercent: 96}}}
+	m.healthLocked(a.ID).lastSuccess = time.Now().Add(-32 * time.Minute)
+	m.mu.Unlock()
+	m.refreshAccount(context.Background(), a.ID, 0, true)
+	if got := m.AccountHealth(a.ID).Condition; got != "usage_current" {
+		t.Fatalf("Recheck kept the expired native login's old usage: health=%s grants=%d usage_calls=%d", got, grants, usageCalls)
+	}
+	u, _ := m.LastUsage(a.ID)
+	if len(u.Windows) != 2 || u.Windows[0].UsedPercent != 0 || u.Windows[1].UsedPercent != 0 || grants != 1 {
+		t.Fatal("reset usage did not replace the stale snapshot after one coordinated native refresh")
+	}
+	current, err := os.ReadFile(paths.CredentialsFile)
+	if err != nil || !strings.Contains(string(current), "fixture-new-refresh") {
+		t.Fatal("native store was left holding a consumed predecessor")
+	}
+}
+
+type nativeUsageFixture struct {
+	*claude.Provider
+	usage func(context.Context, store.Account) (provider.Usage, error)
+	grant claudecode.Grant
+}
+
+func (p *nativeUsageFixture) Refresh(ctx context.Context, a *store.Account) error {
+	return p.Native.Refresh(ctx, a, p.grant)
+}
+
+func (p *nativeUsageFixture) Usage(ctx context.Context, a store.Account) (provider.Usage, error) {
+	return p.usage(ctx, a)
+}
+func (*nativeUsageFixture) ResolvePlan(context.Context, store.Account) (string, error) {
+	return "", nil
 }

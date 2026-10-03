@@ -197,9 +197,12 @@ func (p *Provider) accountFromGithubToken(ctx context.Context, githubToken strin
 		return store.Account{}, fmt.Errorf("github user: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return store.Account{}, fmt.Errorf("github user: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return store.Account{}, errors.New("github user: response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return store.Account{}, fmt.Errorf("github user failed: http %d", resp.StatusCode)
@@ -295,9 +298,12 @@ func fetchCopilotToken(ctx context.Context, githubToken string) (copilotToken, e
 		return copilotToken{}, fmt.Errorf("copilot token: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return copilotToken{}, fmt.Errorf("copilot token: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return copilotToken{}, errors.New("copilot token: response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return copilotToken{}, tokenMintHTTPError{status: resp.StatusCode}
@@ -364,6 +370,8 @@ func (p *Provider) UpstreamURL(path string) string {
 
 // ApplyAuth sets the headers the Copilot API expects from an editor client.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
+	req.Header.Del("X-Api-Key")
+	req.Header.Del("X-Goog-Api-Key")
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)
 	req.Header.Set("User-Agent", "GithubCopilot/1.0")
@@ -439,15 +447,18 @@ func fetchCopilotUsage(ctx context.Context, githubToken string) (copilotUsage, e
 	req.Header.Set("Accept", "application/json")
 	resp, err := provider.OAuthHTTPClient.Do(req)
 	if err != nil {
-		return copilotUsage{}, provider.ErrUsageUnavailable
+		return copilotUsage{}, fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return copilotUsage{}, provider.UsageStatusError(resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
-		return copilotUsage{}, provider.ErrUsageUnavailable
+		return copilotUsage{}, fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
+	}
+	if len(raw) > 1<<20 {
+		return copilotUsage{}, fmt.Errorf("%w: response body too large", provider.ErrUsageUnavailable)
 	}
 	var parsed copilotUsage
 	if err := json.Unmarshal(raw, &parsed); err != nil {
@@ -500,28 +511,54 @@ func windowsOf(u copilotUsage) []provider.UsageWindow {
 	return windows
 }
 
-// ParseRateLimit implements provider.Provider. The Copilot API reports
-// exhaustion as a 429 with a premium_request_exceeded body; the usage
-// snapshot decides until when.
+// ParseRateLimit requires the specific premium_request_exceeded error or
+// an exhausted quota snapshot. Generic rate-limit text is not evidence of
+// subscription exhaustion.
 func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
-	if status != http.StatusTooManyRequests {
+	if status != http.StatusTooManyRequests || ctx.Err() != nil || len(body) > 8<<10 {
 		return time.Time{}, false
 	}
-	if !strings.Contains(string(body), "rate limit") && !strings.Contains(string(body), "premium") &&
-		!strings.Contains(string(body), "exceeded") {
-		return time.Time{}, false
+	var payload struct {
+		Error json.RawMessage `json:"error"`
 	}
-	usage, err := p.Usage(ctx, a)
-	if err != nil {
-		return time.Now().Add(time.Hour), true
-	}
-	var latest time.Time
-	for _, w := range usage.Windows {
-		if w.UsedPercent >= 100 && w.ResetsAt > 0 {
-			if t := time.Unix(w.ResetsAt, 0); t.After(latest) {
-				latest = t
+	var code string
+	if json.Unmarshal(body, &payload) == nil && json.Unmarshal(payload.Error, &code) != nil {
+		var detail struct {
+			Code string `json:"code"`
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(payload.Error, &detail) == nil {
+			code = detail.Code
+			if code == "" {
+				code = detail.Type
 			}
 		}
+	}
+	exhausted := code == "premium_request_exceeded"
+	var usage copilotUsage
+	err := provider.ErrUsageUnavailable
+	if a.Token.RefreshToken != "" {
+		usage, err = fetchCopilotUsage(ctx, a.Token.RefreshToken)
+	}
+	if ctx.Err() != nil {
+		return time.Time{}, false
+	}
+	var latest time.Time
+	if err == nil {
+		for _, s := range snapshotLabels {
+			snap, ok := usage.QuotaSnapshots[s.key]
+			// The legacy entitled display fallback does not establish how
+			// much quota was consumed. Require an explicit used count.
+			if ok && !snap.Unlimited && snap.Entitlement != nil && *snap.Entitlement > 0 && snap.Used != nil && *snap.Used >= *snap.Entitlement {
+				exhausted = true
+				if t, err := time.ParseInLocation("2006-01-02", usage.QuotaResetDate, time.Local); err == nil && t.After(time.Now()) && t.After(latest) {
+					latest = t
+				}
+			}
+		}
+	}
+	if !exhausted {
+		return time.Time{}, false
 	}
 	if latest.IsZero() {
 		return time.Now().Add(time.Hour), true
@@ -570,9 +607,12 @@ func postForm(ctx context.Context, target string, form url.Values) ([]byte, erro
 		return nil, fmt.Errorf("copilot request: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return nil, fmt.Errorf("copilot response: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return nil, errors.New("copilot response body too large")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("copilot request failed: http %d", resp.StatusCode)

@@ -8,19 +8,27 @@ let hubURL = URL(string: "http://127.0.0.1:8787")!
 
 // The server can rotate this device token while the app is running.
 func currentDeviceToken() -> String? {
+    #if SWITCHER_LAYOUT_TEST
+    return nil
+    #else
     guard let raw = try? String(contentsOfFile: NSHomeDirectory() + "/.switcher/local-token", encoding: .utf8) else { return nil }
     let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     return token.count == 64 ? token : nil
+    #endif
 }
 
 // The menu app and server share this local preference file. Consult it at
 // delivery time as well as the cached state so a web toggle takes effect
 // without waiting for the menu app's next state poll.
 func resetAlertsEnabledOnDisk() -> Bool {
+    #if SWITCHER_LAYOUT_TEST
+    return false
+    #else
     let path = NSHomeDirectory() + "/.switcher/settings.json"
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
     return object["reset_notifications"] as? Bool == true
+    #endif
 }
 let launchAgentLabel = "sh.switcher.app"
 let launchAgentPath = NSHomeDirectory() + "/Library/LaunchAgents/" + launchAgentLabel + ".plist"
@@ -75,6 +83,11 @@ struct AppState: Codable, Equatable {
     let update: UpdateInfo?
     let menu_usage_bars: Bool?
     let reset_notifications: Bool?
+
+    func withUpdate(_ info: UpdateInfo) -> AppState {
+        AppState(accounts: accounts, order: order, hidden: hidden, version: version,
+            update: info, menu_usage_bars: menu_usage_bars, reset_notifications: reset_notifications)
+    }
 }
 
 private let resetPrefix = "sh.switcher.reset."
@@ -128,6 +141,9 @@ func resetAlertPermission(_ settings: UNNotificationSettings) -> ResetAlertPermi
 }
 
 func sendTestResetAlert(completion: @escaping (String?) -> Void) {
+    #if SWITCHER_LAYOUT_TEST
+    completion("Notification delivery disabled in fixtures")
+    #else
     guard resetAlertsEnabledOnDisk() else {
         completion("Enable reset alerts in Switcher Settings first")
         return
@@ -146,6 +162,7 @@ func sendTestResetAlert(completion: @escaping (String?) -> Void) {
         center.add(UNNotificationRequest(identifier: "sh.switcher.test." + UUID().uuidString,
             content: content, trigger: nil)) { error in completion(error?.localizedDescription) }
     }
+    #endif
 }
 
 func loadResetAlertLedger(at url: URL) throws -> ResetAlertLedger {
@@ -711,6 +728,7 @@ final class ToggleSwitch: NSView {
 final class SpinnerButton: NSView {
     var onClicked: (() -> Void)?
     private let iconLayer = CALayer()
+    private var busy = false
 
     init(symbol: String, size: CGFloat, color: NSColor) {
         super.init(frame: NSRect(x: 0, y: 0, width: size, height: size))
@@ -733,13 +751,18 @@ final class SpinnerButton: NSView {
     required init?(coder: NSCoder) { fatalError("unused") }
 
     override func mouseDown(with event: NSEvent) {
-        spin()
-        // The menu rebuilds on fresh data; if it does not, stop after 3s so
-        // the icon cannot spin forever.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            self?.iconLayer.removeAnimation(forKey: "spin")
-        }
+        guard !busy else { return }
         onClicked?()
+    }
+
+    func setBusy(_ value: Bool) {
+        busy = value
+        #if SWITCHER_LAYOUT_TEST
+        iconLayer.removeAnimation(forKey: "spin")
+        #else
+        if value && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { spin() }
+        else { iconLayer.removeAnimation(forKey: "spin") }
+        #endif
     }
 
     func spin() {
@@ -752,10 +775,133 @@ final class SpinnerButton: NSView {
     }
 }
 
+struct OwnedServer {
+    let id: UUID
+    let terminate: () -> Void
+}
+
+private func onMain(_ action: @escaping () -> Void) {
+    if Thread.isMainThread { action() } else { DispatchQueue.main.async(execute: action) }
+}
+
+private func fixtureRuntimeError() -> NSError {
+    NSError(domain: "SwitcherFixture", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Runtime actions disabled in fixtures"])
+}
+
+// Only these adapters reach HTTP, private files, processes, or modal UI.
+// Layout fixtures start with inert adapters and opt into synthetic ones.
+struct MenuRuntime {
+    var request: (URLRequest, @escaping (Data?, URLResponse?, Error?) -> Void) -> Void = { request, completion in
+        #if SWITCHER_LAYOUT_TEST
+        completion(nil, nil, fixtureRuntimeError())
+        #else
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = request.timeoutInterval
+        configuration.timeoutIntervalForResource = request.timeoutInterval
+        configuration.httpCookieStorage = nil
+        configuration.urlCache = nil
+        let session = URLSession(configuration: configuration)
+        session.dataTask(with: request) { data, response, error in
+            completion(data, response, error)
+            session.finishTasksAndInvalidate()
+        }.resume()
+        #endif
+    }
+    var deviceToken: () -> String? = currentDeviceToken
+    var alertsEnabled: () -> Bool = resetAlertsEnabledOnDisk
+    var loadLedger: () throws -> ResetAlertLedger = {
+        #if SWITCHER_LAYOUT_TEST
+        return ResetAlertLedger(alerts: [], deliveredIDs: [])
+        #else
+        return try loadResetAlertLedger(at: URL(fileURLWithPath: NSHomeDirectory() + "/.switcher/reset-alerts.json"))
+        #endif
+    }
+    var saveLedger: (ResetAlertLedger) throws -> Void = { ledger in
+        #if !SWITCHER_LAYOUT_TEST
+        try saveResetAlertLedger(ledger, at: URL(fileURLWithPath: NSHomeDirectory() + "/.switcher/reset-alerts.json"))
+        #endif
+    }
+    var schedule: (TimeInterval, @escaping () -> Void) -> Void = { delay, task in
+        #if !SWITCHER_LAYOUT_TEST
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: task)
+        #endif
+    }
+    var launchServer: (@escaping (UUID) -> Void) throws -> OwnedServer = { exited in
+        #if SWITCHER_LAYOUT_TEST
+        throw fixtureRuntimeError()
+        #else
+        let server = URL(fileURLWithPath: Bundle.main.bundlePath + "/Contents/MacOS/SwitcherServer")
+        let logDir = NSHomeDirectory() + "/.switcher"
+        try FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+        let logPath = logDir + "/server.log"
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logPath)
+        let process = Process(), id = UUID()
+        process.executableURL = server
+        process.arguments = ["--port", "8787"]
+        if let handle = FileHandle(forWritingAtPath: logPath) {
+            handle.seekToEndOfFile()
+            process.standardOutput = handle
+            process.standardError = handle
+        }
+        process.terminationHandler = { _ in onMain { exited(id) } }
+        try process.run()
+        return OwnedServer(id: id, terminate: { if process.isRunning { process.terminate() } })
+        #endif
+    }
+    var showError: (String, String) -> Void = { title, detail in
+        #if !SWITCHER_LAYOUT_TEST
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        #endif
+    }
+    var terminateApplication: () -> Void = {
+        #if !SWITCHER_LAYOUT_TEST
+        NSApp.terminate(nil)
+        #endif
+    }
+}
+
+func menuHTTPResult(_ data: Data?, response: URLResponse?, error: Error?) -> Result<Data, Error> {
+    if let error = error {
+        let failure = error as NSError
+        if failure.domain == NSURLErrorDomain, failure.code == URLError.timedOut.rawValue {
+            return .failure(NSError(domain: NSURLErrorDomain, code: failure.code,
+                userInfo: [NSLocalizedDescriptionKey: "Switcher request timed out. Try again."]))
+        }
+        return .failure(error)
+    }
+    guard let response = response as? HTTPURLResponse else {
+        return .failure(NSError(domain: "SwitcherHTTP", code: 0,
+            userInfo: [NSLocalizedDescriptionKey: "Could not reach Switcher"]))
+    }
+    guard (200..<300).contains(response.statusCode) else {
+        let body = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let message = body?["error"] as? String ?? (body?["error"] as? [String: Any])?["message"] as? String
+        let backup = body?["backup"] as? String ?? (body?["result"] as? [String: Any])?["backup"] as? String
+        let detail = [message, body?["details"] as? String, backup.map { "Backup: " + $0 }]
+            .compactMap { $0 }.joined(separator: "\n")
+        return .failure(NSError(domain: "SwitcherHTTP", code: response.statusCode,
+            userInfo: [NSLocalizedDescriptionKey: detail.isEmpty ? "Switcher returned HTTP \(response.statusCode)" : detail]))
+    }
+    return .success(data ?? Data())
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    #if SWITCHER_LAYOUT_TEST
+    let statusItem: NSStatusItem? = nil
+    #else
+    let statusItem: NSStatusItem? = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    #endif
     let menu = NSMenu()
-    var serverProcess: Process?
+    let runtime: MenuRuntime
+    var serverProcess: OwnedServer?
     var cachedState: AppState?
     var hoverCards: [HoverCard] = []
     var hoverTimer: Timer?
@@ -776,14 +922,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var sendingResetIDs = Set<String>()
     private var permissionRequested = false
     private var notificationPermission: ResetAlertPermission?
-    private let resetLedgerURL = URL(fileURLWithPath: NSHomeDirectory() + "/.switcher/reset-alerts.json")
     private var savedResetLedger: ResetAlertLedger?
+    private var serverStarting = false
+    private var quitting = false
+    private var recoveryGeneration = 0
+    private var recoveryAttempts = 0
+    private var stableRecoveryGeneration: Int?
+    private var usageRefreshRunning = false
+    private var refreshButton: SpinnerButton?
+    private var updateActionRunning = false
+    private var updateGeneration = 0
+    private var menuActionMessage = ""
+
+    init(runtime: MenuRuntime = MenuRuntime()) {
+        self.runtime = runtime
+        super.init()
+    }
+
+    var resetAlertLedger: ResetAlertLedger {
+        ResetAlertLedger(alerts: resetAlerts, deliveredIDs: deliveredResetIDs.sorted())
+    }
+
+    func restoreResetLedger(_ ledger: ResetAlertLedger) {
+        resetAlerts = ledger.alerts
+        deliveredResetIDs = Set(ledger.deliveredIDs)
+        savedResetLedger = ledger
+    }
 
     private func persistResetAlerts() {
         let ledger = ResetAlertLedger(alerts: resetAlerts, deliveredIDs: deliveredResetIDs.sorted())
         guard ledger != savedResetLedger else { return }
         do {
-            try saveResetAlertLedger(ledger, at: resetLedgerURL)
+            try runtime.saveLedger(ledger)
             savedResetLedger = ledger
         } catch {
             NSLog("Switcher could not save reset alerts: %@", error.localizedDescription)
@@ -805,20 +975,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if !SWITCHER_LAYOUT_TEST
         UNUserNotificationCenter.current().delegate = self
         ensureServerRunning()
         do {
-            let ledger = try loadResetAlertLedger(at: resetLedgerURL)
-            resetAlerts = ledger.alerts
-            deliveredResetIDs = Set(ledger.deliveredIDs)
-            savedResetLedger = ledger
+            restoreResetLedger(try runtime.loadLedger())
         } catch {
             NSLog("Switcher could not load reset alerts: %@", error.localizedDescription)
         }
-        statusItem.button?.title = "⇄"
-        statusItem.button?.toolTip = "Switcher"
+        statusItem?.button?.title = "⇄"
+        statusItem?.button?.toolTip = "Switcher"
         menu.autoenablesItems = false
-        statusItem.menu = menu
+        statusItem?.menu = menu
         menu.delegate = self
         rebuildMenu()
         fetchStateAsync()
@@ -827,6 +995,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         RunLoop.main.add(warm, forMode: .common)
         let alerts = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.deliverDueResetAlerts() }
         RunLoop.main.add(alerts, forMode: .common)
+        #endif
     }
 
     // Opening draws from the cache immediately (no network on the main
@@ -867,6 +1036,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func applyMenuState(_ state: AppState) {
         let previous = cachedState
         cachedState = state
+        if menuActionMessage == "Switcher server stopped" || menuActionMessage == "Could not start Switcher server" {
+            menuActionMessage = ""
+        }
         if Date() >= nextExhaustionChange { rebuildMenu(); return }
         guard previous != state else { return }
         guard let previous = previous, previous.order == state.order, previous.hidden == state.hidden,
@@ -928,31 +1100,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @discardableResult
     func acceptStateResponse(_ state: AppState, serial: Int) -> Bool {
-        guard serial == stateRequest else { return false }
+        guard serial == stateRequest, !quitting else { return false }
         applyMenuState(state)
+        if serverProcess != nil, recoveryAttempts > 0, stableRecoveryGeneration != recoveryGeneration {
+            let generation = recoveryGeneration
+            stableRecoveryGeneration = generation
+            runtime.schedule(60) { [weak self] in
+                guard let self = self, !self.quitting, self.serverProcess != nil,
+                      self.cachedState != nil, self.recoveryGeneration == generation else { return }
+                self.recoveryAttempts = 0
+            }
+        }
         return true
     }
 
+    private func performRequest(_ request: URLRequest, completion: @escaping (Data?, URLResponse?, Error?) -> Void) {
+        runtime.request(request) { data, response, error in
+            onMain { completion(data, response, error) }
+        }
+    }
+
+    private func makeRequest(path: String, method: String = "GET", timeout: TimeInterval = 5) -> URLRequest {
+        var request = URLRequest(url: hubURL.appendingPathComponent(path))
+        request.httpMethod = method
+        request.timeoutInterval = timeout
+        if let token = runtime.deviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+        return request
+    }
+
     func fetchStateAsync() {
+        guard !quitting else { return }
         let serial = beginStateRequest()
-        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
-        request.timeoutInterval = 5
-        let token = currentDeviceToken()
-        if let token = token { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            if (response as? HTTPURLResponse)?.statusCode == 401 && currentDeviceToken() != token {
-                DispatchQueue.main.async { self?.fetchStateAsync() }
+        let request = makeRequest(path: "api/state")
+        performRequest(request) { [weak self] data, response, _ in
+            guard let self = self, !self.quitting, serial == self.stateRequest else { return }
+            if (response as? HTTPURLResponse)?.statusCode == 401,
+               request.value(forHTTPHeaderField: "Authorization") != self.runtime.deviceToken().map({ "Bearer " + $0 }) {
+                self.fetchStateAsync()
                 return
             }
-            guard let self = self, let data = data,
+            guard let data = data,
                   (response as? HTTPURLResponse)?.statusCode == 200,
-                  let decoded = try? JSONDecoder().decode(AppState.self, from: data) else { return }
-            DispatchQueue.main.async {
-                guard self.acceptStateResponse(decoded, serial: serial) else { return }
-                if self.menuOpen { self.prepareMenuForOpening() }
-                self.updateResetAlerts()
+                  let decoded = try? JSONDecoder().decode(AppState.self, from: data) else {
+                self.cachedState = nil
+                self.rebuildMenu()
+                return
             }
-        }.resume()
+            guard self.acceptStateResponse(decoded, serial: serial) else { return }
+            if self.menuOpen { self.prepareMenuForOpening() }
+            self.updateResetAlerts()
+        }
     }
 
     // Persist upcoming and recently due windows. Nothing is pre-queued in
@@ -967,6 +1164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         resetAlerts = reconciledResetAlerts(resetAlerts, state: state, now: now)
         deliveredResetIDs.formIntersection(Set(resetAlerts.map(\.id)))
         persistResetAlerts()
+        #if !SWITCHER_LAYOUT_TEST
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { [weak self] settings in
             DispatchQueue.main.async {
@@ -985,10 +1183,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 }
             }
         }
+        #endif
     }
 
     func deliverDueResetAlerts() {
-        guard cachedState?.reset_notifications == true, resetAlertsEnabledOnDisk() else {
+        guard let cachedState = cachedState else { return }
+        guard cachedState.reset_notifications == true, runtime.alertsEnabled() else {
             clearResetAlerts()
             return
         }
@@ -1002,32 +1202,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         // Read the server's current preference immediately before delivery.
         // If it is unavailable, skip the alert rather than risk showing one
         // after the user turned the setting off in the web app.
-        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
-        request.timeoutInterval = 5
-        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+        let request = makeRequest(path: "api/state")
+        performRequest(request) { [weak self] data, response, _ in
             guard let data = data, (response as? HTTPURLResponse)?.statusCode == 200,
                   let state = try? JSONDecoder().decode(AppState.self, from: data) else { return }
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                guard self.acceptStateResponse(state, serial: serial) else { return }
-                self.updateResetAlerts()
-                guard state.reset_notifications == true, resetAlertsEnabledOnDisk() else { return }
-                let valid = Set(self.resetAlerts.map(\.id))
-                let ready = due.filter { valid.contains($0.id) && !self.deliveredResetIDs.contains($0.id) && !self.sendingResetIDs.contains($0.id) }
-                guard !ready.isEmpty else { return }
-                for alert in ready { self.sendingResetIDs.insert(alert.id) }
-                self.presentResetAlerts(ready)
-            }
-        }.resume()
+            guard let self = self, !self.quitting else { return }
+            guard self.acceptStateResponse(state, serial: serial) else { return }
+            self.updateResetAlerts()
+            guard state.reset_notifications == true, self.runtime.alertsEnabled() else { return }
+            let valid = Set(self.resetAlerts.map(\.id))
+            let ready = due.filter { valid.contains($0.id) && !self.deliveredResetIDs.contains($0.id) && !self.sendingResetIDs.contains($0.id) }
+            guard !ready.isEmpty else { return }
+            for alert in ready { self.sendingResetIDs.insert(alert.id) }
+            self.presentResetAlerts(ready)
+        }
     }
 
     private func presentResetAlerts(_ due: [ResetAlert]) {
+        #if SWITCHER_LAYOUT_TEST
+        for alert in due { sendingResetIDs.remove(alert.id) }
+        #else
         UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 guard resetAlertPermission(settings).canSend,
-                      self.cachedState?.reset_notifications == true, resetAlertsEnabledOnDisk() else {
+                      self.cachedState?.reset_notifications == true, self.runtime.alertsEnabled() else {
                     for alert in due { self.sendingResetIDs.remove(alert.id) }
                     return
                 }
@@ -1036,7 +1235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                     content.title = "\(alert.provider) usage window"
                     content.body = "Provider-reported reset time reached for \(alert.window)."
                     content.sound = .default
-                    guard resetAlertsEnabledOnDisk() else { self.sendingResetIDs.remove(alert.id); continue }
+                    guard self.runtime.alertsEnabled() else { self.sendingResetIDs.remove(alert.id); continue }
                     UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: alert.id,
                         content: content, trigger: nil)) { [weak self] error in
                         DispatchQueue.main.async {
@@ -1054,56 +1253,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 }
             }
         }
+        #endif
     }
 
-    // serverReachable is the one synchronous probe, used once at launch to
-    // decide whether to spawn the bundled server.
-    func serverReachable(timeout: Double) -> Bool {
-        var request = URLRequest(url: hubURL.appendingPathComponent("api/state"))
-        request.timeoutInterval = timeout
-        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
-        let semaphore = DispatchSemaphore(value: 0)
-        var ok = false
-        URLSession.shared.dataTask(with: request) { _, response, _ in
-            ok = (response as? HTTPURLResponse)?.statusCode == 200
-            semaphore.signal()
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + timeout)
-        return ok
-    }
-
-    func ensureServerRunning() {
-        if serverReachable(timeout: 1.5) { return }
-        let server = URL(fileURLWithPath: Bundle.main.bundlePath + "/Contents/MacOS/SwitcherServer")
-        guard FileManager.default.fileExists(atPath: server.path) else { return }
-        let logDir = NSHomeDirectory() + "/.switcher"
-        try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: logDir + "/server.log") {
-            FileManager.default.createFile(atPath: logDir + "/server.log", contents: nil)
-        }
-        // The log contains account emails; keep it user-only.
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logDir + "/server.log")
-        let process = Process()
-        process.executableURL = server
-        process.arguments = ["--port", "8787"]
-        if let logHandle = FileHandle(forWritingAtPath: logDir + "/server.log") {
-            process.standardOutput = logHandle
-            process.standardError = logHandle
-        }
-        do {
-            try process.run()
-            serverProcess = process
-            Thread.sleep(forTimeInterval: 0.8)
-        } catch {
-            NSLog("switcher: could not start server: \(error)")
+    // An HTTP response, including 401, means something already owns the port.
+    // Recovery never terminates or adopts that external listener.
+    func ensureServerRunning(recovering: Bool = false) {
+        guard !quitting, !serverStarting, serverProcess == nil else { return }
+        serverStarting = true
+        let generation = recoveryGeneration
+        performRequest(makeRequest(path: "api/state", timeout: 1.5)) { [weak self] _, response, _ in
+            guard let self = self, !self.quitting, generation == self.recoveryGeneration else { return }
+            self.serverStarting = false
+            if response is HTTPURLResponse { return }
+            do {
+                self.serverProcess = try self.runtime.launchServer { [weak self] id in
+                    onMain { self?.ownedServerExited(id) }
+                }
+                let id = self.serverProcess?.id
+                self.runtime.schedule(0.8) { [weak self] in
+                    guard let self = self, !self.quitting, self.serverProcess?.id == id else { return }
+                    self.fetchStateAsync()
+                }
+            } catch {
+                self.menuActionMessage = "Could not start Switcher server"
+                self.rebuildMenu()
+                NSLog("Switcher could not start server: %@", error.localizedDescription)
+                if recovering { self.scheduleOwnedRecovery() }
+            }
         }
     }
 
-    func post(path: String, completion: (() -> Void)? = nil) {
-        var request = URLRequest(url: hubURL.appendingPathComponent(path))
-        request.httpMethod = "POST"
-        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
-        URLSession.shared.dataTask(with: request) { _, _, _ in completion?() }.resume()
+    private func ownedServerExited(_ id: UUID) {
+        guard !quitting, serverProcess?.id == id else { return }
+        serverProcess = nil
+        recoveryGeneration += 1
+        stableRecoveryGeneration = nil
+        _ = beginStateRequest()
+        cachedState = nil
+        menuActionMessage = "Switcher server stopped"
+        rebuildMenu()
+        scheduleOwnedRecovery()
+    }
+
+    private func scheduleOwnedRecovery() {
+        guard !quitting, recoveryAttempts < 3 else { return }
+        let delay = pow(2, Double(recoveryAttempts))
+        recoveryAttempts += 1
+        let generation = recoveryGeneration
+        runtime.schedule(delay) { [weak self] in
+            guard let self = self, !self.quitting, self.recoveryGeneration == generation else { return }
+            self.ensureServerRunning(recovering: true)
+        }
+    }
+
+    func post(path: String, timeout: TimeInterval = 90, completion: @escaping (Result<Data, Error>) -> Void) {
+        func attempt(retry: Bool) {
+            let request = makeRequest(path: path, method: "POST", timeout: timeout)
+            performRequest(request) { [weak self] data, response, error in
+                guard let self = self, !self.quitting else { return }
+                if retry, (response as? HTTPURLResponse)?.statusCode == 401,
+                   request.value(forHTTPHeaderField: "Authorization") != self.runtime.deviceToken().map({ "Bearer " + $0 }) {
+                    attempt(retry: false)
+                    return
+                }
+                completion(menuHTTPResult(data, response: response, error: error))
+            }
+        }
+        attempt(retry: true)
     }
 
     // MARK: menu construction
@@ -1142,6 +1359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let refresh = SpinnerButton(symbol: "arrow.clockwise", size: 26, color: dimColor)
         refresh.frame.origin = NSPoint(x: menuWidth - edgeInset - 26, y: 16)
         refresh.onClicked = { [weak self] in self?.refreshUsage() }
+        refresh.setBusy(usageRefreshRunning)
+        refreshButton = refresh
         headerView.addSubview(refresh)
         menu.addItem(menuItemWithView(headerView))
 
@@ -1204,7 +1423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
         // Bottom actions: equal-width buttons, text vertically centered.
         let installAvailable = state?.update?.update_available == true
-        let updateTitle = installAvailable ? "Install update" : "Check for updates"
+        let updateTitle = updateActionRunning ? "Working…" : installAvailable ? "Install update" : "Check for updates"
         let buttonWidth = (menuWidth - 2 * edgeInset - 10) / 2
         let actionRow = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 46))
         let webCard = cardView(width: buttonWidth, height: 38)
@@ -1223,6 +1442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         updateCard.frame.origin = NSPoint(x: edgeInset + buttonWidth + 10, y: 4)
         let updateButton = NSButton(title: updateTitle,
             target: self, action: #selector(runUpdate))
+        updateButton.isEnabled = !updateActionRunning
         updateButton.isBordered = false
         updateButton.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         updateButton.frame = NSRect(x: 0, y: 9, width: buttonWidth, height: 20)
@@ -1233,6 +1453,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         updateCard.addSubview(updateButton)
         actionRow.addSubview(updateCard)
         menu.addItem(menuItemWithView(actionRow))
+        if !menuActionMessage.isEmpty {
+            let feedback = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 26))
+            let text = label(menuActionMessage, font: NSFont.systemFont(ofSize: 11), color: dimColor)
+            text.frame = NSRect(x: edgeInset, y: 5, width: contentWidth, height: 16)
+            text.toolTip = menuActionMessage
+            feedback.addSubview(text)
+            menu.addItem(menuItemWithView(feedback))
+        }
 
         // Start at login: symmetric card, label left, toggle right.
         let toggleCard = cardView(width: contentWidth, height: 42)
@@ -1325,6 +1553,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 row.addSubview(banked)
             }
 
+            let nativeSelectionBlock: CGFloat = account.native_switch_available == true ? titleUsageGap + usageLineHeight : 0
+            if nativeSelectionBlock > 0 {
+                let selection = label("Claude Code \(account.native_active == true ? "active" : "idle") · Proxy \(account.active ? "active" : "idle")",
+                    font: NSFont.systemFont(ofSize: 10.5), color: dimColor)
+                selection.frame = NSRect(x: textX, y: titleY - titleUsageGap - usageLineHeight,
+                    width: contentWidth - textX - cardInset, height: usageLineHeight)
+                row.addSubview(selection)
+            }
+
             // Stable label and percentage columns, with resets trailing.
             let usageFont = NSFont.systemFont(ofSize: 11)
             let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
@@ -1332,7 +1569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             let windows = account.usage?.windows ?? []
             let layout = usageLayout(windows: windows, titleY: titleY,
                 lineWidth: contentWidth - textX - cardInset, contentWidth: contentWidth, textX: textX,
-                cardInset: cardInset, lineHeight: usageLineHeight, titleGap: titleUsageGap,
+                cardInset: cardInset, lineHeight: usageLineHeight, titleGap: titleUsageGap + nativeSelectionBlock,
                 showBars: showUsageBars)
             for (window, line) in zip(windows, layout.lines) {
                 let left = max(0, min(100, 100 - window.used_percent))
@@ -1372,6 +1609,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 let check = NSImageView(frame: layout.checkmark)
                 check.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
                 check.contentTintColor = accentColor
+                check.toolTip = account.native_switch_available == true ? "Claude Code native login active" : "Proxy account active"
                 row.addSubview(check)
             } else if exhausted {
                 let badge = label("Out of usage", font: NSFont.systemFont(ofSize: 10.5), color: warnColor)
@@ -1395,52 +1633,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     func rowHeight(for account: Account) -> CGFloat {
         let windows = CGFloat(account.usage?.windows?.count ?? 0)
         let usageBlock = windows > 0 ? titleUsageGap + windows * usageLineHeight : 0
-        return rowTopPad + titleHeight + usageBlock + rowBottomPad
+        let selectionBlock = account.native_switch_available == true ? titleUsageGap + usageLineHeight : 0
+        return rowTopPad + titleHeight + selectionBlock + usageBlock + rowBottomPad
     }
 
     // MARK: actions
 
     func activateAccount(_ account: Account) {
-        guard switchingAccountID == nil else { return }
+        guard !quitting, switchingAccountID == nil else { return }
         switchingAccountID = account.id
         if account.native_switch_available == true {
             nativeSwitchMessage = "Switching Claude Code login…"
             rebuildMenu()
         }
-        var request = URLRequest(url: hubURL.appendingPathComponent("api/accounts/\(account.id)/activate"))
-        request.httpMethod = "POST"
-        request.timeoutInterval = 90
-        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            let body = data.flatMap { try? JSONDecoder().decode(AccountActivationResponse.self, from: $0) }
-            let ok = (response as? HTTPURLResponse)?.statusCode == 200
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.switchingAccountID = nil
-                self.nativeSwitchMessage = ok ? (body?.native?.message ?? "") : ""
-                self.rebuildMenu()
-                self.fetchStateAsync()
-                if !ok {
-                    let alert = NSAlert()
-                    alert.messageText = body?.error ?? "Could not switch account"
-                    alert.informativeText = [body?.details, body?.backup.map { "Backup: " + $0 }, error?.localizedDescription]
-                        .compactMap { $0 }.joined(separator: "\n")
-                    alert.addButton(withTitle: "OK")
-                    alert.runModal()
-                } else if !self.nativeSwitchMessage.isEmpty {
-                    let message = self.nativeSwitchMessage
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-                        guard self?.nativeSwitchMessage == message else { return }
-                        self?.nativeSwitchMessage = ""
-                        self?.rebuildMenu()
-                    }
+        post(path: "api/accounts/\(account.id)/activate") { [weak self] result in
+            guard let self = self else { return }
+            self.switchingAccountID = nil
+            switch result {
+            case .success(let data):
+                let body = try? JSONDecoder().decode(AccountActivationResponse.self, from: data)
+                self.nativeSwitchMessage = body?.native?.message ?? ""
+            case .failure(let error):
+                self.nativeSwitchMessage = ""
+                self.runtime.showError("Could not switch account", error.localizedDescription)
+            }
+            self.rebuildMenu()
+            self.fetchStateAsync()
+            if !self.nativeSwitchMessage.isEmpty {
+                let message = self.nativeSwitchMessage
+                self.runtime.schedule(8) { [weak self] in
+                    guard let self = self, !self.quitting, self.nativeSwitchMessage == message else { return }
+                    self.nativeSwitchMessage = ""
+                    self.rebuildMenu()
                 }
             }
-        }.resume()
+        }
     }
 
     func syncClaudeSessions() {
-        guard claudeSyncPhase != "running", !claudeSyncConfirming else { return }
+        #if !SWITCHER_LAYOUT_TEST
+        guard !quitting, claudeSyncPhase != "running", !claudeSyncConfirming else { return }
         claudeSyncConfirming = true
         menu.cancelTracking()
         NSApp.activate(ignoringOtherApps: true)
@@ -1452,58 +1684,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         claudeSyncPhase = "running"
         claudeSyncDetail = ""
         rebuildMenu()
-        var request = URLRequest(url: hubURL.appendingPathComponent("api/claude/sync"))
-        request.httpMethod = "POST"
-        request.timeoutInterval = 90
-        if let token = currentDeviceToken() { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            let body = data.flatMap { try? JSONDecoder().decode(ClaudeSyncResponse.self, from: $0) }
-            let ok = (response as? HTTPURLResponse)?.statusCode == 200 && body?.detail != nil
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.claudeSyncPhase = ok ? "success" : "error"
-                self.claudeSyncDetail = ok ? (body?.detail ?? "No new sessions to share") :
-                    [body?.error, body?.details, error?.localizedDescription,
-                     body?.result?.backup.map { "Backup: " + $0 }].compactMap { $0 }.joined(separator: "\n")
-                if self.claudeSyncDetail.isEmpty { self.claudeSyncDetail = "Could not reach Switcher. Try again." }
-                self.rebuildMenu()
-                if ok {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
-                        guard self?.claudeSyncPhase == "success", self?.claudeSyncGeneration == generation else { return }
-                        self?.claudeSyncPhase = "idle"
-                        self?.rebuildMenu()
-                    }
+        post(path: "api/claude/sync") { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let data):
+                let body = try? JSONDecoder().decode(ClaudeSyncResponse.self, from: data)
+                self.claudeSyncPhase = body?.detail == nil ? "error" : "success"
+                self.claudeSyncDetail = body?.detail ?? "Invalid session sync response"
+            case .failure(let error):
+                self.claudeSyncPhase = "error"
+                self.claudeSyncDetail = error.localizedDescription
+            }
+            self.rebuildMenu()
+            if self.claudeSyncPhase == "success" {
+                self.runtime.schedule(6) { [weak self] in
+                    guard let self = self, !self.quitting, self.claudeSyncPhase == "success",
+                          self.claudeSyncGeneration == generation else { return }
+                    self.claudeSyncPhase = "idle"
+                    self.rebuildMenu()
                 }
             }
-        }.resume()
+        }
+        #endif
     }
 
     @objc func showClaudeSyncError() {
-        let alert = NSAlert()
-        alert.messageText = "Claude session sync did not complete"
-        alert.informativeText = claudeSyncDetail
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+        runtime.showError("Claude session sync did not complete", claudeSyncDetail)
     }
 
     @objc func refreshUsage() {
-        post(path: "api/usage/refresh") { [weak self] in
-            DispatchQueue.main.async { self?.fetchStateAsync() }
+        guard !quitting, !usageRefreshRunning else { return }
+        usageRefreshRunning = true
+        refreshButton?.setBusy(true)
+        post(path: "api/usage/refresh") { [weak self] result in
+            guard let self = self else { return }
+            self.usageRefreshRunning = false
+            self.refreshButton?.setBusy(false)
+            switch result {
+            case .success:
+                self.menuActionMessage = "Usage refresh accepted"
+                self.fetchStateAsync()
+            case .failure(let error):
+                self.menuActionMessage = "Usage refresh failed"
+                self.runtime.showError("Could not refresh usage", error.localizedDescription)
+            }
+            self.rebuildMenu()
         }
     }
 
     @objc func openWebApp() {
+        #if !SWITCHER_LAYOUT_TEST
         NSWorkspace.shared.open(hubURL)
+        #endif
     }
 
     @objc func runUpdate() {
-        post(path: "api/update") { [weak self] in
-            // The server exec-restarts; give it a moment before re-reading.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.fetchStateAsync() }
+        guard !quitting, !updateActionRunning else { return }
+        let install = cachedState?.update?.update_available == true
+        updateActionRunning = true
+        updateGeneration += 1
+        let generation = updateGeneration
+        let oldVersion = cachedState?.version
+        menuActionMessage = install ? "Installing update…" : "Checking for updates…"
+        rebuildMenu()
+        post(path: install ? "api/update" : "api/update/check", timeout: install ? 330 : 30) { [weak self] result in
+            guard let self = self else { return }
+            if install {
+                if case .failure(let error) = result, (error as NSError).domain == "SwitcherHTTP" {
+                    self.finishUpdateFailure(error, install: true)
+                } else {
+                    self.awaitUpdatedServer(oldVersion: oldVersion, generation: generation, remaining: 20)
+                }
+                return
+            }
+            switch result {
+            case .success(let data):
+                struct CheckResponse: Decodable { let update: UpdateInfo? }
+                let flat = try? JSONDecoder().decode(UpdateInfo.self, from: data)
+                let nested = (try? JSONDecoder().decode(CheckResponse.self, from: data))?.update
+                guard let info = flat?.update_available != nil ? flat : nested, info.update_available != nil else {
+                    self.finishUpdateFailure(NSError(domain: "SwitcherHTTP", code: 0,
+                        userInfo: [NSLocalizedDescriptionKey: "Invalid update metadata response"]), install: false)
+                    return
+                }
+                self.updateActionRunning = false
+                self.menuActionMessage = info.update_available == true ? "Update available: \(info.latest ?? "new release")"
+                    : info.latest == nil ? "No update metadata available" : "No newer release available"
+                _ = self.beginStateRequest()
+                if let state = self.cachedState { self.applyMenuState(state.withUpdate(info)) }
+                else { self.fetchStateAsync() }
+                self.rebuildMenu()
+            case .failure(let error): self.finishUpdateFailure(error, install: false)
+            }
+        }
+    }
+
+    private func finishUpdateFailure(_ error: Error, install: Bool) {
+        updateActionRunning = false
+        menuActionMessage = install ? "Update installation failed" : "Update check failed"
+        rebuildMenu()
+        runtime.showError(install ? "Could not install update" : "Could not check for updates", error.localizedDescription)
+    }
+
+    private func awaitUpdatedServer(oldVersion: String?, generation: Int, remaining: Int) {
+        guard !quitting, updateGeneration == generation else { return }
+        guard remaining > 0 else {
+            finishUpdateFailure(NSError(domain: NSURLErrorDomain, code: URLError.timedOut.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for the updated server"]), install: true)
+            return
+        }
+        runtime.schedule(1.5) { [weak self] in
+            guard let self = self, !self.quitting, self.updateGeneration == generation else { return }
+            let serial = self.beginStateRequest()
+            self.performRequest(self.makeRequest(path: "api/state")) { [weak self] data, response, _ in
+                guard let self = self, !self.quitting, self.updateGeneration == generation else { return }
+                if (response as? HTTPURLResponse)?.statusCode == 200, let data = data,
+                   let state = try? JSONDecoder().decode(AppState.self, from: data),
+                   let version = state.version, version != oldVersion {
+                    self.updateActionRunning = false
+                    self.menuActionMessage = "Updated server to \(version)"
+                    _ = self.acceptStateResponse(state, serial: serial)
+                    self.rebuildMenu()
+                } else {
+                    self.awaitUpdatedServer(oldVersion: oldVersion, generation: generation, remaining: remaining - 1)
+                }
+            }
         }
     }
 
     @objc func toggleStartAtLogin() {
+        #if !SWITCHER_LAYOUT_TEST
         if startAtLoginEnabled() {
             try? FileManager.default.removeItem(atPath: launchAgentPath)
         } else {
@@ -1519,6 +1829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 try? data.write(to: URL(fileURLWithPath: launchAgentPath))
             }
         }
+        #endif
     }
 
     @objc func testResetAlert() {
@@ -1528,13 +1839,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         }
     }
 
+    private func stopOwnedServerForQuit() {
+        guard !quitting else { return }
+        quitting = true
+        recoveryGeneration += 1
+        updateGeneration += 1
+        _ = beginStateRequest()
+        serverProcess?.terminate()
+        serverProcess = nil
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        stopOwnedServerForQuit()
+    }
+
     @objc func quit() {
-        if let process = serverProcess, process.isRunning { process.terminate() }
-        NSApp.terminate(nil)
+        stopOwnedServerForQuit()
+        runtime.terminateApplication()
     }
 
     func startAtLoginEnabled() -> Bool {
-        FileManager.default.fileExists(atPath: launchAgentPath)
+        #if SWITCHER_LAYOUT_TEST
+        return false
+        #else
+        return FileManager.default.fileExists(atPath: launchAgentPath)
+        #endif
     }
 }
 
@@ -1598,7 +1927,7 @@ struct SwitcherApp {
         let delegate = AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.accessory) // menu bar app: no Dock icon
-        app.run()
+        withExtendedLifetime(delegate) { app.run() }
     }
 }
 #endif

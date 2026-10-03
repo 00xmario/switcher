@@ -129,6 +129,9 @@ func (p *Provider) LoginExchange(ctx context.Context, state, code string) (store
 		return store.Account{}, err
 	}
 	projectID, err := p.discoverProject(ctx, tok.AccessToken)
+	if ctx.Err() != nil {
+		return store.Account{}, ctx.Err()
+	}
 	if err != nil {
 		// Onboarding failed, but the tokens are valid: keep the account
 		// with no project id instead of discarding it. Usage reports
@@ -164,7 +167,11 @@ func (p *Provider) discoverProject(ctx context.Context, accessToken string) (str
 	if err != nil {
 		return "", err
 	}
-	return projectIDOf(id), nil
+	id = projectIDOf(id)
+	if id == "" {
+		return "", errors.New("cloud code onboarding returned an empty project")
+	}
+	return id, nil
 }
 
 type cloudcodeHTTPError struct{ status int }
@@ -188,9 +195,12 @@ func (p *Provider) cloudcodePost(ctx context.Context, accessToken, method string
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("gemini %s failed: %w", method, cloudcodeHTTPError{resp.StatusCode})
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		return fmt.Errorf("gemini %s: %w", method, err)
+	}
+	if len(raw) > 1<<20 {
+		return fmt.Errorf("gemini %s: response body too large", method)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("gemini %s response: %w", method, err)
@@ -225,6 +235,10 @@ func (p *Provider) AddByKey(ctx context.Context, key string) (store.Account, err
 
 // accountFromToken builds the stored account from a token exchange.
 func accountFromToken(tok googleauth.Token, email, projectID string) store.Account {
+	discoveryStatus := googleauth.ProjectDiscoveryDiscovered
+	if projectID == "" {
+		discoveryStatus = googleauth.ProjectDiscoveryFailed
+	}
 	acc := store.Account{
 		Provider:  "gemini",
 		Email:     email,
@@ -233,7 +247,10 @@ func accountFromToken(tok googleauth.Token, email, projectID string) store.Accou
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
 			ExpiresAt:    tok.ExpiresAt(),
-			Extra:        map[string]any{"project_id": projectID},
+			Extra: map[string]any{
+				"project_id":                         projectID,
+				googleauth.ProjectDiscoveryStatusKey: discoveryStatus,
+			},
 		},
 	}
 	sum := sha256.Sum256([]byte(acc.Provider + "|" + email + "|" + projectID))
@@ -281,6 +298,8 @@ func (p *Provider) UpstreamURL(path string) string {
 // ApplyAuth sets the headers the Cloud Code backend expects from the
 // Gemini CLI.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
+	req.Header.Del("X-Api-Key")
+	req.Header.Del("X-Goog-Api-Key")
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
 	req.Header.Set("X-Goog-Api-Client", apiClient)
 	req.Header.Set("User-Agent", userAgent)
@@ -331,15 +350,12 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 			if fraction == nil {
 				fraction = b.RemainingFraction2
 			}
-			if fraction == nil {
+			if fraction == nil || *fraction < 0 || *fraction > 1 {
 				continue
 			}
 			used := int((1 - *fraction) * 100)
-			if used < 0 {
-				used = 0
-			}
-			if used > 100 {
-				used = 100
+			if *fraction > 0 {
+				used = min(used, 99)
 			}
 			reset := b.ResetTime
 			if reset == "" {
@@ -361,24 +377,38 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	return provider.Usage{Available: true, Windows: windows}, nil
 }
 
-// ParseRateLimit implements provider.Provider. Cloud Code exhaustion
-// surfaces as a 429 or a RESOURCE_EXHAUSTED body; park until the latest
-// reset among exhausted windows, one hour when nothing is known.
+// ParseRateLimit requires confirmed depleted quota. A 429 or Google's
+// generic RESOURCE_EXHAUSTED status can also describe a burst limit.
 func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
-	if status != http.StatusTooManyRequests && !strings.Contains(string(body), "RESOURCE_EXHAUSTED") {
+	if status < 400 || ctx.Err() != nil || len(body) > 8<<10 {
 		return time.Time{}, false
 	}
-	usage, err := p.Usage(ctx, a)
-	if err != nil {
-		return time.Now().Add(time.Hour), true
+	if status != http.StatusTooManyRequests {
+		var payload struct {
+			Error struct {
+				Status string `json:"status"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &payload) != nil || payload.Error.Status != "RESOURCE_EXHAUSTED" {
+			return time.Time{}, false
+		}
 	}
+	usage, err := p.Usage(ctx, a)
+	if err != nil || !usage.Available || ctx.Err() != nil {
+		return time.Time{}, false
+	}
+	exhausted := false
 	var latest time.Time
 	for _, w := range usage.Windows {
-		if w.UsedPercent >= 100 && w.ResetsAt > 0 {
-			if t := time.Unix(w.ResetsAt, 0); t.After(latest) {
+		if w.UsedPercent >= 100 {
+			exhausted = true
+			if t := time.Unix(w.ResetsAt, 0); t.After(time.Now()) && t.After(latest) {
 				latest = t
 			}
 		}
+	}
+	if !exhausted {
+		return time.Time{}, false
 	}
 	if latest.IsZero() {
 		return time.Now().Add(time.Hour), true

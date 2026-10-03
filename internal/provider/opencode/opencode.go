@@ -102,6 +102,7 @@ func (p *Provider) UpstreamURL(path string) string {
 // ApplyAuth sets the Bearer authentication the Zen API expects.
 func (p *Provider) ApplyAuth(req *http.Request, a store.Account) error {
 	req.Header.Del("X-Api-Key")
+	req.Header.Del("X-Goog-Api-Key")
 	req.Header.Set("Authorization", "Bearer "+a.Token.AccessToken)
 	return nil
 }
@@ -143,7 +144,7 @@ func fetchUsage(ctx context.Context, key string) (usageSnapshot, error) {
 	req.Header.Set("Accept", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return usageSnapshot{}, provider.ErrUsageUnavailable
+		return usageSnapshot{}, fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -158,9 +159,12 @@ func fetchUsage(ctx context.Context, key string) (usageSnapshot, error) {
 			Monthly usageWindow `json:"monthly"`
 		} `json:"usage"`
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	resp.Body.Close()
-	if err != nil || json.Unmarshal(raw, &snap) != nil {
+	if err != nil {
+		return usageSnapshot{}, fmt.Errorf("%w: %w", provider.ErrUsageUnavailable, err)
+	}
+	if len(raw) > 1<<20 || json.Unmarshal(raw, &snap) != nil {
 		return usageSnapshot{}, provider.ErrUsageUnavailable
 	}
 	return usageSnapshot{
@@ -197,24 +201,29 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 	return provider.Usage{Available: true, Windows: windows}, nil
 }
 
-// ParseRateLimit implements provider.Provider. OpenCode reports
-// exhaustion through the usage windows; any 429 parks the account until
-// the earliest still-limited window resets.
+// ParseRateLimit requires a 429 and confirmed depleted usage. No distinct
+// OpenCode exhaustion error has been verified; a failed quota lookup must
+// not turn ordinary throttling into account exhaustion.
 func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status int, body []byte) (time.Time, bool) {
-	if status != http.StatusTooManyRequests {
+	if status != http.StatusTooManyRequests || ctx.Err() != nil || len(body) > 8<<10 {
 		return time.Time{}, false
 	}
 	snap, err := fetchUsage(ctx, a.Token.AccessToken)
-	if err != nil {
-		return time.Now().Add(time.Hour), true
+	if err != nil || ctx.Err() != nil {
+		return time.Time{}, false
 	}
+	exhausted := false
 	var latest int64
 	for _, w := range []usageWindow{snap.Rolling, snap.Weekly, snap.Monthly} {
 		if w.Percent >= 100 {
-			if t := parseISO(w.ResetsAt); t > latest {
+			exhausted = true
+			if t := parseISO(w.ResetsAt); t > time.Now().Unix() && t > latest {
 				latest = t
 			}
 		}
+	}
+	if !exhausted {
+		return time.Time{}, false
 	}
 	if latest == 0 {
 		latest = time.Now().Add(time.Hour).Unix()
@@ -222,7 +231,7 @@ func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status i
 	return time.Unix(latest, 0), true
 }
 
-// parseISO parses the Zen reset timestamps (RFC3339 or epoch seconds).
+// parseISO parses the Zen reset timestamps as RFC3339.
 func parseISO(s string) int64 {
 	if s == "" {
 		return 0

@@ -105,7 +105,21 @@ generation checks matter as much as the refresh request itself.
 
 ### Switcher's refresh and transaction recovery
 
-Before an inactive refresh POST, Switcher saves a private consumption intent.
+An expired active native login is refreshed using the verified locked live
+credential. The refresh locks serialize it with Claude Code's own refresh;
+the issued successor is retained before writes, then installed in the native
+stores and account record before the locks release. This follows upstream's
+`_fetch_active_usage` path. Always deferring an expired active login to Code
+strands idle clients and prevents quota checks, which caused the stale-usage
+regression in v0.5.6.
+
+Active recovery retains the native preimage and profile paths. It repairs a
+pending native write before usage observation, import, or manual switching,
+without restoring a consumed predecessor. Native identity and exact credential
+generations are fenced; unrelated project-setting changes stay in place.
+Known Keychain writer limits are checked before consuming the live grant.
+
+Before any refresh POST, Switcher saves a private consumption intent.
 An HTTP gateway error, timeout, lost response, or crash leaves that intent in
 place. Only a recognized OAuth rejection with HTTP 400, 401, or 403 clears it
 without an issued successor. A possibly consumed predecessor is never retried
@@ -124,7 +138,9 @@ durable consumption intent blocks reuse after a restart.
 Cleanup removes the intent before its sidecar. Explicit re-login archives old
 recovery files and any in-memory-only successor after the new login is saved.
 If archival fails, the bytes remain available and retirement is retried after
-storage repair. Imports keep native locks through account persistence to avoid
+storage repair. Re-importing the same native predecessor cannot clear an
+uncertain consumption intent; a genuinely new login can supersede it.
+Imports keep native locks through account persistence to avoid
 capturing one generation and saving it after a concurrent switch or refresh.
 
 Native switching saves an exact snapshot and a pending transaction before
@@ -156,7 +172,7 @@ not proof that an HTTP proxy transparently switches every native client.
 | Manual Claude selection | Changed only proxy `active["claude"]`. | Claude account action changes native Code credential/config plus proxy selection after verification. |
 | Claude CLI connection | Informational setup row; adding an account did not configure native routing. | Uses native credential stores directly. No `ANTHROPIC_BASE_URL` rewrite and no claim of a native request test. |
 | Credential import | Hardcoded unsuffixed Keychain read, extracted only OAuth token fields. | Correct profile store; full account-scoped credential and identity capture, verified from token identity. |
-| Active token rotations | Saved copy refreshed independently under Switcher-only mutex. | Reconcile verified native rotations; native-owned expired tokens defer to Code rather than consume its grant. |
+| Active token rotations | Saved copy refreshed independently under Switcher-only mutex. | Reconcile verified native rotations; expired live generations refresh under Claude locks and persist to native storage before release. |
 | Inactive token refresh | Ordinary provider POST/save. | Native ownership gate, compatible locks, bounded grant, durable successor recovery before another consumption. |
 | Shared MCP credentials | Not part of the stored account. | Preserve live shared fields during composition, never carry another account's device token. |
 | Config/history | Native config unchanged. | Splice `oauthAccount`, preserve projects/MCP/preferences. Actual transcripts and Desktop session indexes remain untouched. |
@@ -219,3 +235,13 @@ restart recovery, re-login retirement, auth, CSRF, and local-only mutations.
 No real native account switch or provider-quota request was used for these
 checks. Running-client adoption still depends on Claude Code's internal storage
 and cache contracts; it was not exercised with a live client session.
+
+The active-refresh hotfix adds a proxy/native integration regression that starts
+with an expired live login and stale quota, then verifies one coordinated grant
+replaces that quota with a fresh response. Native recovery tests also cover
+failed writes, restart, import and switch ordering, writer preflight, unrelated
+config updates, and unchanged-import consumption fences. The relevant race
+tests, Go suite, vet, and independent recovery review passed. A local installed
+build then passed the original forced-Recheck probe against the real usage
+endpoint. That probe renewed the existing native generation without changing
+the selected account and returned current quota; it sent no inference request.

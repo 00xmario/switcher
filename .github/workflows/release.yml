@@ -72,6 +72,10 @@ jobs:
           for attempt in 1 2 3; do
             hdiutil create -volname "Switcher $VERSION" -srcfolder "$STAGE" \
               -ov -format UDZO "dist/Switcher_${VERSION}.dmg" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "hdiutil failed after 3 attempts" >&2
+              exit 1
+            fi
             echo "hdiutil attempt $attempt failed; retrying in 5s"
             sleep 5
           done

@@ -56,6 +56,9 @@ func TestRefreshCredentialRejection(t *testing.T) {
 		t.Fatalf("missing token: %v", err)
 	}
 	status, body = http.StatusBadRequest, `{"error":"invalid_grant","secret":"do-not-log"}`
+	oldDefault := http.DefaultClient
+	http.DefaultClient = oauthHTTPClient
+	defer func() { http.DefaultClient = oldDefault }()
 	_, err := tokenRequest(context.Background(), tokenURL, []byte(`{}`))
 	if errors.Is(err, provider.ErrReloginRequired) || strings.Contains(err.Error(), "do-not-log") {
 		t.Fatalf("login exchange classified or leaked response: %v", err)

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import './app_flows_fixtures.mjs';
 
 // Exercise the actual async state handler without a browser or extra deps.
 const source = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
@@ -19,6 +20,7 @@ const pendingRechecks = new Map();
 const accountStatusAnnouncer = { textContent: '' };
 let renders = 0;
 const context = vm.createContext({
+  authState: { locked: false },
   data: null,
   lastRenderMinute: Math.floor(Date.now() / 60000),
   stateEpoch: 0,
@@ -105,11 +107,15 @@ assert.match(markup, /<div class="recover" title="Provider-reported reset:/);
 for (const missing of [null, 0, reset - 7200]) {
   const html = hover.windowHTML({ label: 'Session', used_percent: 20, resets_at: missing }, 'fake');
   assert.doesNotMatch(html, /Provider-reported reset:|<time class="reset-badge"/);
+  assert.doesNotMatch(html, /soon|a moment|\+20% in/);
 }
+assert.match(hover.windowHTML({ label: 'Session', used_percent: 100, resets_at: null }, 'fake'), /Reset time not reported/);
+assert.match(hover.windowHTML({ label: 'Session', used_percent: 100, resets_at: reset - 7200 }, 'fake'), /Reset time passed/);
 
 const accountContext = vm.createContext({
   data: { active: { codex: 'active-id' } },
   pendingRechecks: new Map(),
+  pendingActivations: new Set(),
   PLAN_NAMES: { pro: 'Pro 20x', prolite: 'Pro 5x' },
   ADD_METHOD: { codex: 'browser', opencode: 'key' },
   LOGOS: { codex: '<svg aria-hidden="true"></svg>' },
@@ -155,6 +161,7 @@ assert.match(compactCard, /⚡ 2 banked/);
 assert.equal((compactCard.match(/class="compact-window"/g) || []).length, 2);
 assert.match(compactCard, /Weekly[\s\S]*75% <span>left<\/span>[\s\S]*<time datetime="[^"]+" title="Provider-reported reset:/);
 assert.match(compactCard, /Session[\s\S]*0% <span>left<\/span>/);
+assert.match(compactCard, /Reset time not reported/);
 assert.match(compactCard, /aria-valuenow="75"/);
 assert.match(compactCard, /data-act="recheck"[\s\S]*Refresh quota[\s\S]*data-act="activate"/);
 assert.match(compactCard, /data-account-menu/);
@@ -169,10 +176,30 @@ assert.doesNotMatch(nativeNotSelected, /account-badge active-status/);
 const nativeSelected = accountContext.compactAccountHTML({ id: 'native-claude', provider: 'claude', email: 'fixture@example.test', native_switch_available: true, native_active: true });
 assert.match(nativeSelected, /account-badge active-status/);
 assert.doesNotMatch(nativeSelected, /data-act="activate"/);
+accountContext.pendingActivations.add('switching-claude');
+const switchingClaude = { id: 'switching-claude', provider: 'claude', email: 'fixture@example.test', native_switch_available: true, native_active: false };
+for (const html of [accountContext.accountHTML(switchingClaude), accountContext.compactAccountHTML(switchingClaude), accountContext.accountMenuHTML(switchingClaude)]) {
+  assert.match(html, /data-act="activate"[^>]*disabled aria-busy="true"[^>]*>Switching…/,
+    'replacement card and menu controls must retain the pending activation');
+}
+accountContext.pendingActivations.clear();
+accountContext.data.active.claude = 'proxy-claude';
+const proxyClaude = { id: 'proxy-claude', provider: 'claude', email: 'proxy@example.test', native_switch_available: true, native_active: false };
+const nativeClaude = { ...proxyClaude, id: 'native-claude', email: 'native@example.test', native_active: true };
+for (const renderAccount of [accountContext.accountHTML, accountContext.compactAccountHTML]) {
+  const proxyCard = renderAccount(proxyClaude), nativeCard = renderAccount(nativeClaude);
+  assert.match(proxyCard, /Proxy active/);
+  assert.doesNotMatch(proxyCard, /account-state">Idle|Claude Code active/);
+  assert.match(nativeCard, /Claude Code active/);
+  assert.doesNotMatch(nativeCard, /Proxy active/);
+  assert.match(renderAccount({ ...nativeClaude, id: 'proxy-claude' }), /Claude Code active[\s\S]*Proxy active/,
+    'matching native and proxy selections must still be identified independently');
+}
 
 let compactPage = false;
 const providersEl = { hidden: false, innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
 const renderContext = vm.createContext({
+  authState: { locked: false },
   patchProviderList: (container, html) => { container.innerHTML = html; },
   resetFeedback: { repaint: () => {} },
   data: { active: {}, compact_accounts: true, accounts: [
@@ -181,6 +208,7 @@ const renderContext = vm.createContext({
   providersEl, activeAccountMenu: null,
   usagePage: { hidden: true }, settingsPage: { hidden: true },
   renderSettings: () => {},
+  loadUsage: () => {},
   document: {
     activeElement: null,
     body: { classList: { toggle: (_, enabled) => { compactPage = enabled; } } },

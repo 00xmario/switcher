@@ -418,13 +418,14 @@ func TestIsExpired(t *testing.T) {
 
 func TestParseRateLimit(t *testing.T) {
 	tomorrow := time.Now().Add(24 * time.Hour).Format("2006-01-02")
+	used := 300
 	stubEndpoints(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/copilot_internal/user" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		fmt.Fprintf(w, `{"copilot_plan":"pro","quota_reset_date":%q,
-			"quota_snapshots":{"premium_interactions":{"entitlement":300,"used":300}}}`, tomorrow)
+			"quota_snapshots":{"premium_interactions":{"entitlement":300,"used":%d}}}`, tomorrow, used)
 	})
 
 	p := New()
@@ -442,6 +443,7 @@ func TestParseRateLimit(t *testing.T) {
 	if _, exhausted := p.ParseRateLimit(context.Background(), acc, http.StatusBadRequest, nil); exhausted {
 		t.Fatal("other statuses must never exhaust the account")
 	}
+	used = 150
 	if _, exhausted := p.ParseRateLimit(context.Background(), acc,
 		http.StatusTooManyRequests, []byte(`{"error":"other"}`)); exhausted {
 		t.Fatal("a 429 without a quota body must not exhaust the account")

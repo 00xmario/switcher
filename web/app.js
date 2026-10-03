@@ -1,6 +1,7 @@
 import { createClaudeSync } from './claude-sync.js';
 import { patchProviderList, createResetFeedback, mergeAccountMutation } from './account-updates.js';
 import { createAppearance } from './themes.js';
+import { createDesktopRelay, desktopRelayLoopback } from './desktop-relay.js';
 
 const providersEl = document.getElementById('providers');
 const resetFeedback = createResetFeedback({ getCard: id => [...providersEl.querySelectorAll('.account')].find(card => card.dataset.id === id) });
@@ -11,7 +12,7 @@ const claudeSessionSync = createClaudeSync({
     confirmLabel: 'Sync sessions',
     initialFocus: 'cancel',
   }),
-  request: () => fetchWithCSRF('/api/claude/sync', { method: 'POST' }),
+  request: () => fetchWithCSRF('/api/claude/sync', { method: 'POST', timeoutMs: 90000 }),
   paint: () => {
     const control = providersEl.querySelector('.claude-sync-control');
     if (control) control.outerHTML = claudeSessionSync.html();
@@ -106,52 +107,212 @@ const ADD_METHOD = { codex: 'browser', claude: 'browser', grok: 'device', openco
 
 /* ---------- helpers ---------- */
 
-let authState = { enabled: false, locked: false };
+let authState = { enabled: false, locked: false, loggingOut: false };
+let authReady = null;
+let sessionCSRF = '';
+const dashboardRequests = new Set();
+const logoutState = { csrf: '', busy: false, completed: false, view: null, message: '' };
+
+function csrfToken() {
+  try { return localStorage.getItem('switcher-csrf') || sessionCSRF; }
+  catch { return sessionCSRF; }
+}
+
+function hydrateAuthStatus(status) {
+  if (authState.loggingOut) return;
+  authState.enabled = status.auth_enabled === true;
+  if (typeof status.csrf === 'string' && status.csrf) {
+    sessionCSRF = status.csrf;
+    try { localStorage.setItem('switcher-csrf', status.csrf); } catch { /* keep the session token in memory */ }
+  } else if (!authState.enabled) {
+    sessionCSRF = '';
+    try { localStorage.removeItem('switcher-csrf'); } catch { /* storage can be unavailable */ }
+  }
+}
+
+function ensureAuthReady() {
+  if (authState.loggingOut) return Promise.reject(new Error('Logout in progress'));
+  if (!authReady) {
+    authReady = api('/api/auth/status').then(status => {
+      if (status.auth_enabled && !csrfToken()) {
+        authLocked();
+        throw new Error('Authentication required');
+      }
+      return status;
+    }).catch(error => { authReady = null; throw error; });
+  }
+  return authReady;
+}
 
 async function api(path, options = {}) {
-  // Cookie-authenticated state-changing requests must carry the CSRF
-  // token; attach it automatically so every call site stays simple.
-  if (options.method && options.method !== 'GET' && options.method !== 'HEAD') {
-    const csrf = localStorage.getItem('switcher-csrf');
-    if (csrf) {
-      options.headers = { 'X-Switcher-CSRF': csrf, ...(options.headers || {}) };
-    }
+  const res = await fetchWithCSRF(path, options);
+  const body = await res.json();
+  if (authState.locked && !isLogoutRetry(path, options)) throw new Error('Authentication required');
+  if (!res.ok) {
+    const error = new Error(errorMessage(body, res.statusText));
+    error.status = res.status;
+    error.body = body;
+    throw error;
   }
-  const res = await fetch(path, options);
-  const body = await res.json().catch(() => ({}));
-  if (res.status === 401 && body.auth_required) {
-    authLocked();
-    throw new Error('Authentication required');
-  }
-  if (!res.ok) throw new Error(errorMessage(body, res.statusText));
+  if (path === '/api/auth/status') hydrateAuthStatus(body);
   return body;
+}
+
+function isLogoutRetry(path, options) {
+  return authState.loggingOut && !logoutState.completed && path === '/api/auth/logout' && options.method === 'POST';
+}
+
+function renderLogoutView(message = logoutState.message) {
+  logoutState.message = message;
+  if (!logoutState.view) {
+    const view = document.createElement('main');
+    view.id = 'logout-page';
+    view.className = 'logout-page';
+    view.innerHTML = `<section class="logout-card" aria-labelledby="logout-title">
+      <h1 id="logout-title"></h1>
+      <p id="logout-status" role="status" aria-live="polite"></p>
+      <button type="button" data-logout-retry>Retry logout</button>
+    </section>`;
+    document.body.replaceChildren(view);
+    logoutState.view = view;
+    view.querySelector('[data-logout-retry]').addEventListener('click', logoutHere);
+  }
+  const view = logoutState.view;
+  view.querySelector('#logout-title').textContent = logoutState.completed ? 'Logged out' : logoutState.busy ? 'Logging out…' : 'Logout not confirmed';
+  view.querySelector('#logout-status').textContent = message;
+  const button = view.querySelector('[data-logout-retry]');
+  button.disabled = logoutState.busy || logoutState.completed;
+  button.setAttribute('aria-busy', String(logoutState.busy));
+  if (!button.disabled) button.focus({ preventScroll: true });
+}
+
+function clearPrivateDashboard() {
+  stateEpoch++;
+  pollRequest++;
+  clearTimeout(stateTimer);
+  clearTimeout(usageTimer);
+  clearTimeout(usageState.timer);
+  stateTimer = usageTimer = usageState.timer = null;
+  usageState.generation++;
+  usageState.summary = null;
+  usageState.summaryDays = null;
+  data = { accounts: [], active: {}, order: [], hidden: [] };
+  pendingRechecks.clear();
+  pendingActivations.clear();
+  settingsPage.desktopRelay?.clear();
+  closeAccountMenu();
+  for (const node of [providersEl, settingsPage, usagePage, usageHeadline, usageSub,
+    usageProviders, usageTotals, usageChartBox, usageChartTitle, usageBreakdownTable, accountStatusAnnouncer]) node.replaceChildren();
+}
+
+async function logoutHere() {
+  if (logoutState.busy || logoutState.completed || (authState.locked && !authState.loggingOut)) return;
+  if (!authState.loggingOut) {
+    // Freeze access before cancelling requests. Their late completions must
+    // neither restore the dashboard nor clear the logout-only retry proof.
+    logoutState.csrf = sessionCSRF || csrfToken();
+    sessionCSRF = logoutState.csrf;
+    authState.loggingOut = true;
+    authState.locked = true;
+    clearPrivateDashboard();
+  }
+  logoutState.busy = true;
+  renderLogoutView('The private dashboard has been cleared. Saving logout…');
+  for (const controller of dashboardRequests) controller.abort();
+  dashboardRequests.clear();
+  try {
+    const res = await fetchWithCSRF('/api/auth/logout', {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store', timeoutMs: 15000,
+    });
+    const body = await res.json();
+    if (!res.ok || res.status !== 200 || body?.status !== 'ok') {
+      renderLogoutView(res.status === 500
+        ? 'Switcher could not save the logout. The dashboard is closed. Repair the storage problem, then retry logout.'
+        : res.status === 401 || res.status === 403
+          ? 'Logout could not be confirmed. The logout-only retry proof may have expired or been rejected. The dashboard remains closed.'
+          : 'Logout could not be confirmed. The dashboard is closed. Retry logout when Switcher is available.');
+      return;
+    }
+    logoutState.completed = true;
+    logoutState.csrf = sessionCSRF = '';
+    try { localStorage.removeItem('switcher-csrf'); } catch { /* the in-memory proof is already cleared */ }
+    renderLogoutView('Logout saved. Returning to login…');
+    location.replace('/login');
+  } catch (error) {
+    renderLogoutView(error.name === 'TimeoutError'
+      ? 'The logout request timed out. The dashboard is closed. No retry was sent automatically. Retry logout to confirm it.'
+      : 'Logout could not be confirmed. The dashboard is closed. No retry was sent automatically. Retry logout when Switcher is available.');
+  } finally {
+    logoutState.busy = false;
+    renderLogoutView();
+  }
 }
 
 // Once a session expires, leave the app document entirely. A removable DOM
 // overlay must never be the boundary protecting account information.
 function authLocked() {
-  if (authState.locked) return;
+  if (authState.loggingOut || authState.locked) return;
   authState.locked = true;
+  if (typeof settingsPage !== 'undefined') settingsPage.desktopRelay?.clear();
   clearInterval(stateTimer);
   usageTimer && clearTimeout(usageTimer);
-  localStorage.removeItem('switcher-csrf');
+  sessionCSRF = '';
+  try { localStorage.removeItem('switcher-csrf'); } catch { /* navigation still protects the document */ }
   location.replace('/login');
 }
 
-// fetchWithCSRF attaches the CSRF token to state-changing requests when a
-// token is known.
-function fetchWithCSRF(path, options = {}) {
-  const csrf = localStorage.getItem('switcher-csrf') || '';
-  return fetch(path, {
-    ...options,
-    headers: { ...(options.headers || {}), 'X-Switcher-CSRF': csrf },
-  });
+// Buffer the small dashboard response under one deadline, including body
+// reads. All callers get the same CSRF and expired-session handling.
+async function fetchWithCSRF(path, options = {}) {
+  const logoutOnly = isLogoutRetry(path, options);
+  if (authState.locked && !logoutOnly) throw new Error('Authentication required');
+  const mutation = options.method && !['GET', 'HEAD'].includes(options.method);
+  const { timeoutMs = mutation ? 90000 : 15000, controllerKey, ...requestOptions } = options;
+  if (mutation && !logoutOnly) await ensureAuthReady();
+  if (authState.locked && !logoutOnly) throw new Error('Authentication required');
+  const controller = new AbortController();
+  if (!logoutOnly) dashboardRequests.add(controller);
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  const abort = () => controller.abort();
+  requestOptions.signal?.addEventListener('abort', abort, { once: true });
+  if (requestOptions.signal?.aborted) abort();
+  try {
+    const res = await fetch(path, {
+      credentials: 'same-origin',
+      ...requestOptions, signal: controller.signal,
+      headers: { ...(requestOptions.headers || {}),
+        ...(controllerKey ? { 'X-Switcher-Desktop-Control': controllerKey } : {}),
+        'X-Switcher-CSRF': logoutOnly ? logoutState.csrf : csrfToken() },
+    });
+    const body = await res.json().catch(error => {
+      if (controller.signal.aborted) throw error;
+      return {};
+    });
+    if (authState.locked && !logoutOnly) throw new Error('Authentication required');
+    if (res.status === 401 && body?.auth_required && !logoutOnly) {
+      authLocked();
+      throw new Error('Authentication required');
+    }
+    return { ok: res.ok, status: res.status, statusText: res.statusText, json: async () => body };
+  } catch (error) {
+    if (timedOut) {
+      const timeoutError = new Error('Request timed out. Try again.');
+      timeoutError.name = 'TimeoutError';
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    dashboardRequests.delete(controller);
+    clearTimeout(timeout);
+    requestOptions.signal?.removeEventListener('abort', abort);
+  }
 }
 
 function errorMessage(body, fallback) {
   if (!body || body.error === undefined) return fallback || 'Request failed';
   if (typeof body.error === 'string') return body.error;
-  return body.error.message || fallback || 'Request failed';
+  return body.error?.message || fallback || 'Request failed';
 }
 
 function escapeHTML(s) {
@@ -162,7 +323,7 @@ function escapeHTML(s) {
 
 // fmtRemaining renders a countdown the way T3 does: "6d 23h", "3h 44m".
 function fmtRemaining(untilUnix) {
-  if (!untilUnix || untilUnix <= 0) return null; // no reset time reported
+  if (!Number.isFinite(untilUnix) || untilUnix <= 0) return null; // no reset time reported
   let ms = untilUnix * 1000 - Date.now();
   if (ms <= 0) return null; // window already rolled; upstream will refresh soon
   const m = Math.floor(ms / 60000);
@@ -188,7 +349,13 @@ function resetTime(untilUnix, description = 'Provider-reported reset') {
   };
 }
 
+function unknownResetText(untilUnix) {
+  return Number.isFinite(untilUnix) && untilUnix > 0 && untilUnix <= Date.now() / 1000
+    ? 'Reset time passed · awaiting usage update' : 'Reset time not reported';
+}
+
 function toast(message) {
+  if (authState.locked) return;
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = message;
@@ -199,11 +366,12 @@ function toast(message) {
 /* ---------- rendering ---------- */
 
 async function refreshState() {
+  if (authState.locked) return;
   const epoch = stateEpoch;
   const request = ++stateRequestId;
   try {
     const next = await api('/api/state');
-    if (epoch !== stateEpoch || request < lastAppliedStateRequestId) return;
+    if (authState.locked || epoch !== stateEpoch || request < lastAppliedStateRequestId) return;
     lastAppliedStateRequestId = request;
     const completed = settleRechecks(next.accounts);
     const minute = Math.floor(Date.now() / 60000);
@@ -216,7 +384,7 @@ async function refreshState() {
       renderAddProviderMenu();
     }
   } catch (err) {
-    toast('Could not reach Switcher: ' + err.message);
+    if (!authState.locked) toast('Could not reach Switcher: ' + err.message);
   }
 }
 
@@ -234,6 +402,7 @@ let stateEpoch = 0;
 let stateRequestId = 0;
 let lastAppliedStateRequestId = 0;
 const pendingRechecks = new Map(); // account id -> { accepted: bool }
+const pendingActivations = new Set();
 let activeAccountMenu = null;
 const accountStatusAnnouncer = document.createElement('div');
 accountStatusAnnouncer.className = 'sr-only';
@@ -295,11 +464,9 @@ function windowHTML(win, providerID) {
   const exact = remaining ? resetTime(win.resets_at) : null;
   const exactTitle = exact ? ` title="${escapeHTML(exact.title)}"` : '';
   const exactDate = exact ? ` datetime="${exact.iso}"` : '';
-  // A window at 100% with no reported reset time has nothing to count
-  // down: the badge would only say "soon", which is a guess, so hide it.
-  const resetText = remaining ? `↻ ${remaining}` : (left < 100 ? '↻ soon' : '');
-  const recovery = left < 100
-    ? `<div class="recover"${exactTitle}>↻ +${used}% in ${remaining || 'a moment'}</div>`
+  const resetText = exact ? `↻ ${remaining}` : unknownResetText(win.resets_at);
+  const recovery = left < 100 && exact
+    ? `<div class="recover"${exactTitle}>↻ +${used}% in ${remaining}</div>`
     : '';
   const color = PROVIDER_BAR_COLORS[providerID] || 'var(--text)';
   const fill = `<div class="fill" style="width:${left}%; background-color:${color}"></div>`;
@@ -321,6 +488,7 @@ function windowHTML(win, providerID) {
 
 function accountHTML(account) {
   const isActive = accountIsSelected(account);
+  const activationPending = pendingActivations.has(account.id);
   const status = statusOf(account);
   const recheckPending = pendingRechecks.has(account.id);
   const health = recheckPending
@@ -342,7 +510,6 @@ function accountHTML(account) {
           ${accountIdentityHTML(account, isActive)}
           <div class="meta">
             ${plan ? `<span>${escapeHTML(plan)}</span>` : ''}
-            ${account.native_switch_available && account.id === data.active?.claude && !isActive ? '<span>Proxy active</span>' : ''}
             ${status.cls === 'exhausted' ? '<span class="routing-warning">Out of usage</span>' : ''}
             ${account.reset_credits?.count > 0 ? `<span class="banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
           </div>
@@ -352,7 +519,7 @@ function accountHTML(account) {
           <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-label="Recheck account usage" title="Recheck usage" aria-disabled="${recheckPending}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
           </button>
-          ${isActive ? '' : `<button class="use" data-act="activate" ${account.native_switch_available ? 'title="Switch Claude Code’s native login and Switcher’s Claude proxy"' : ''}>${account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
+          ${isActive ? '' : `<button class="use" data-act="activate" ${activationPending ? 'disabled aria-busy="true"' : ''} ${account.native_switch_available ? 'title="Switch Claude Code’s native login and Switcher’s Claude proxy"' : ''}>${activationPending ? 'Switching…' : account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
           <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
         </div>
       </div>
@@ -369,7 +536,7 @@ function compactWindowHTML(win) {
       <div class="compact-window-head">
         <span class="compact-window-name">${escapeHTML(win.label)}</span>
         <strong class="${left <= 20 ? 'low-quota' : ''}">${left}% <span>left</span></strong>
-        ${exact ? `<time datetime="${exact.iso}" title="${escapeHTML(exact.title)}">${escapeHTML(exact.short)}</time><span class="compact-reset-relative">· in ${remaining}</span>` : ''}
+        ${exact ? `<time datetime="${exact.iso}" title="${escapeHTML(exact.title)}">${escapeHTML(exact.short)}</time><span class="compact-reset-relative">· in ${remaining}</span>` : `<span class="compact-reset-relative">${unknownResetText(win.resets_at)}</span>`}
       </div>
       <div class="compact-track" role="progressbar" aria-label="${escapeHTML(win.label)} quota remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${left}">
         <span class="compact-fill ${left <= 20 ? 'low' : ''}" style="width:${left}%"></span>
@@ -390,6 +557,7 @@ function compactCreditsHTML(credits) {
 
 function compactAccountHTML(account) {
   const isActive = accountIsSelected(account);
+  const activationPending = pendingActivations.has(account.id);
   const status = statusOf(account);
   const recheckPending = pendingRechecks.has(account.id);
   const health = recheckPending ? { condition: 'checking' } : (account.health || { condition: 'checking' });
@@ -416,15 +584,21 @@ function compactAccountHTML(account) {
         <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-disabled="${recheckPending}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>Refresh quota
         </button>
-        ${isActive ? '' : `<button class="use" data-act="activate">${account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
+        ${isActive ? '' : `<button class="use" data-act="activate" ${activationPending ? 'disabled aria-busy="true"' : ''}>${activationPending ? 'Switching…' : account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
       </div>
     </div>`;
 }
 
 function accountIdentityHTML(account, active) {
+  const proxyActive = account.id === data.active?.[account.provider];
+  const native = account.native_switch_available === true;
+  const badge = (text, cls = '') => `<span class="account-badge ${cls}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>${text}</span>`;
+  const indicators = native
+    ? `${active ? badge('Claude Code active', 'active-status') : ''}${proxyActive ? badge('Proxy active', 'proxy-status') : ''}`
+    : active ? badge('Active', 'active-status') : '';
   return `<div class="identity-line">
     <div class="email" tabindex="0">${escapeHTML(account.email)}</div>
-    ${active ? '<span class="account-badge active-status"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>Active</span>' : '<span class="account-state">Idle</span>'}
+    ${indicators || '<span class="account-state">Idle</span>'}
   </div>`;
 }
 
@@ -436,7 +610,7 @@ function accountMenuHTML(account) {
   const mode = account.auto_use_reset || 'global';
   const labels = { global: 'Global', on: 'On', off: 'Off' };
   return `
-    ${account.native_switch_available ? `<button type="button" role="menuitem" data-act="activate" data-account-id="${escapeHTML(account.id)}">Use in Claude Code</button>` : ''}
+    ${account.native_switch_available ? `<button type="button" role="menuitem" data-act="activate" data-account-id="${escapeHTML(account.id)}" ${pendingActivations.has(account.id) ? 'disabled aria-busy="true"' : ''}>${pendingActivations.has(account.id) ? 'Switching…' : 'Use in Claude Code'}</button>` : ''}
     ${account.reset_credits?.count > 0 ? `<button type="button" role="menuitem" data-act="use-reset" data-account-id="${escapeHTML(account.id)}" data-credit-id="${escapeHTML(account.reset_credits.next_id || '')}" ${account.last_reset?.pending ? 'disabled title="Refreshing quota after the last reset"' : ''}>Use reset</button>` : ''}
     ${account.supports_banked_resets ? `
       <div class="menu-auto-reset" role="group" aria-label="Auto-use reset, currently ${account.auto_use_reset_effective ? 'on' : 'off'}">
@@ -455,16 +629,17 @@ function updateBannerHTML() {
   const info = data.update;
   if (!info || !info.update_available) return '';
   return `
-    <div class="update-banner">
+    <div class="update-banner ${updateRunning ? 'updating' : ''}">
       <span class="update-text">
         <strong>Switcher ${escapeHTML(info.latest)}</strong> is available
         (you are running ${escapeHTML(data.version)})
       </span>
-      <button class="update-install" data-act="install-update">Install &amp; restart</button>
+      <button class="update-install" data-act="install-update" ${updateRunning ? 'disabled' : ''}>${updateRunning ? 'Installing…' : 'Install &amp; restart'}</button>
     </div>`;
 }
 
 function render() {
+  if (authState.locked) return;
   const compact = data.compact_accounts === true;
   document.body.classList.toggle('compact-account-view', compact);
   const focusedRecheck = document.activeElement?.matches?.('button[data-act="recheck"]')
@@ -534,6 +709,7 @@ function render() {
     card?.querySelector('[data-account-menu]')?.focus({ preventScroll: true });
   }
   if (activeAccountMenu) positionAccountMenu(activeAccountMenu.menu, activeAccountMenu.anchor);
+  settingsPage.desktopRelay?.update();
 }
 
 /* ---------- usage ---------- */
@@ -554,6 +730,7 @@ function scheduleUsage() {}
 
 // openProviderMenu shows a small dropdown with per-provider actions.
 function openProviderMenu(anchor, providerID) {
+  if (authState.locked) return;
   document.querySelector('.prov-menu')?.remove();
   const name = PROVIDER_NAMES[providerID] || providerID;
   const menu = document.createElement('div');
@@ -614,6 +791,7 @@ function positionAccountMenu(menu, anchor) {
 }
 
 function openAccountMenu(anchor, account) {
+  if (authState.locked) return;
   closeAccountMenu();
   document.querySelector('.prov-menu')?.remove();
   const menu = document.createElement('div');
@@ -657,6 +835,7 @@ function openAccountMenu(anchor, account) {
 
 // "Add provider" button in the header: lists removed providers.
 function renderAddProviderMenu() {
+  if (authState.locked) return;
   const host = document.getElementById('add-provider-slot');
   if (!host) return;
   if (typeof data.hidden !== 'object' || !Array.isArray(data.hidden)) data.hidden = [];
@@ -714,26 +893,34 @@ providersEl.addEventListener('click', async (event) => {
 });
 
 async function runAccountAction(button) {
+  if (authState.locked) return;
   if (button.disabled || button.getAttribute('aria-disabled') === 'true') return;
   const id = button.dataset.accountId || button.closest('.account')?.dataset.id;
   if (!id) return;
   try {
     if (button.dataset.act === 'activate') {
+      if (pendingActivations.has(id)) return;
+      pendingActivations.add(id);
       button.disabled = true;
+      render();
       try {
-        const response = await fetchWithCSRF(`/api/accounts/${id}/activate`, { method: 'POST' });
+        const response = await fetchWithCSRF(`/api/accounts/${id}/activate`, { method: 'POST', timeoutMs: 90000 });
         const result = await response.json();
         if (!response.ok) {
-          if (result.details) await confirmDialog({ title: result.error || 'Account switch failed',
+          if (result.details) await confirmDialog({ title: errorMessage(result, 'Account switch failed'),
             message: [result.details, result.backup && `Backup: ${result.backup}`].filter(Boolean).join('\n'),
             confirmLabel: 'Close', cancelLabel: 'Close', initialFocus: 'cancel' });
-          else throw new Error(result.error || 'Account switch failed');
+          else throw new Error(errorMessage(result, 'Account switch failed'));
           return;
         }
         stateEpoch++;
         if (result.native?.message) toast(result.native.message);
         await refreshState();
-      } finally { button.disabled = false; }
+      } finally {
+        pendingActivations.delete(id);
+        button.disabled = false;
+        render();
+      }
     } else if (button.dataset.act === 'recheck') {
       pendingRechecks.set(id, { accepted: false });
       const account = data.accounts.find(a => a.id === id);
@@ -863,12 +1050,14 @@ providersEl.addEventListener('dragover', (event) => {
 // keychain), and falls back to the browser flow otherwise. Shared by
 // "Add account" and "Relogin".
 async function startProviderLogin(providerID, reloginOf) {
+  if (authState.locked) return;
   try {
     const imported = await api('/api/login/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: providerID, relogin_of: reloginOf || undefined }),
     });
+    if (authState.locked) return;
     if (imported.status === 'ok' && imported.account) {
       if (reloginOf) pendingRechecks.delete(reloginOf);
       toast(`Imported the ${PROVIDER_NAMES[providerID] || providerID} CLI login: ${imported.account.email}`);
@@ -877,11 +1066,13 @@ async function startProviderLogin(providerID, reloginOf) {
       return;
     }
   } catch { /* fall through to the interactive flow */ }
+  if (authState.locked) return;
   const login = await api('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ provider: providerID, relogin_of: reloginOf || undefined }),
   });
+  if (authState.locked) return;
   if (login.kind === 'device') {
     showDeviceModal(login.verification_url, login.user_code, `Sign in to ${PROVIDER_NAMES[providerID] || providerID}`);
   } else {
@@ -950,7 +1141,7 @@ document.addEventListener('click', (event) => {
 // the user can always click "Add account" again immediately.
 async function pollLogin(state, reloginOf) {
   const deadline = Date.now() + 5 * 60 * 1000;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !authState.locked) {
     try {
       const res = await api(`/api/login/${state}`);
       if (res.status === 'done') {
@@ -971,16 +1162,20 @@ async function pollLogin(state, reloginOf) {
     } catch {
       // Transient network hiccup while polling: keep trying.
     }
+    if (authState.locked) return;
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
-  document.querySelector('.device-overlay')?.remove();
-  toast('Login timed out');
+  if (!authState.locked) {
+    document.querySelector('.device-overlay')?.remove();
+    toast('Login timed out');
+  }
 }
 
 // showDeviceModal presents a device code and a link to the verification
 // page; keep it on screen until the login resolves. providerTitle names the
 // provider ("Sign in to Grok").
 function showDeviceModal(verifyURL, userCode, providerTitle) {
+  if (authState.locked) return;
   const title = providerTitle || 'Sign in';
   const overlay = document.createElement('div');
   overlay.className = 'device-overlay';
@@ -1012,6 +1207,7 @@ function showDeviceModal(verifyURL, userCode, providerTitle) {
 // confirmDialog is the in-app replacement for window.confirm: themed,
 // keyboard-friendly, and destructive actions get their own styling.
 function confirmDialog({ title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, logoHTML = '', initialFocus = 'confirm' }) {
+  if (authState.locked) return Promise.resolve(false);
   return new Promise(resolve => {
     const previousFocus = document.activeElement;
     const overlay = document.createElement('div');
@@ -1054,6 +1250,7 @@ function confirmDialog({ title, message, confirmLabel = 'Confirm', cancelLabel =
 
 // promptKey asks for an API key inline (a real dialog beats prompt()).
 function promptKey(name) {
+  if (authState.locked) return Promise.resolve(null);
   return new Promise(resolve => {
     const overlay = document.createElement('div');
     overlay.className = 'device-overlay';
@@ -1084,6 +1281,7 @@ function promptKey(name) {
 // askPassword is the in-app replacement for prompt() when a password is
 // collected: masked input, themed modal, null on cancel.
 function askPassword(title, subtitle, submitLabel = 'Confirm') {
+  if (authState.locked) return Promise.resolve(null);
   return new Promise(resolve => {
     const overlay = document.createElement('div');
     overlay.className = 'device-overlay confirm-overlay';
@@ -1117,6 +1315,7 @@ function askPassword(title, subtitle, submitLabel = 'Confirm') {
 // hub" dialog asks for: the hub URL and the management key.
 document.addEventListener('click', (event) => {
   if (!event.target.closest('#hub-button')) return;
+  if (authState.locked) return;
   document.querySelector('.hub-modal')?.remove();
   const overlay = document.createElement('div');
   overlay.className = 'device-overlay';
@@ -1147,7 +1346,7 @@ document.addEventListener('click', (event) => {
 let updateRunning = false;
 
 async function runUpdateFlow(button) {
-  if (updateRunning) return;
+  if (authState.locked || updateRunning) return;
   updateRunning = true;
   const oldVersion = data.version;
   const banner = button.closest('.update-banner');
@@ -1156,33 +1355,43 @@ async function runUpdateFlow(button) {
   button.textContent = 'Installing...';
   banner.classList.add('updating');
   try {
-    // The server downloads, swaps, and exec-restarts: the response often
-    // never arrives. Fire the request, then poll for the version change.
-    api('/api/update', { method: 'POST' }).catch(() => {});
-    const deadline = Date.now() + 45000;
+    // A successful exec can disconnect the request. A completed HTTP error
+    // is definitive and must interrupt both the delay and state polling.
+    let installError, fail;
+    const failure = new Promise(resolve => { fail = resolve; });
+    api('/api/update', { method: 'POST', timeoutMs: 330000 }).catch(error => {
+      if (error.status || error.name === 'TimeoutError' || authState.locked) {
+        installError = error;
+        fail();
+      }
+    });
+    const deadline = Date.now() + 360000;
     while (Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      try {
-        const res = await fetch('/api/state');
-        const next = await res.json();
-        if (next.version && next.version !== oldVersion) {
-          data = next;
-          render();
-          renderAddProviderMenu();
-          toast(`Updated to Switcher v${next.version}`);
-          return;
-        }
-      } catch { /* mid-restart, keep polling */ }
+      await Promise.race([failure, new Promise(resolve => setTimeout(resolve, 1500))]);
+      if (installError) throw installError;
+      const result = await Promise.race([failure, api('/api/state', { timeoutMs: 5000 })
+        .then(next => ({ next }), error => ({ error }))]);
+      if (installError) throw installError;
+      if (authState.locked) throw new Error('Authentication required');
+      const next = result?.next;
+      if (next?.version && next.version !== oldVersion) {
+        stateEpoch++;
+        data = next;
+        render();
+        renderAddProviderMenu();
+        toast(`Updated to Switcher v${next.version}`);
+        return;
+      }
     }
-    toast('Update is still downloading; check again in a minute');
-    await refreshState();
+    throw new Error('Timed out waiting for the updated server');
   } catch (err) {
-    toast('Update failed: ' + err.message);
+    if (!authState.locked) toast('Update failed: ' + err.message);
+  } finally {
+    updateRunning = false;
     button.disabled = false;
     button.textContent = original;
     banner.classList.remove('updating');
-  } finally {
-    updateRunning = false;
+    render();
   }
 }
 
@@ -1205,15 +1414,18 @@ document.addEventListener('visibilitychange', () => {
   clearTimeout(stateTimer);
   if (!document.hidden) pollState();
 });
-pollState();
+ensureAuthReady().then(() => pollState()).catch(error => {
+  if (!authState.locked) { toast(error.message); pollState(); }
+});
 window.addEventListener('pageshow', (event) => {
-  if (event.persisted) location.reload();
+  if (event.persisted && !authState.loggingOut) location.reload();
 });
 
 
 /* ================= Usage page (cost + tokens) ================= */
 
-const usageState = { metric: 'cost', days: 30, mode: 'model', summary: null, loading: false };
+const usageState = { metric: 'cost', days: 30, mode: 'model', summary: null, summaryDays: null,
+  loading: false, generation: 0, promise: null, timer: null };
 
 const usagePage = document.getElementById('usage-page');
 const usageHeadline = document.getElementById('usage-headline');
@@ -1229,6 +1441,7 @@ document.getElementById('tab-accounts').addEventListener('click', () => setPage(
 document.getElementById('tab-usage').addEventListener('click', () => setPage('usage'));
 
 function setPage(page) {
+  if (authState.locked) return;
   document.querySelectorAll('.page-tab').forEach(b => b.classList.toggle('active', b.id === `tab-${page}`));
   document.getElementById('providers').hidden = page !== 'accounts';
   document.querySelector('footer.footnote').hidden = page !== 'accounts';
@@ -1270,31 +1483,64 @@ document.getElementById('usage-refresh').addEventListener('click', async () => {
 });
 
 async function loadUsage() {
-  if (usageState.loading) return;
-  usageState.loading = true;
-  try {
-    const res = await fetch(`/api/tokens?days=${usageState.days}`);
-    if (!res.ok && res.status !== 202) {
-      usageHeadline.textContent = 'Usage unavailable';
-      usageSub.textContent = 'The usage service could not answer this request.';
-      return;
-    }
-    const body = await res.json();
-    if (body.summary) {
-      usageState.summary = body.summary;
-      renderUsage();
-    } else if (body.scanning) {
-      usageHeadline.textContent = 'Scanning sessions...';
-      usageSub.textContent = "Reading the provider CLIs' own logs on disk.";
-      usageProviders.innerHTML = '';
-      usageTotals.innerHTML = '';
-      usageChartBox.innerHTML = '';
-      usageBreakdownTable.innerHTML = '';
-      setTimeout(loadUsage, 2500);
-    }
-  } finally {
-    usageState.loading = false;
+  if (authState.locked) return;
+  const clearSummary = () => {
+    usageState.summary = null;
+    usageProviders.innerHTML = '';
+    usageTotals.innerHTML = '';
+    usageChartBox.innerHTML = '';
+    usageBreakdownTable.innerHTML = '';
+  };
+  usageState.generation++;
+  clearTimeout(usageState.timer);
+  if (usageState.summaryDays !== usageState.days) {
+    clearSummary();
+    usageHeadline.textContent = 'Loading usage…';
+    usageSub.textContent = '';
   }
+  if (usageState.loading) return usageState.promise;
+  usageState.loading = true;
+  usageState.promise = (async () => {
+    let generation;
+    try {
+      do {
+        generation = usageState.generation;
+        const days = usageState.days;
+        if (usageState.summaryDays !== days) {
+          clearSummary();
+          usageHeadline.textContent = 'Loading usage…';
+          usageSub.textContent = '';
+        }
+        try {
+          const body = await api(`/api/tokens?days=${days}`);
+          if (generation !== usageState.generation || authState.locked) continue;
+          if (body.summary) {
+            usageState.summary = body.summary;
+            usageState.summaryDays = days;
+            renderUsage();
+          } else if (body.scanning) {
+            clearSummary();
+            usageHeadline.textContent = 'Scanning sessions...';
+            usageSub.textContent = "Reading the provider CLIs' own logs on disk.";
+            usageState.timer = setTimeout(() => {
+              if (generation === usageState.generation && !document.hidden && !usagePage.hidden && !authState.locked) loadUsage();
+            }, 2500);
+          } else {
+            throw new Error('The usage service returned no summary');
+          }
+        } catch (err) {
+          if (generation !== usageState.generation || authState.locked) continue;
+          clearSummary();
+          usageHeadline.textContent = 'Usage unavailable';
+          usageSub.textContent = err.message || 'The usage service could not answer this request.';
+        }
+      } while (generation !== usageState.generation && !authState.locked);
+    } finally {
+      usageState.loading = false;
+      usageState.promise = null;
+    }
+  })();
+  return usageState.promise;
 }
 
 // sigRound rounds n to `figs` significant digits (numeric result).
@@ -1353,6 +1599,7 @@ function fmtMoney(n) {
 function fmtPct(x) { return (x * 100).toFixed(1) + '%'; }
 
 function renderUsage() {
+  if (authState.locked) return;
   const s = usageState.summary;
   if (!s) return;
   const isCost = usageState.metric === 'cost';
@@ -1651,6 +1898,28 @@ const settingsPage = document.createElement('section');
 settingsPage.id = 'settings-page';
 settingsPage.hidden = true;
 usagePage.after(settingsPage);
+let settingsRenderGeneration = 0;
+settingsPage.desktopRelay = createDesktopRelay({
+  api,
+  getAccounts: () => data.accounts || [],
+  getContext: () => ({
+    loopback: desktopRelayLoopback(location.hostname),
+    locked: authState.locked, loggingOut: authState.loggingOut,
+    authKind: authState.enabled ? 'cookie' : '',
+    controllerKey: data.hub_management_key || '',
+  }),
+  copy: text => navigator.clipboard.writeText(text),
+  confirmStop: ({ inFlight, activeTasks }) => confirmDialog({
+    title: 'Stop the Desktop task relay?',
+    message: `The relay has ${inFlight} request${inFlight === 1 ? '' : 's'} in flight. ${activeTasks} observed task${activeTasks === 1 ? ' is' : 's are'} active. Stopping affects tasks using this relay. Switcher may reject Stop until their streams finish.`,
+    confirmLabel: 'Stop relay', danger: true, initialFocus: 'cancel',
+  }),
+  confirmRestart: () => confirmDialog({
+    title: 'Restart Claude Desktop?',
+    message: 'This closes Claude Desktop windows and interrupts active Desktop Code tasks. Finish your current work before restarting.',
+    confirmLabel: 'Restart Claude Desktop', danger: true, initialFocus: 'cancel',
+  }),
+});
 
 const settingsTab = document.createElement('button');
 settingsTab.id = 'tab-settings';
@@ -1660,12 +1929,15 @@ settingsTab.textContent = 'Settings';
 settingsTab.addEventListener('click', () => setPage('settings'));
 document.querySelector('.page-tabs').appendChild(settingsTab);
 setPage = function (page) {
+  if (authState.locked) return;
   document.querySelectorAll('.page-tab').forEach(b => b.classList.toggle('active', b.id === `tab-${page}`));
   document.getElementById('providers').hidden = page !== 'accounts';
   document.body.classList.toggle('compact-account-view', data.compact_accounts === true);
   document.querySelector('footer.footnote').hidden = page !== 'accounts';
   usagePage.hidden = page !== 'usage';
   settingsPage.hidden = page !== 'settings';
+  if (page !== 'settings') settingsPage.desktopRelay?.setActive(false);
+  if (page === 'usage') loadUsage();
   if (page === 'settings') renderSettings();
 };
 
@@ -1772,15 +2044,22 @@ function cliSetupRowHTML(client) {
 }
 
 async function renderSettings() {
+  if (authState.locked || settingsPage.hidden) return;
+  const request = ++settingsRenderGeneration;
+  const epoch = stateEpoch;
   let status;
   try {
     status = await api('/api/auth/status');
   } catch {
     return;
   }
+  if (authState.locked || settingsPage.hidden || request !== settingsRenderGeneration || epoch !== stateEpoch) return;
+  const relayFocus = settingsPage.querySelector('#desktop-relay-settings')?.contains(document.activeElement)
+    ? document.activeElement?.dataset.relayFocus : null;
   settingsPage.innerHTML = `
     <div class="settings-grid">
       <section class="settings-card appearance-card" id="appearance-settings" aria-label="Appearance"></section>
+      <section class="settings-card desktop-relay-card" id="desktop-relay-settings" aria-label="Claude Desktop account switching"></section>
       <details class="settings-card cli-setup-card" id="cli-setup-card">
         <summary class="cli-setup-summary">
           <span class="cli-setup-summary-text">
@@ -1867,6 +2146,7 @@ async function renderSettings() {
     </div>`;
 
   appearance.mount(settingsPage.querySelector('#appearance-settings'));
+  settingsPage.desktopRelay.mount(settingsPage.querySelector('#desktop-relay-settings'), relayFocus);
   const setupList = settingsPage.querySelector('#cli-setup-list');
   const setupAnnouncer = settingsPage.querySelector('#cli-setup-announcer');
   const setupStatus = settingsPage.querySelector('#cli-setup-status');
@@ -2004,6 +2284,7 @@ async function renderSettings() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bind_lan: bindLan.checked, tls: bindLan.checked }),
     });
+    if (authState.locked) return;
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       bindLan.checked = !bindLan.checked;
@@ -2012,6 +2293,7 @@ async function renderSettings() {
     }
     toast('Saved. The server restarts listeners on next launch.');
     await new Promise(r => setTimeout(r, 600));
+    if (authState.locked) return;
     location.reload();
   });
 
@@ -2024,6 +2306,7 @@ async function renderSettings() {
       body: JSON.stringify({ next }),
     });
     const body = await res.json().catch(() => ({}));
+    if (authState.locked) return;
     if (!res.ok) { toast(body.error || 'Could not set password'); return; }
     localStorage.removeItem('switcher-csrf');
     location.replace('/login');
@@ -2037,6 +2320,7 @@ async function renderSettings() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password }),
     });
+    if (authState.locked) return;
     if (!res.ok) { const b = await res.json().catch(() => ({})); toast(b.error || 'Wrong password'); return; }
     toast('Authentication disabled');
     renderSettings();
@@ -2049,13 +2333,11 @@ async function renderSettings() {
 
   settingsPage.querySelector('#logout-all')?.addEventListener('click', async () => {
     const res = await fetchWithCSRF('/api/auth/sessions', { method: 'DELETE' });
+    if (authState.locked) return;
     if (res.ok) { localStorage.removeItem('switcher-csrf'); location.replace('/login'); }
   });
 
-  settingsPage.querySelector('#logout-here')?.addEventListener('click', async () => {
-    const res = await fetchWithCSRF('/api/auth/logout', { method: 'POST' });
-    if (res.ok) { localStorage.removeItem('switcher-csrf'); location.replace('/login'); }
-  });
+  settingsPage.querySelector('#logout-here')?.addEventListener('click', logoutHere);
 
   settingsPage.querySelector('#change-password-btn')?.addEventListener('click', async () => {
     const current = await askPassword('Change password', 'Enter your current password.', 'Continue');
@@ -2068,6 +2350,7 @@ async function renderSettings() {
       body: JSON.stringify({ current, next }),
     });
     const body = await res.json().catch(() => ({}));
+    if (authState.locked) return;
     if (!res.ok) { toast(body.error || 'Could not change password'); return; }
     localStorage.removeItem('switcher-csrf');
     location.replace('/login');

@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -34,12 +35,12 @@ func int64From(v float64) int64 {
 // lines of one file (and across resumes): current model and session, the
 // last accepted token-usage signature, and fork-copy suppression.
 type codexScanState struct {
-	model           string
-	sessionID       string
-	sawSessionMeta  bool
-	lastSig         string
-	suppressingFork bool
-	forkAnchorMs    int64
+	Model           string `json:"model"`
+	SessionID       string `json:"session_id"`
+	SawSessionMeta  bool   `json:"saw_session_meta"`
+	LastSig         string `json:"last_sig"`
+	SuppressingFork bool   `json:"suppressing_fork"`
+	ForkAnchorMs    int64  `json:"fork_anchor_ms"`
 }
 
 const forkCopyMaxGapMs = 1000
@@ -63,7 +64,7 @@ func parseCodexLine(line []byte, st *codexScanState) *Record {
 	}
 	switch root.Type {
 	case "session_meta":
-		if st.sawSessionMeta {
+		if st.SawSessionMeta {
 			return nil
 		}
 		var meta struct {
@@ -78,11 +79,10 @@ func parseCodexLine(line []byte, st *codexScanState) *Record {
 		if json.Unmarshal(root.Payload, &meta) != nil {
 			return nil
 		}
-		st.sawSessionMeta = true
-		st.sessionID = firstString(meta.ID, meta.SessionID)
+		st.SawSessionMeta = true
+		st.SessionID = firstString(meta.ID, meta.SessionID)
 		forkCopy := false
-		if v, ok := jsonString(meta.Forked); ok {
-			_ = v
+		if _, ok := jsonString(meta.Forked); ok {
 			forkCopy = true
 		}
 		if len(meta.Source) > 0 && meta.Source[0] == '{' {
@@ -100,8 +100,8 @@ func parseCodexLine(line []byte, st *codexScanState) *Record {
 			}
 		}
 		if forkCopy {
-			st.suppressingFork = true
-			st.forkAnchorMs = tsMs
+			st.SuppressingFork = true
+			st.ForkAnchorMs = tsMs
 		}
 		return nil
 	case "turn_context":
@@ -109,14 +109,15 @@ func parseCodexLine(line []byte, st *codexScanState) *Record {
 			Model string `json:"model"`
 		}
 		if json.Unmarshal(root.Payload, &ctx) == nil && ctx.Model != "" {
-			st.model = ctx.Model
+			st.Model = ctx.Model
 		}
 		return nil
 	case "event_msg":
 		var evt struct {
 			Type string `json:"type"`
 			Info *struct {
-				LastTokenUsage *struct {
+				TotalTokenUsage map[string]float64 `json:"total_token_usage"`
+				LastTokenUsage  *struct {
 					Input      float64 `json:"input_tokens"`
 					Cached     float64 `json:"cached_input_tokens"`
 					CacheWrite float64 `json:"cache_write_input_tokens"`
@@ -129,29 +130,34 @@ func parseCodexLine(line []byte, st *codexScanState) *Record {
 			return nil
 		}
 		u := evt.Info.LastTokenUsage
-		if st.model == "" || st.sessionID == "" {
+		if st.Model == "" || st.SessionID == "" {
 			return nil
 		}
-		sig := string(mustJSON(u))
-		if sig == st.lastSig {
+		// Equal deltas can belong to distinct requests. Cumulative counts
+		// identify repeated notifications; older logs fall back to event time.
+		sig := "total:" + string(mustJSON(evt.Info.TotalTokenUsage))
+		if len(evt.Info.TotalTokenUsage) == 0 {
+			sig = strconv.FormatInt(tsMs, 10) + ":" + string(mustJSON(u))
+		}
+		if sig == st.LastSig {
 			return nil
 		}
-		if st.suppressingFork {
-			if tsMs-st.forkAnchorMs < forkCopyMaxGapMs {
-				st.forkAnchorMs = tsMs
+		if st.SuppressingFork {
+			if tsMs-st.ForkAnchorMs < forkCopyMaxGapMs {
+				st.ForkAnchorMs = tsMs
 				return nil
 			}
-			st.suppressingFork = false
+			st.SuppressingFork = false
 		}
-		st.lastSig = sig
+		st.LastSig = sig
 		input := int64From(u.Input)
 		cached := int64From(u.Cached)
 		creation := int64From(u.CacheWrite)
 		output := int64From(u.Output)
 		rec := Record{
 			Provider:  ProviderCodex,
-			Model:     st.model,
-			SessionID: st.sessionID,
+			Model:     st.Model,
+			SessionID: st.SessionID,
 			Timestamp: time.UnixMilli(tsMs).UTC(),
 			Totals: Totals{
 				UncachedInput: maxInt64(0, input-cached-creation),
@@ -310,7 +316,9 @@ func parseGrokLine(line []byte) []*Record {
 		var tickedCost, untickedTokens float64
 		for _, m := range u.ModelUsage {
 			tickedCost += m.CostTicks
-			untickedTokens += m.Input + m.Output
+			if m.CostTicks == 0 {
+				untickedTokens += m.Input + m.Output
+			}
 		}
 		remaining := maxFloat64(0, u.CostTicks-tickedCost)
 		for model, m := range u.ModelUsage {
@@ -338,13 +346,13 @@ func parseGrokLine(line []byte) []*Record {
 	return nil
 }
 
-// jsonString reports whether raw is a JSON string and returns its value.
+// jsonString accepts nonempty JSON strings, not null or empty fork IDs.
 func jsonString(raw []byte) (string, bool) {
 	var v string
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return "", false
 	}
-	return v, true
+	return v, v != ""
 }
 
 func parseISOMs(s string) int64 {

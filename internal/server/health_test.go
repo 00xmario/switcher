@@ -173,6 +173,7 @@ func TestReloginImportRejectsAnotherIdentityAndKeepsTargetID(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest(http.MethodPost, "/api/login/import",
 			strings.NewReader(`{"provider":"fake","relogin_of":"fake-a"}`))
+		r.Host, r.RemoteAddr = "127.0.0.1:9123", "127.0.0.1:1234"
 		w := httptest.NewRecorder()
 		a.handleLoginImport(w, r)
 		return w

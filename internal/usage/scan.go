@@ -75,11 +75,13 @@ type ScanCache struct {
 	Version int                   `json:"version"`
 	Files   map[string]cachedFile `json:"files"`
 	mu      sync.Mutex
+	saveMu  sync.Mutex
 	dirty   bool
 	path    string
 }
 
-const scanCacheVersion = 1
+// Version 1 persisted empty Codex state and may contain undercounted records.
+const scanCacheVersion = 2
 
 // LoadScanCache reads the cache file, returning an empty cache on any error.
 func LoadScanCache(path string) *ScanCache {
@@ -100,6 +102,8 @@ func LoadScanCache(path string) *ScanCache {
 
 // Save writes the cache when something changed.
 func (c *ScanCache) Save() {
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 	c.mu.Lock()
 	if !c.dirty {
 		c.mu.Unlock()
@@ -124,9 +128,15 @@ func (c *ScanCache) Save() {
 	data, err := json.Marshal(&snapshot)
 	if err == nil {
 		tmp := c.path + ".tmp"
-		if os.WriteFile(tmp, data, 0o644) == nil {
-			_ = os.Rename(tmp, c.path)
+		err = os.WriteFile(tmp, data, 0o644)
+		if err == nil {
+			err = os.Rename(tmp, c.path)
 		}
+	}
+	if err != nil {
+		c.mu.Lock()
+		c.dirty = true
+		c.mu.Unlock()
 	}
 }
 
@@ -180,7 +190,7 @@ func scanSource(src Source, opt scanOptions, cache *ScanCache, sink recordSink) 
 // files that changed underneath us.
 const guardBytes = 64
 
-// maxLineBytes caps per-line memory during scans.
+// maxLineBytes bounds the lines sent to JSON decoding.
 const maxLineBytes = 8 << 20
 
 func scanFile(src Source, path string, info os.FileInfo, cache *ScanCache, sink recordSink) {
@@ -198,15 +208,16 @@ func scanFile(src Source, path string, info os.FileInfo, cache *ScanCache, sink 
 
 	if haveCached && cached.Provider == src.Provider {
 		switch {
-		case cached.Size == info.Size() && cached.MtimeNs == info.ModTime().UnixNano():
+		case cached.Size == info.Size() && cached.MtimeNs == info.ModTime().UnixNano() && cached.ResumeOffset == cached.Size:
 			// Unchanged: replay cached records, no file I/O.
 			for _, r := range cached.Records {
 				sink(cachedToRecord(src.Provider, r, src.Dir))
 			}
 			return
-		case info.Size() > cached.Size && cached.ResumeOffset > guardBytes:
-			// Grew since last scan: resume, keeping earlier records.
-			records = cached.Records
+		case (info.Size() > cached.Size || info.Size() == cached.Size && info.ModTime().UnixNano() == cached.MtimeNs) && cached.ResumeOffset > guardBytes && cached.ResumeOffset <= info.Size():
+			// Resume complete lines, including when an uncached tail remains.
+			// Each scan owns its slice; cached snapshots stay immutable.
+			records = append([]persistedRecord(nil), cached.Records...)
 			resumeFrom = cached.ResumeOffset
 			guard = cached.Guard
 			st = derefState(cached.Codex)
@@ -228,6 +239,9 @@ func scanFile(src Source, path string, info os.FileInfo, cache *ScanCache, sink 
 	}
 	if _, err := f.Seek(resumeFrom, io.SeekStart); err != nil {
 		return
+	}
+	for _, r := range records {
+		sink(cachedToRecord(src.Provider, r, src.Dir))
 	}
 
 	handle := func(raw []byte, complete bool) {
@@ -265,29 +279,34 @@ func scanFile(src Source, path string, info os.FileInfo, cache *ScanCache, sink 
 	reader := bufio.NewReaderSize(f, 256*1024)
 	for {
 		lineBytes, readErr := reader.ReadBytes('\n')
-		if len(lineBytes) > maxLineBytes {
-			// Absurdly long lines (base64 dumps) can never carry usage;
-			// drop the bytes instead of buffering line-sized allocations
-			// per window.
-			lineBytes = nil
-		}
 		if len(lineBytes) > 0 {
 			complete := lineBytes[len(lineBytes)-1] == '\n'
 			if complete {
 				consumed += int64(len(lineBytes))
 			}
-			handle(bytes.TrimSuffix(lineBytes, []byte("\n")), complete)
+			if len(lineBytes) <= maxLineBytes {
+				checkpoint := st
+				handle(bytes.TrimSuffix(lineBytes, []byte("\n")), complete)
+				if !complete {
+					// The tail will be parsed again, so its dedupe/model state
+					// must not advance the persisted newline checkpoint.
+					st = checkpoint
+				}
+			}
 		}
 		if readErr != nil {
 			break
 		}
 	}
 
+	if latest, err := f.Stat(); err == nil {
+		info = latest
+	}
 	newSize := info.Size()
 	var newGuard string
-	if newSize > guardBytes {
+	if consumed > guardBytes {
 		buf := make([]byte, guardBytes)
-		if _, err := f.ReadAt(buf, newSize-guardBytes); err == nil {
+		if _, err := f.ReadAt(buf, consumed-guardBytes); err == nil {
 			newGuard = hex.EncodeToString(hashBytes(buf))
 		}
 	}

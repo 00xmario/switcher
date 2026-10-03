@@ -24,10 +24,16 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
 	"switcher/internal/codexcfg"
 	"switcher/internal/config"
+	"switcher/internal/desktoprelay"
 	"switcher/internal/login"
 	"switcher/internal/mgmtapi"
 	"switcher/internal/provider"
@@ -40,6 +46,7 @@ import (
 	"switcher/internal/provider/opencode"
 	"switcher/internal/proxy"
 	"switcher/internal/server"
+	"switcher/internal/sessionmeta"
 	"switcher/internal/settings"
 	"switcher/internal/store"
 	"switcher/internal/update"
@@ -49,6 +56,8 @@ import (
 // version is overridable at build time: -ldflags "-X main.version=x.y.z".
 var version = "dev"
 
+const defaultDesktopRelayPort = 8789
+
 //go:embed web
 var webFS embed.FS
 
@@ -57,6 +66,7 @@ var thirdPartyNotices string
 
 func main() {
 	port := flag.Int("port", config.DefaultPort, "port for the Switcher server (UI + proxy)")
+	desktopRelayPort := flag.Int("desktop-relay-port", defaultDesktopRelayPort, "port for the opt-in Desktop task relay")
 	flag.Parse()
 
 	args := flag.Args()
@@ -102,12 +112,72 @@ func main() {
 		fmt.Print(thirdPartyNotices)
 
 	default:
-		run(*port)
+		if err := validateServerPorts(*port, *desktopRelayPort); err != nil {
+			log.Fatal(err)
+		}
+		run(*port, *desktopRelayPort)
 	}
 }
 
+func validateServerPorts(port, desktopRelayPort int) error {
+	if port < 1 || port > 65535 || desktopRelayPort < 1 || desktopRelayPort > 65535 {
+		return errors.New("server ports must be between 1 and 65535")
+	}
+	if port == desktopRelayPort {
+		return errors.New("desktop relay port must differ from the UI port")
+	}
+	return nil
+}
+
+// Construction and resume are lazy. Only the relay's persisted explicit opt-in
+// may start its listener. A failed resume retains the manager for public status
+// and an explicit later retry from local management.
+func resumeDesktopRelay(ctx context.Context, cfg desktoprelay.Config) (*desktoprelay.Manager, error) {
+	m, err := desktoprelay.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return m, m.Resume(ctx)
+}
+
+// Resolve only in main. The API and manager have no implicit HOME fallback.
+// Relative overrides fail closed instead of targeting the working directory.
+func desktopSettingsPath() string {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		if !filepath.IsAbs(dir) || strings.ContainsAny(dir, "\x00\r\n") {
+			return ""
+		}
+		return filepath.Join(dir, "settings.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || !filepath.IsAbs(home) || strings.ContainsAny(home, "\x00\r\n") {
+		return ""
+	}
+	return filepath.Join(home, ".claude", "settings.json")
+}
+
+// Resolve metadata roots only at the production composition point. This helper
+// is pure; the shared index scans lazily for trusted resolution or a local GET.
+func sessionMetadataRoots(goos, home, configDir string) sessionmeta.Config {
+	valid := func(path string) bool {
+		return filepath.IsAbs(path) && !strings.ContainsAny(path, "\x00\r\n")
+	}
+	var cfg sessionmeta.Config
+	if goos == "darwin" && valid(home) {
+		cfg.DesktopRoot = filepath.Join(home, "Library", "Application Support", "Claude", "claude-code-sessions")
+	}
+	if configDir != "" {
+		if valid(configDir) {
+			cfg.ProjectsRoot = filepath.Join(configDir, "projects")
+		}
+	} else if valid(home) {
+		cfg.ProjectsRoot = filepath.Join(home, ".claude", "projects")
+	}
+	return cfg
+}
+
 // run starts the OAuth callback listener and the main server, then blocks.
-func run(port int) {
+func run(port, desktopRelayPort int) {
 	st := store.New(config.Dir())
 	claudeProvider := claude.New()
 	if err := claudeProvider.ConfigureNative(st, config.Dir()); err != nil {
@@ -131,6 +201,17 @@ func run(port int) {
 	proxyManager, err := proxy.New(st, providers, registrationOrder)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
+	}
+	home, _ := os.UserHomeDir()
+	metadataIndex := sessionmeta.New(sessionMetadataRoots(runtime.GOOS, home, os.Getenv("CLAUDE_CONFIG_DIR")))
+	relayCtx, relayCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	desktopRelay, relayErr := resumeDesktopRelay(relayCtx, desktoprelay.Config{
+		DataRoot: filepath.Join(config.Dir(), "desktop-relay"), Port: desktopRelayPort,
+		Source: proxy.NewDesktopCredentialSource(proxyManager), Conversations: metadataIndex,
+	})
+	relayCancel()
+	if relayErr != nil {
+		log.Print("desktop relay unavailable; inspect local relay status")
 	}
 
 	settingsStore := settings.New(config.Dir())
@@ -162,7 +243,9 @@ func run(port int) {
 		if err := st.SaveState(state); err != nil {
 			log.Fatalf("persist management key: %v", err)
 		}
-		proxyManager.SetManagementKey(managementKey)
+		if err := proxyManager.SetManagementKey(managementKey); err != nil {
+			log.Fatalf("persist proxy management key: %v", err)
+		}
 	}
 	// Successful logins persist immediately from the callback goroutine;
 	// the first account of a provider automatically becomes active.
@@ -211,7 +294,9 @@ func run(port int) {
 	}()
 	api := &server.API{
 		Store: st, Logins: logins, Proxy: proxyManager, Providers: providers,
-		ManagementKey: managementKey, Version: version, Updater: updater, Usage: usageService,
+		DesktopRelay: desktopRelay, DesktopSettingsPath: desktopSettingsPath(),
+		DesktopSessionMetadata: metadataIndex,
+		ManagementKey:          managementKey, Version: version, Updater: updater, Usage: usageService,
 		Settings: settingsStore, Port: port,
 	}
 
@@ -269,13 +354,14 @@ func run(port int) {
 	// optional LAN listener is always TLS. Binding the LAN without a
 	// password on disk is refused: no TOFU window. LocalOnly runs outside
 	// the auth gate so rebinding checks happen pre-auth.
-	gate := &server.AuthGate{Store: settingsStore}
+	gate := &server.AuthGate{Store: settingsStore, DesktopManagementKey: managementKey}
 	loopback := server.Listener{
 		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-		Handler: server.LocalOnlyWith(server.LocalOptions{Port: port}, gate.Wrap(hardened)),
+		Handler: server.ControlRequests(server.LocalOnlyWith(server.LocalOptions{Port: port}, gate.Wrap(hardened))),
 	}
 	listeners := []server.Listener{loopback}
-	if settingsStore.Load().BindLAN && settingsStore.Load().TLS && settingsStore.HasPassword() {
+	network, settingsErr := settingsStore.Snapshot()
+	if settingsErr == nil && network.AuthEnabled && network.BindLAN && network.TLS && network.PasswordHash != "" {
 		if lan := server.LANAddress(); lan != "" {
 			cert, err := server.EnsureTLSCert(config.Dir(), lan, port)
 			if err != nil {
@@ -285,7 +371,7 @@ func run(port int) {
 					Addr:    fmt.Sprintf("%s:%d", lan, port),
 					TLS:     true,
 					Cert:    cert,
-					Handler: server.LocalOnlyWith(server.LocalOptions{Port: port, LANHost: lan}, gate.Wrap(hardened)),
+					Handler: server.ControlRequests(server.LocalOnlyWith(server.LocalOptions{Port: port, LANHost: lan}, gate.WrapLAN(hardened))),
 				})
 				log.Printf("lan listener: https://%s:%d (self-signed)", lan, port)
 			}
@@ -293,8 +379,24 @@ func run(port int) {
 			log.Printf("lan binding requested but no non-loopback IPv4 address found")
 		}
 	}
-	if err := server.ServeAll(listeners); err != nil {
-		log.Fatalf("server: %v", err)
+	shutdown, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	serveErrors := make(chan error, 1)
+	go func() { serveErrors <- server.ServeAll(listeners) }()
+	var serveErr error
+	select {
+	case <-shutdown.Done():
+	case serveErr = <-serveErrors:
+	}
+	if desktopRelay != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := desktopRelay.Close(closeCtx); err != nil {
+			log.Print("desktop relay shutdown incomplete")
+		}
+		cancel()
+	}
+	if serveErr != nil {
+		log.Fatalf("server: %v", serveErr)
 	}
 }
 
@@ -351,9 +453,14 @@ func hardenedHeaders(next http.Handler) http.Handler {
 // bind (e.g. the port is taken) only disables logins, not the server.
 func serveCallback(mux *http.ServeMux, port int) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := callbackServer(mux, addr).ListenAndServe(); err != nil {
 		log.Printf("oauth callback listener on %s unavailable: %v", addr, err)
 	}
+}
+
+func callbackServer(handler http.Handler, addr string) *http.Server {
+	return &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second}
 }
 
 // callbackHandler completes the OAuth flow and answers the browser with a

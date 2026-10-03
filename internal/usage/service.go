@@ -13,14 +13,17 @@ import (
 // summary without blocking.
 type Service struct {
 	mu       sync.Mutex
+	ratesMu  sync.Mutex
 	summ     map[int]*Summary
 	fresh    map[int]time.Time
 	scanning map[int]bool
 	cache    *ScanCache
 	rates    RateTable
 	ratesOK  bool
+	ratesAt  time.Time
 	dataDir  string
 	client   *http.Client
+	now      func() time.Time
 }
 
 // NewService builds the service; dataDir holds usage-scan-cache.json and
@@ -39,6 +42,7 @@ func NewService(dataDir string, client *http.Client) *Service {
 		cache:    LoadScanCache(filepath.Join(dataDir, "usage-scan-cache.json")),
 		dataDir:  dataDir,
 		client:   client,
+		now:      time.Now,
 	}
 	return s
 }
@@ -59,11 +63,11 @@ func (s *Service) Age(days int) time.Duration {
 	if !ok {
 		return 1<<63 - 1
 	}
-	return time.Since(t)
+	return s.now().Sub(t)
 }
 
 // Scan recomputes the summary for a window synchronously. Callers should
-// run it in a goroutine; Get stays lock-free for readers.
+// run it in a goroutine; Get does not wait for scan I/O.
 func (s *Service) Scan(days int) *Summary {
 	s.mu.Lock()
 	if s.scanning[days] {
@@ -71,7 +75,6 @@ func (s *Service) Scan(days int) *Summary {
 		return nil
 	}
 	s.scanning[days] = true
-	rates := s.rates
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -79,29 +82,40 @@ func (s *Service) Scan(days int) *Summary {
 		s.mu.Unlock()
 	}()
 
-	if !s.ratesReady() {
-		table, _ := LoadRates(filepath.Join(s.dataDir, "model-rates.json"), s.client)
-		s.mu.Lock()
-		s.rates = table
-		s.ratesOK = len(table) > 0
-		rates = table
-		s.mu.Unlock()
-	}
+	rates := s.currentRates()
 
-	until := time.Now()
+	until := s.now()
 	windowStart := until.AddDate(0, 0, -(days - 1))
 	summary := SummaryFor(ResolveSources(), s.cache, rates, windowStart, until, time.Local)
 	s.mu.Lock()
 	s.summ[days] = summary
-	s.fresh[days] = time.Now()
+	s.fresh[days] = s.now()
 	s.mu.Unlock()
 	return summary
 }
 
-func (s *Service) ratesReady() bool {
+func (s *Service) currentRates() RateTable {
+	// Different windows share one price refresh, without blocking Get.
+	s.ratesMu.Lock()
+	defer s.ratesMu.Unlock()
+	now := s.now()
+	s.mu.Lock()
+	age := now.Sub(s.ratesAt)
+	if s.ratesOK && age >= 0 && age < ratesTTL {
+		table := s.rates
+		s.mu.Unlock()
+		return table
+	}
+	s.mu.Unlock()
+	table, _, fetchedAt := loadRatesAt(filepath.Join(s.dataDir, "model-rates.json"), s.client, now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ratesOK
+	if len(table) > 0 {
+		s.rates = table
+		s.ratesAt = fetchedAt
+		s.ratesOK = true
+	}
+	return s.rates
 }
 
 // RefreshStale rescans windows older than maxAge. It returns the windows it
@@ -113,7 +127,7 @@ func (s *Service) RefreshStale(windows []int, olderThan time.Duration) []int {
 		t, ok := s.fresh[days]
 		busy := s.scanning[days]
 		s.mu.Unlock()
-		if !ok || (time.Since(t) > olderThan && !busy) {
+		if !ok || (s.now().Sub(t) > olderThan && !busy) {
 			s.Scan(days)
 			refreshed = append(refreshed, days)
 		}
