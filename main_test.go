@@ -464,3 +464,16 @@ func TestCallbackServerBoundsPartialHeaders(t *testing.T) {
 		t.Fatal("partial headers reached callback handler")
 	}
 }
+
+func TestIgnoreOwnRelayProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://scope:secret@127.0.0.1:8789")
+	t.Setenv("HTTP_PROXY", "http://corp-proxy.example:8789")
+	t.Setenv("ALL_PROXY", "http://127.0.0.1:3128")
+	ignoreOwnRelayProxy(8789)
+	if os.Getenv("HTTPS_PROXY") != "" {
+		t.Fatal("own relay proxy was kept")
+	}
+	if os.Getenv("HTTP_PROXY") == "" || os.Getenv("ALL_PROXY") == "" {
+		t.Fatal("unrelated proxies were removed")
+	}
+}

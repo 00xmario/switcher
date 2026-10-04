@@ -22,11 +22,14 @@ import (
 	"html"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -64,10 +67,31 @@ var webFS embed.FS
 //go:embed THIRD_PARTY_NOTICES.md
 var thirdPartyNotices string
 
+// ignoreOwnRelayProxy drops proxy settings that point at Switcher's own Desktop
+// relay. Claude Code exports them to processes it starts, and a Switcher
+// launched from such a shell would otherwise send its own Anthropic calls
+// through its relay and fail TLS verification.
+func ignoreOwnRelayProxy(relayPort int) {
+	own := func(value string) bool {
+		u, err := url.Parse(value)
+		if err != nil || u.Port() != strconv.Itoa(relayPort) {
+			return false
+		}
+		ip := net.ParseIP(u.Hostname())
+		return u.Hostname() == "localhost" || ip != nil && ip.IsLoopback()
+	}
+	for _, key := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
+		if value := os.Getenv(key); value != "" && own(value) {
+			os.Unsetenv(key)
+		}
+	}
+}
+
 func main() {
 	port := flag.Int("port", config.DefaultPort, "port for the Switcher server (UI + proxy)")
 	desktopRelayPort := flag.Int("desktop-relay-port", defaultDesktopRelayPort, "port for the opt-in Desktop task relay")
 	flag.Parse()
+	ignoreOwnRelayProxy(*desktopRelayPort)
 
 	args := flag.Args()
 	switch {
