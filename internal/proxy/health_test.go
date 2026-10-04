@@ -535,12 +535,14 @@ func TestProxySaveFailurePreservesRoutingWithoutForwardingRotatedToken(t *testin
 			m.mu.Lock()
 			m.healthLocked("a").relogin = true
 			m.mu.Unlock()
-			if status := doRequest(t, m, "/v1/responses").Code; status != http.StatusServiceUnavailable {
-				t.Fatalf("storage-failure status = %d, want 503", status)
-			}
-			wantForwarded := int32(0)
+			// An expired token that cannot be saved after refresh is a local
+			// failure; a rejected one returns Anthropic's own 401.
+			wantStatus, wantForwarded := http.StatusServiceUnavailable, int32(0)
 			if !expired {
-				wantForwarded = 1 // initial 401 only; no unrelated account is billed
+				wantStatus, wantForwarded = http.StatusUnauthorized, 2 // same stored token retried once
+			}
+			if status := doRequest(t, m, "/v1/responses").Code; status != wantStatus {
+				t.Fatalf("storage-failure status = %d, want %d", status, wantStatus)
 			}
 			if got := forwarded.Load(); got != wantForwarded {
 				t.Fatalf("forwarded %d requests, want %d", got, wantForwarded)

@@ -198,9 +198,6 @@ func newRelayE2EFixture(t *testing.T, resolvers ...desktoprelay.ConversationReso
 		FixtureTLSRoots: x509.NewCertPool(),
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("fixture blocks blind-tunnel egress")
-		},
-		LookupIP: func(context.Context, string) ([]net.IP, error) {
-			return nil, errors.New("fixture blocks external DNS")
 		}}
 	if len(resolvers) != 0 {
 		cfg.Conversations = resolvers[0]
@@ -624,8 +621,7 @@ func TestDesktopRelayIntegrationCredentialErrorsHaveStableCodes(t *testing.T) {
 		status     int
 	}{
 		{"source account removed", "account_not_found", fmt.Errorf("%w: %s", desktoprelay.ErrNotFound, relayE2ESourceBody), 404},
-		{"source legacy busy", "credential_busy", fmt.Errorf("%w: %s", desktoprelay.ErrBusy, relayE2ESourceBody), 503},
-		{"source credential busy", "credential_busy", fmt.Errorf("%w: %s", desktoprelay.ErrCredentialBusy, relayE2ESourceBody), 503},
+		{"source busy", "credential_unavailable", fmt.Errorf("%w: %s", desktoprelay.ErrBusy, relayE2ESourceBody), 503},
 		{"source unavailable", "credential_unavailable", errors.New(relayE2ESourceBody), 503},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -653,7 +649,6 @@ func TestDesktopRelayIntegrationCredentialErrorsHaveStableCodes(t *testing.T) {
 		status     int
 	}{
 		{"selected account removed", "account_not_found", fmt.Errorf("%w: %s", desktoprelay.ErrNotFound, relayE2ESourceBody), 404},
-		{"selected credential busy", "credential_busy", fmt.Errorf("%w: %s", desktoprelay.ErrCredentialBusy, relayE2ESourceBody), 503},
 		{"selected credential unavailable", "credential_unavailable", errors.New(relayE2ESourceBody), 503},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -688,7 +683,7 @@ func TestDesktopRelayIntegrationCredentialErrorsHaveStableCodes(t *testing.T) {
 	if len(refreshed) != 1 || refreshed[0].accountID != "beta" || refreshed[0].rejected != relayE2ESavedB {
 		t.Fatal("401 recovery did not belong to the selected rejected generation")
 	}
-	if f.session(t, scope.ID, relayE2ESession, 5, 0).AccountID != "beta" {
+	if f.session(t, scope.ID, relayE2ESession, 4, 0).AccountID != "beta" {
 		t.Fatal("classified credential errors changed the explicit binding")
 	}
 	f.assertGlobalSelection(t)

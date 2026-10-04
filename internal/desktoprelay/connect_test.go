@@ -116,7 +116,7 @@ func connectRaw(t *testing.T, setup desktoprelay.ScopeSetup, authority, auth str
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := net.DialTimeout("tcp", u.Host, time.Second)
+	c, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

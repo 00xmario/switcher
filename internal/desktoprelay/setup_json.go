@@ -25,7 +25,7 @@ func parseSetupDocument(data []byte, exists bool) (setupDocument, error) {
 	if !exists {
 		return d, nil
 	}
-	if len(data) > maxSetupSettings || !uniqueJSON(data) || json.Unmarshal(data, &d.root) != nil || d.root == nil || bytes.TrimSpace(data)[0] != '{' {
+	if len(data) > maxSetupSettings || !json.Valid(data) || json.Unmarshal(data, &d.root) != nil || d.root == nil || bytes.TrimSpace(data)[0] != '{' {
 		return d, setupError("setup_invalid_settings", ErrUnavailable)
 	}
 	if raw, ok := d.root["env"]; ok {

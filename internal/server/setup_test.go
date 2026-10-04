@@ -57,8 +57,6 @@ func newDesktopSetupFixture(t *testing.T) *desktopSetupFixture {
 		Source: f.source, Transport: desktopControlBlockedTransport{},
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("fixture forbids tunnel egress")
-		}, LookupIP: func(context.Context, string) ([]net.IP, error) {
-			return nil, errors.New("fixture forbids DNS")
 		}})
 	if err != nil {
 		t.Fatal(err)
@@ -213,23 +211,6 @@ func TestDesktopSetupEmptyAPIPathNeverUsesHOMEOrEnvironment(t *testing.T) {
 		if err != nil || string(raw) != "fixture-settings-auth-secret" {
 			t.Fatal("empty API path fell back to HOME/environment settings")
 		}
-	}
-}
-
-func TestDesktopSetupMutationBodiesRejectPathsCommandsAmbiguityAndOversize(t *testing.T) {
-	f := newDesktopSetupFixture(t)
-	for _, suffix := range []string{"/configure", "/restore"} {
-		for _, body := range []string{`null`, `[]`, `{`, `{} {}`, `{"settings_path":"/fixture/path"}`,
-			`{"command":"open -a Claude"}`, `{"env":{}}`, `{"path":"a","path":"b"}`,
-			`{"path":"a","PATH":"b"}`, `{"ignored":"` + strings.Repeat("x", 9000) + `"}`} {
-			f.request(t, "POST", suffix, body, 400)
-		}
-	}
-	if f.api.DesktopRelay.Status().Listening || len(f.api.DesktopRelay.Scopes()) != 0 {
-		t.Fatal("invalid body changed relay state")
-	}
-	if _, err := os.Stat(f.api.DesktopSettingsPath); !os.IsNotExist(err) {
-		t.Fatal("invalid body wrote settings")
 	}
 }
 

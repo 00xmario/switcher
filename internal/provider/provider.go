@@ -29,6 +29,9 @@ type UsageWindow struct {
 type Usage struct {
 	Available bool          `json:"available"`
 	Windows   []UsageWindow `json:"windows,omitempty"`
+	// Plan is current upstream account metadata from the same usage response.
+	// Empty means not reported, never an inferred free or paid subscription.
+	Plan string `json:"plan,omitempty"`
 }
 
 // ErrUsageUnavailable reports that usage could not be determined.

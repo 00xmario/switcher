@@ -29,7 +29,8 @@ type Info struct {
 
 const (
 	cacheTTL   = 3 * time.Second
-	lookupTime = 750 * time.Millisecond
+	lookupTime = 2 * time.Second
+	missRetry  = 300 * time.Millisecond
 )
 
 type Index struct {
@@ -37,7 +38,7 @@ type Index struct {
 	gate    chan struct{}
 	cache   snapshot
 	expires time.Time
-	misses  map[string]bool
+	misses  map[string]time.Time
 }
 
 // New is lazy, including when a configured root is missing or unsafe.
@@ -48,19 +49,16 @@ func New(cfg Config) *Index {
 // Lookup returns only exact, nonzero UUID matches, keyed by the requested ID.
 // Missing, unsafe and malformed metadata is ordinary absence, not an API error.
 func (i *Index) Lookup(ctx context.Context, ids []string) map[string]Info {
-	info, _, _ := i.lookup(ctx, ids, false, nil)
+	info, _, _ := i.lookup(ctx, ids, false)
 	return info
 }
 
 type snapshot struct {
-	info               map[string]Info
-	conversations      map[string]string
-	validGroups        map[string]bool
-	claimedAliases     map[string]bool
-	historicalComplete bool
+	info          map[string]Info
+	conversations map[string]string
 }
 
-func (i *Index) lookup(ctx context.Context, ids []string, resolve bool, known map[string]string) (map[string]Info, map[string]string, error) {
+func (i *Index) lookup(ctx context.Context, ids []string, resolve bool) (map[string]Info, map[string]string, error) {
 	info, conversations := make(map[string]Info), make(map[string]string)
 	if err := ctx.Err(); err != nil {
 		return info, conversations, err
@@ -92,8 +90,9 @@ func (i *Index) lookup(ctx context.Context, ids []string, resolve bool, known ma
 	refresh := expired
 	if resolve && !refresh && len(i.misses) < maxEntries {
 		for _, canonical := range wanted {
-			if i.cache.conversations[canonical] == "" && !i.misses[canonical] {
-				// At most one forced scan per missing UUID within this TTL.
+			if i.cache.conversations[canonical] == "" && time.Since(i.misses[canonical]) > missRetry {
+				// Desktop may write a new session's metadata just after its
+				// first request, so a miss is rescanned after a short pause.
 				refresh = true
 				break
 			}
@@ -107,25 +106,26 @@ func (i *Index) lookup(ctx context.Context, ids []string, resolve bool, known ma
 		i.cache = cache
 		if expired {
 			i.expires = time.Now().Add(cacheTTL)
-			i.misses = make(map[string]bool)
+			i.misses = make(map[string]time.Time)
 		}
 	}
 	if resolve {
 		for _, canonical := range wanted {
 			if i.cache.conversations[canonical] == "" && len(i.misses) < maxEntries {
 				if i.misses == nil {
-					i.misses = make(map[string]bool)
+					i.misses = make(map[string]time.Time)
 				}
-				i.misses[canonical] = true
+				if _, seen := i.misses[canonical]; !seen || refresh {
+					i.misses[canonical] = time.Now()
+				}
 			}
 		}
 	}
-	prior, disputed := canonicalKnown(ctx, known)
 	for original, canonical := range wanted {
 		if saved, ok := i.cache.info[canonical]; ok {
 			info[original] = saved
 		}
-		if conversation := i.cache.association(canonical, prior, disputed); conversation != "" {
+		if conversation := i.cache.conversations[canonical]; conversation != "" {
 			conversations[original] = conversation
 		}
 	}
@@ -133,16 +133,6 @@ func (i *Index) lookup(ctx context.Context, ids []string, resolve bool, known ma
 		return make(map[string]Info), make(map[string]string), err
 	}
 	return info, conversations, nil
-}
-
-func (s snapshot) association(alias string, prior map[string]string, disputed map[string]bool) string {
-	if current := s.conversations[alias]; current != "" {
-		return current
-	}
-	if group := prior[alias]; group != "" && s.historicalComplete && !disputed[alias] && !s.claimedAliases[alias] && s.validGroups[group] {
-		return group
-	}
-	return ""
 }
 
 func uuid(s string) string {
@@ -164,12 +154,11 @@ func uuid(s string) string {
 func (i *Index) scan(ctx context.Context) snapshot {
 	out := make(map[string]Info)
 	b := newBudget(ctx)
-	native := newMembership(ctx)
+	native := newMembership()
 	desktop := make(map[string][]match)
-	nativeComplete := walkMetadata(i.cfg.DesktopRoot, 2, b, func(name string) bool {
+	walkMetadata(i.cfg.DesktopRoot, 2, b, func(name string) bool {
 		return strings.HasPrefix(name, "local_") && strings.HasSuffix(name, ".json")
 	}, func(name string, data []byte) {
-		native.trackClaims(data)
 		var record struct {
 			ID       string          `json:"cliSessionId"`
 			Title    string          `json:"title"`
@@ -177,17 +166,13 @@ func (i *Index) scan(ctx context.Context) snapshot {
 			Activity json.RawMessage `json:"lastActivityAt"`
 		}
 		if !decodeMetadata(ctx, data, &record) {
-			native.reject(name)
 			return
 		}
-		native.add(name, data, uuid(record.ID))
+		native.add(data, uuid(record.ID))
 		if id := uuid(record.ID); id != "" {
 			desktop[id] = append(desktop[id], match{record.Title, record.Cwd, activity(record.Activity)})
 		}
-	}, func(name string) {
-		native.reject(name)
-		native.historyReadable = false
-	})
+	}, nil)
 	for id, records := range desktop {
 		if record, ok := authoritative(records); ok {
 			out[id] = display(record, "desktop")
@@ -228,10 +213,6 @@ func (i *Index) scan(ctx context.Context) snapshot {
 			cli[id] = append(cli[id], match{title: title, cwd: record.ProjectPath})
 		}
 	}, nil)
-	if !b.active() {
-		// A truncated scan cannot prove that an unseen copy would not conflict.
-		return snapshot{}
-	}
 	for id, records := range cli {
 		record, ok := authoritative(records)
 		if !ok {
@@ -251,25 +232,7 @@ func (i *Index) scan(ctx context.Context) snapshot {
 		}
 		out[id] = info
 	}
-	conversations := make(map[string]string)
-	validGroups, claimed := make(map[string]bool), make(map[string]bool)
-	if nativeComplete {
-		conversations = native.resolve()
-		for group := range native.groups {
-			if !native.invalidGroups[group] {
-				validGroups[group] = true
-			}
-		}
-		for alias := range native.aliases {
-			claimed[alias] = true
-		}
-		for alias := range native.invalidAlias {
-			claimed[alias] = true
-		}
-		for alias := range native.claimed {
-			claimed[alias] = true
-		}
-	}
+	conversations := native.resolve()
 	// Membership is independent of display-title/project selection. A verified
 	// member with disagreeing titles still belongs in grouped revision checks.
 	for id, conversation := range conversations {
@@ -277,8 +240,7 @@ func (i *Index) scan(ctx context.Context) snapshot {
 		info.ClientKind, info.ConversationID = "desktop", conversation
 		out[id] = info
 	}
-	return snapshot{info: out, conversations: conversations, validGroups: validGroups, claimedAliases: claimed,
-		historicalComplete: nativeComplete && native.historyReadable}
+	return snapshot{info: out, conversations: conversations}
 }
 
 type match struct {

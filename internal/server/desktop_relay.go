@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -99,31 +98,9 @@ func (a *API) handleDesktopRelay(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	switch r.URL.Path {
 	case "/api/desktop-relay":
-		scopes, sessions := a.DesktopRelay.Scopes(), a.DesktopRelay.Sessions()
-		if scopes == nil {
-			scopes = []desktoprelay.Scope{}
-		}
-		// This authorized local GET only decorates copies. It never publishes a
-		// binding or promotes an exact-session override into a conversation.
-		// Current and historical proof comes from the manager's trusted source.
-		// Missing display metadata cannot retire an already proved alias. Saved
-		// ownership remains resettable if source verification is unavailable.
-		bindings := a.DesktopRelay.ConversationBindings()
-		if bindings == nil {
-			bindings = []desktoprelay.ConversationBinding{}
-		}
-		owned := make(map[desktopRelayConversationIdentity]bool, len(bindings))
-		for _, binding := range bindings {
-			owned[desktopRelayConversationIdentity{binding.ScopeID, binding.ConversationID}] = true
-		}
-		verified, verificationErr := a.DesktopRelay.VerifiedConversationAssociations(ctx)
-		if verificationErr != nil {
-			// Source failures are local verification absence, never response text
-			// or authority to reuse a partial result from another admission scope.
-			verified = nil
-		}
+		a.DesktopRelay.AssociateConversations(ctx)
+		scopes, sessions, bindings := a.DesktopRelay.Scopes(), a.DesktopRelay.Sessions(), a.DesktopRelay.ConversationBindings()
 		var info map[string]sessionmeta.Info
-		views := make([]desktopRelaySessionView, len(sessions))
 		if a.DesktopSessionMetadata != nil && len(sessions) != 0 {
 			ids := make([]string, len(sessions))
 			for j, session := range sessions {
@@ -131,12 +108,12 @@ func (a *API) handleDesktopRelay(w http.ResponseWriter, r *http.Request) {
 			}
 			info = a.DesktopSessionMetadata.Lookup(ctx, ids)
 		}
+		views := make([]desktopRelaySessionView, len(sessions))
 		for j, session := range sessions {
-			proof := verified[session.ScopeID+"/"+session.SessionID]
-			views[j] = desktopRelaySessionAssociation(session, info[session.SessionID], proof, verificationErr == nil, owned)
+			views[j] = desktopRelaySessionView{Session: session, Info: info[session.SessionID]}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": a.desktopRelayStatus(), "setup": a.desktopRelaySetup(), "scopes": scopes,
-			"sessions": views, "conversation_bindings": bindings, "conversations": desktopRelayConversations(views, bindings)})
+			"sessions": views, "conversation_bindings": bindings})
 	case "/api/desktop-relay/configure", "/api/desktop-relay/restore":
 		if !decodeDesktopRelayBody(w, r, &struct{}{}, true) {
 			return
@@ -198,88 +175,11 @@ func (a *API) handleDesktopRelay(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// desktopRelaySessionView adds saved Desktop titles to a request session. The
+// session's own conversation_id wins over the metadata's (which is not serialized).
 type desktopRelaySessionView struct {
 	desktoprelay.Session
 	sessionmeta.Info
-	// ConversationID is current/historical source proof or saved control ownership.
-	// The explicit flag distinguishes these without changing the captured Session.
-	ConversationID      string `json:"conversation_id,omitempty"`
-	AssociationVerified bool   `json:"association_verified"`
-	AssociationConflict bool   `json:"association_conflict,omitempty"`
-}
-
-type desktopRelayConversationIdentity struct{ scope, conversation string }
-
-func desktopRelaySessionAssociation(session desktoprelay.Session, metadata sessionmeta.Info, verified string, sourceAvailable bool, owned map[desktopRelayConversationIdentity]bool) desktopRelaySessionView {
-	view := desktopRelaySessionView{Session: session, Info: metadata}
-	stored, current := session.ConversationID, metadata.ConversationID
-	storedValid, currentValid := validDesktopConversationID(stored), validDesktopConversationID(current)
-	if storedValid && owned[desktopRelayConversationIdentity{session.ScopeID, stored}] {
-		// An empty-account revision record also owns reset control. Its members
-		// may have later exact overrides that grouped reset must clear together.
-		view.ConversationID = stored
-	}
-	proofValid := sourceAvailable && validDesktopConversationID(verified)
-	if storedValid && currentValid && stored != current || proofValid &&
-		(storedValid && stored != verified || currentValid && current != verified) {
-		// Display identity can veto a conflicting view, never grant membership.
-		// Keep saved ownership for removal without silently forking its group.
-		view.AssociationConflict = true
-		return view
-	}
-	if proofValid {
-		// The scoped manager result is the only authority for either a fresh
-		// current alias or a historically proved persisted alias. Sparse absence
-		// cannot be filled from display metadata, bindings or caller fields.
-		view.ConversationID, view.AssociationVerified = verified, true
-	}
-	return view
-}
-
-type desktopRelayConversationView struct {
-	desktoprelay.ConversationBinding
-	SessionIDs          []string          `json:"session_ids"`
-	MemberRevisions     map[string]uint64 `json:"member_revisions"`
-	AssociationVerified bool              `json:"association_verified"`
-}
-
-func desktopRelayConversations(sessions []desktopRelaySessionView, bindings []desktoprelay.ConversationBinding) []desktopRelayConversationView {
-	groups := make(map[desktopRelayConversationIdentity]*desktopRelayConversationView)
-	for _, binding := range bindings {
-		groups[desktopRelayConversationIdentity{binding.ScopeID, binding.ConversationID}] = &desktopRelayConversationView{
-			ConversationBinding: binding, SessionIDs: []string{}, MemberRevisions: make(map[string]uint64)}
-	}
-	for _, session := range sessions {
-		if session.ConversationID == "" {
-			continue
-		}
-		key := desktopRelayConversationIdentity{session.ScopeID, session.ConversationID}
-		group := groups[key]
-		if group == nil {
-			group = &desktopRelayConversationView{ConversationBinding: desktoprelay.ConversationBinding{
-				ScopeID: session.ScopeID, ConversationID: session.ConversationID}, MemberRevisions: make(map[string]uint64)}
-			groups[key] = group
-		}
-		if len(group.SessionIDs) == 0 {
-			group.AssociationVerified = session.AssociationVerified
-		} else {
-			group.AssociationVerified = group.AssociationVerified && session.AssociationVerified
-		}
-		group.SessionIDs = append(group.SessionIDs, session.SessionID)
-		group.MemberRevisions[session.SessionID] = session.Revision
-	}
-	views := make([]desktopRelayConversationView, 0, len(groups))
-	for _, group := range groups {
-		sort.Strings(group.SessionIDs)
-		views = append(views, *group)
-	}
-	sort.Slice(views, func(i, j int) bool {
-		if views[i].ScopeID != views[j].ScopeID {
-			return views[i].ScopeID < views[j].ScopeID
-		}
-		return views[i].ConversationID < views[j].ConversationID
-	})
-	return views
 }
 
 func (a *API) desktopRelayStatus() desktoprelay.Status {
@@ -309,79 +209,19 @@ func publicDesktopRelaySetup(setup desktoprelay.SetupStatus) desktoprelay.SetupS
 }
 
 func decodeDesktopRelayBody(w http.ResponseWriter, r *http.Request, body any, allowEmpty ...bool) bool {
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<10))
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
 	if err != nil {
 		writeDesktopRelayBadRequest(w)
 		return false
 	}
-	if len(allowEmpty) != 0 && allowEmpty[0] && len(bytes.TrimSpace(raw)) == 0 {
+	if len(bytes.TrimSpace(raw)) == 0 && (len(allowEmpty) != 0 && allowEmpty[0]) {
 		return true
 	}
-	// Require one object and unique keys. Ambiguous revisions must not become
-	// a valid compare-and-swap through encoding/json's last-key-wins rule.
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
-		writeDesktopRelayBadRequest(w)
-		return false
-	}
-	if !desktopRelayUniqueObject(decoder, 0) {
-		writeDesktopRelayBadRequest(w)
-		return false
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
-		writeDesktopRelayBadRequest(w)
-		return false
-	}
-	decoder = json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(body); err != nil {
+	if json.Unmarshal(raw, body) != nil {
 		writeDesktopRelayBadRequest(w)
 		return false
 	}
 	return true
-}
-
-// Parse nested objects too, so duplicate member revisions cannot collapse into
-// one accepted CAS value. Field names and member UUIDs are lowercase on the wire.
-func desktopRelayUniqueObject(decoder *json.Decoder, depth int) bool {
-	if depth > 16 {
-		return false
-	}
-	seen := make(map[string]bool)
-	for decoder.More() {
-		token, err := decoder.Token()
-		key, ok := token.(string)
-		if err != nil || !ok || key != strings.ToLower(key) || seen[key] {
-			return false
-		}
-		seen[key] = true
-		if !desktopRelayUniqueValue(decoder, depth+1) {
-			return false
-		}
-	}
-	token, err := decoder.Token()
-	return err == nil && token == json.Delim('}')
-}
-
-func desktopRelayUniqueValue(decoder *json.Decoder, depth int) bool {
-	token, err := decoder.Token()
-	if err != nil || depth > 16 {
-		return false
-	}
-	switch token {
-	case json.Delim('{'):
-		return desktopRelayUniqueObject(decoder, depth)
-	case json.Delim('['):
-		for decoder.More() {
-			if !desktopRelayUniqueValue(decoder, depth+1) {
-				return false
-			}
-		}
-		token, err := decoder.Token()
-		return err == nil && token == json.Delim(']')
-	default:
-		return true
-	}
 }
 
 func validDesktopConversationID(id string) bool {
@@ -460,25 +300,6 @@ func (a *API) handleDesktopRelaySelection(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"session": selected})
 }
 
-type desktopRelayConversationRevision struct {
-	Revision        *uint64            `json:"revision"`
-	MemberRevisions map[string]*uint64 `json:"member_revisions"`
-}
-
-func (body desktopRelayConversationRevision) members() (map[string]uint64, bool) {
-	if body.Revision == nil || len(body.MemberRevisions) == 0 || len(body.MemberRevisions) > 256 {
-		return nil, false
-	}
-	members := make(map[string]uint64, len(body.MemberRevisions))
-	for id, revision := range body.MemberRevisions {
-		if !validDesktopConversationID(id) || revision == nil {
-			return nil, false
-		}
-		members[id] = *revision
-	}
-	return members, true
-}
-
 func (a *API) handleDesktopRelayConversationSelection(w http.ResponseWriter, r *http.Request, ctx context.Context, conversation string) {
 	scope := r.PathValue("scope")
 	if !validID(scope) || !validDesktopConversationID(conversation) {
@@ -489,32 +310,21 @@ func (a *API) handleDesktopRelayConversationSelection(w http.ResponseWriter, r *
 	var err error
 	if r.Method == http.MethodPost {
 		var body struct {
-			desktopRelayConversationRevision
 			AccountID string `json:"account_id"`
 		}
 		if !decodeDesktopRelayBody(w, r, &body) {
 			return
 		}
-		members, valid := body.members()
-		if !valid || !validID(body.AccountID) {
+		if !validID(body.AccountID) {
 			writeDesktopRelayBadRequest(w)
 			return
 		}
 		if !a.desktopRelayClaudeAccount(w, body.AccountID) {
 			return
 		}
-		selected, err = a.DesktopRelay.BindConversation(ctx, scope, conversation, body.AccountID, *body.Revision, members)
+		selected, err = a.DesktopRelay.BindConversation(ctx, scope, conversation, body.AccountID)
 	} else {
-		var body desktopRelayConversationRevision
-		if !decodeDesktopRelayBody(w, r, &body) {
-			return
-		}
-		members, valid := body.members()
-		if !valid {
-			writeDesktopRelayBadRequest(w)
-			return
-		}
-		selected, err = a.DesktopRelay.UnbindConversation(ctx, scope, conversation, *body.Revision, members)
+		selected, err = a.DesktopRelay.UnbindConversation(ctx, scope, conversation)
 	}
 	if err != nil {
 		writeDesktopRelayError(w, err)
@@ -551,9 +361,9 @@ func writeDesktopRelayError(w http.ResponseWriter, err error) {
 	case errors.Is(err, errDesktopSetupConflict) || (isSetupError && errors.Is(err, desktoprelay.ErrConflict)):
 		code, message = http.StatusConflict, "desktop relay setup changed; reload setup before retrying"
 	case errors.Is(err, desktoprelay.ErrNotFound):
-		code, message = http.StatusNotFound, "desktop relay account, scope, session or verified conversation not found"
+		code, message = http.StatusNotFound, "desktop relay account, scope, session or conversation not found"
 	case errors.Is(err, desktoprelay.ErrConflict):
-		code, message = http.StatusConflict, "desktop relay revision or verified membership changed; reload the conversation and its sessions"
+		code, message = http.StatusConflict, "desktop relay selection changed; reload and try again"
 	case errors.Is(err, desktoprelay.ErrBusy):
 		code, message = http.StatusConflict, "desktop relay is busy; reload status before retrying"
 	}
@@ -568,13 +378,6 @@ func writeDesktopRelayError(w http.ResponseWriter, err error) {
 	var credentialError *desktoprelay.CredentialError
 	if errors.As(err, &credentialError) {
 		reply["error_code"] = credentialError.ErrorCode()
-	}
-	var associationError *desktoprelay.AssociationError
-	if errors.As(err, &associationError) {
-		switch associationError.ErrorCode() {
-		case "conversation_association_unavailable", "conversation_association_invalid", "conversation_association_changed":
-			reply["error_code"] = associationError.ErrorCode()
-		}
 	}
 	writeJSON(w, code, reply)
 }

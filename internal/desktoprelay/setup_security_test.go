@@ -50,7 +50,7 @@ func TestSetupStatusCreatesNoFilesAndNeverConsultsSource(t *testing.T) {
 func TestSetupInvalidSettingsNeverOverwriteOrStart(t *testing.T) {
 	for name, input := range map[string]string{
 		"malformed": `{"env":`, "null": `null`, "array": `[]`,
-		"duplicate": `{"env":{},"env":{}}`, "nestedDuplicate": `{"permissions":{"x":1,"x":2}}`,
+
 		"envArray": `{"env":[]}`, "envScalar": `{"env":7}`, "trailing": `{} {}`,
 		"oversized": `{"large":"` + strings.Repeat("x", 1<<20) + `"}`,
 	} {

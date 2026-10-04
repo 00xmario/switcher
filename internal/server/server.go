@@ -485,6 +485,9 @@ func viewBaseWithSettings(a *API, acc store.Account, preferences settings.Settin
 		v.ExhaustedUntil = until.Unix()
 	}
 	v.Usage, v.LastReset, v.QuotaRevision, v.QuotaEpoch = a.Proxy.QuotaSnapshot(acc.ID)
+	if v.Usage != nil && v.Usage.Plan != "" {
+		v.Plan = v.Usage.Plan
+	}
 	if native, ok := a.Providers[acc.Provider].(provider.NativeLoginProvider); ok && native.NativeEnabled() {
 		v.NativeSwitchAvailable = true
 		v.NativeActive = native.NativeStatus().ActiveID == acc.ID
@@ -587,6 +590,7 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"menu_usage_bars":     preferences.MenuUsageBars == nil || *preferences.MenuUsageBars,
 		"reset_notifications": preferences.ResetNotifications,
 		"compact_accounts":    preferences.CompactAccounts,
+		"merge_accounts":      preferences.MergeAccounts,
 		"desktop_relay":       a.desktopRelayStatus(),
 	}
 	if native, ok := a.Providers["claude"].(provider.NativeLoginProvider); ok {
@@ -742,6 +746,7 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		"menu_usage_bars":     a.Settings.MenuUsageBars(),
 		"reset_notifications": st.ResetNotifications,
 		"compact_accounts":    st.CompactAccounts,
+		"merge_accounts":      st.MergeAccounts,
 		"auto_use_reset":      st.AutoUseReset,
 		"bind_lan":            st.BindLAN,
 		"lan_active":          LANListenerActive(),
@@ -943,6 +948,7 @@ func (a *API) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"menu_usage_bars":     a.Settings.MenuUsageBars(),
 		"reset_notifications": st.ResetNotifications,
 		"compact_accounts":    st.CompactAccounts,
+		"merge_accounts":      st.MergeAccounts,
 		"auto_use_reset":      st.AutoUseReset,
 	})
 }
@@ -957,6 +963,7 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		MenuUsageBars      *bool `json:"menu_usage_bars"`
 		ResetNotifications *bool `json:"reset_notifications"`
 		CompactAccounts    *bool `json:"compact_accounts"`
+		MergeAccounts      *bool `json:"merge_accounts"`
 		AutoUseReset       *bool `json:"auto_use_reset"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
@@ -989,6 +996,9 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.CompactAccounts != nil {
 			st.CompactAccounts = *body.CompactAccounts
+		}
+		if body.MergeAccounts != nil {
+			st.MergeAccounts = *body.MergeAccounts
 		}
 		// A routing preference takes effect on the next exhausted request,
 		// so it never restarts the listeners.

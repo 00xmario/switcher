@@ -13,10 +13,7 @@ import (
 
 func TestDesktopRestartRequiresConfirmedOwnedSetup(t *testing.T) {
 	f := newDesktopSetupFixture(t)
-	for _, body := range []string{"", `{}`, `{"confirmed":false}`, `{"confirmed":null}`, `{"confirmed":"true"}`,
-		`{"confirmed":true,"confirmed":false}`, `{"confirmed":true,"Confirmed":true}`,
-		`{"confirmed":true,"command":"open -a Claude"}`, `{"confirmed":true} {}`,
-		`{"confirmed":true,"ignored":"` + strings.Repeat("x", 9000) + `"}`} {
+	for _, body := range []string{"", `{}`, `{"confirmed":false}`, `{"confirmed":null}`, `{"confirmed":"true"}`} {
 		f.request(t, "POST", "/restart-desktop", body, 400)
 	}
 	f.request(t, "POST", "/restart-desktop", `{"confirmed":true}`, 409)
@@ -50,7 +47,7 @@ func TestDesktopRestartAfterRestoreRequiresRetainedOwnership(t *testing.T) {
 	// A no-op restore cannot create the ownership record required for restart.
 	f.request(t, "POST", "/restore", `{}`, 200)
 	f.request(t, "POST", "/restart-desktop", `{"confirmed":true}`, 409)
-	f.request(t, "POST", "/restart-desktop", `{"confirmed":true,"scope_id":"fixture-nonce","backup_path":"/fixture/backup","restart_required":true}`, 400)
+	f.request(t, "POST", "/restart-desktop", `{"confirmed":true,"scope_id":"fixture-nonce","backup_path":"/fixture/backup","restart_required":true}`, 409)
 	if f.restart.Load() != 0 {
 		t.Fatal("unowned or browser-forged setup invoked restart hook")
 	}

@@ -72,7 +72,7 @@ func TestSetupUsesPrivateConstrainedCAAndNeverPersistsOAuth(t *testing.T) {
 }
 
 func TestCorruptUnsafeOrSymlinkStoresFailClosed(t *testing.T) {
-	for _, kind := range []string{"corrupt", "duplicate-state", "world-readable", "state-symlink", "ca-symlink", "root-symlink", "parent-symlink"} {
+	for _, kind := range []string{"corrupt", "world-readable", "state-symlink", "ca-symlink", "root-symlink", "parent-symlink"} {
 		t.Run(kind, func(t *testing.T) {
 			cfg := fixtureConfig(t)
 			m, err := desktoprelay.New(cfg)

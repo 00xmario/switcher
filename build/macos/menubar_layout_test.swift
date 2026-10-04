@@ -155,6 +155,7 @@ struct MenuBarLayoutTest {
     static func main() {
         _ = NSApplication.shared
         runMenuActionRegressionFixtures()
+        guard planNames["free"] == "Free" else { fail("Free accounts must not display a paid tier") }
         guard planNames["claude_max_5x"] == "Max 5x",
               planNames["claude_max_20x"] == "Max 20x",
               planNames["claude_max"] == "Max" else { fail("Claude Max tiers must not be inferred from a generic max flag") }

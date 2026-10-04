@@ -1,15 +1,16 @@
 package desktoprelay
 
 import (
-	"bytes"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -105,14 +106,7 @@ func readPrivate(root *privateStore, name string) ([]byte, error) {
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil || st.Uid != uint32(os.Getuid()) || st.Nlink != 1 {
 		return nil, errors.New("unsafe store file ownership or links")
 	}
-	b, err := io.ReadAll(io.LimitReader(f, 4<<20+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(b) > 4<<20 {
-		return nil, errors.New("store file too large")
-	}
-	return b, nil
+	return io.ReadAll(f)
 }
 
 var errCommitUncertain = errors.New("relay state commit durability uncertain")
@@ -170,137 +164,130 @@ func loadState(root *privateStore) (diskState, bool, error) {
 		return diskState{}, false, err
 	}
 	var s diskState
-	if !uniqueJSON(b) {
-		return s, false, errors.New("ambiguous persisted state")
-	}
-	d := json.NewDecoder(bytes.NewReader(b))
-	d.DisallowUnknownFields()
-	if err = d.Decode(&s); err != nil {
-		return s, false, errors.New("corrupt relay state")
-	}
-	if d.Decode(new(any)) != io.EOF || s.Version != 1 || s.Scopes == nil || s.Sessions == nil {
+	if err = json.Unmarshal(b, &s); err != nil || s.Version != 1 {
 		return s, false, errors.New("unsupported relay state")
-	}
-	if len(s.Scopes) > 128 || len(s.Sessions)+len(s.ConversationBindings) > 4096 {
-		return s, false, errors.New("relay state exceeds limits")
 	}
 	if !validSetupRecords(s, root.dir.Name()) {
 		return s, false, errors.New("corrupt relay setup journal")
 	}
-	for id, scope := range s.Scopes {
-		secret, err := hex.DecodeString(scope.Secret)
-		if !validUUID(id) || scope.ID != id || err != nil || len(secret) != 32 || len(scope.Label) > 256 {
-			return s, false, errors.New("corrupt relay scope")
-		}
+	if s.Scopes == nil {
+		s.Scopes = map[string]storedScope{}
 	}
-	conversationMembers := make(map[string]int)
+	if s.Sessions == nil {
+		s.Sessions = map[string]Session{}
+	}
+	pruneSessions(&s, time.Now())
+	// Drop records that no longer belong to a scope instead of refusing to start.
 	for key, session := range s.Sessions {
-		if key != taskKey(session.ScopeID, session.SessionID) || !validUUID(session.SessionID) || session.Revision == 0 || len(session.AccountID) > 256 || len(session.AgentID) > 128 || len(session.Model) > 256 || (session.ParentSessionID != "" && !validUUID(session.ParentSessionID)) {
-			return s, false, errors.New("corrupt relay session")
-		}
-		if _, ok := s.Scopes[session.ScopeID]; !ok {
-			return s, false, errors.New("orphan relay session")
-		}
-		if session.ConversationID != "" && !validUUID(session.ConversationID) {
-			return s, false, errors.New("corrupt relay conversation identity")
-		}
-		if !validEvidence(session.LastResponse) {
-			return s, false, errors.New("corrupt relay response evidence")
-		}
-		if session.ConversationID != "" {
-			groupKey := taskKey(session.ScopeID, session.ConversationID)
-			conversationMembers[groupKey]++
-			if binding := s.ConversationBindings[groupKey]; binding.AccountID != "" && session.AccountID != binding.AccountID {
-				return s, false, errors.New("inconsistent relay conversation selection")
-			}
+		if _, ok := s.Scopes[session.ScopeID]; !ok || key != taskKey(session.ScopeID, session.SessionID) {
+			delete(s.Sessions, key)
+			continue
 		}
 		session.InFlight = 0
 		s.Sessions[key] = session
 	}
 	for key, binding := range s.ConversationBindings {
-		if key != taskKey(binding.ScopeID, binding.ConversationID) || !validUUID(binding.ConversationID) || binding.Revision == 0 || len(binding.AccountID) > 256 {
-			return s, false, errors.New("corrupt relay conversation binding")
-		}
-		if _, ok := s.Scopes[binding.ScopeID]; !ok {
-			return s, false, errors.New("orphan relay conversation binding")
-		}
-		if conversationMembers[key] == 0 {
-			return s, false, errors.New("relay conversation binding has no observed members")
+		if _, ok := s.Scopes[binding.ScopeID]; !ok || key != taskKey(binding.ScopeID, binding.ConversationID) {
+			delete(s.ConversationBindings, key)
 		}
 	}
 	return s, true, nil
 }
 
+// Sessions are request telemetry. Idle ones are forgotten after two weeks and
+// at most maxSessions are kept, so the state file stays small.
+const (
+	maxSessions = 2000
+	sessionTTL  = 14 * 24 * time.Hour
+)
+
+func pruneSessions(s *diskState, now time.Time) {
+	if len(s.Sessions) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(s.Sessions))
+	for key, session := range s.Sessions {
+		if session.InFlight == 0 && now.Sub(session.LastSeen) > sessionTTL {
+			delete(s.Sessions, key)
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) <= maxSessions {
+		return
+	}
+	sort.Slice(keys, func(i, j int) bool { return s.Sessions[keys[i]].LastSeen.After(s.Sessions[keys[j]].LastSeen) })
+	for _, key := range keys[maxSessions:] {
+		if s.Sessions[key].InFlight == 0 {
+			delete(s.Sessions, key)
+		}
+	}
+}
+
+// saveLocked persists the state now. The caller holds m.mu.
 func (m *Manager) saveLocked() error {
-	if m.store == nil || m.failed {
+	if m.store == nil {
 		return ErrUnavailable
 	}
-	b, err := json.Marshal(m.state)
-	if len(b) > 4<<20 {
-		return ErrBusy
-	}
+	b, seq, err := m.snapshotLocked()
 	if err == nil {
-		err = atomicPrivate(m.store, "state.json", b)
+		err = m.write(m.store, b, seq)
 	}
 	if err != nil {
-		if errors.Is(err, errCommitUncertain) {
-			m.failed = true
-			m.condition = "store_error"
-			if m.run != nil {
-				m.run.cancel()
-			}
-			return errors.Join(ErrUnavailable, errCommitUncertain)
-		}
 		return fmt.Errorf("%w: could not persist state", ErrUnavailable)
 	}
 	return nil
 }
 
-func uniqueJSON(b []byte) bool {
-	d := json.NewDecoder(bytes.NewReader(b))
-	d.UseNumber()
-	var walk func(int) bool
-	walk = func(depth int) bool {
-		if depth > 64 {
-			return false
-		}
-		t, err := d.Token()
-		if err != nil {
-			return false
-		}
-		switch t {
-		case json.Delim('{'):
-			seen := make(map[string]bool)
-			for d.More() {
-				key, err := d.Token()
-				if err != nil {
-					return false
-				}
-				k, ok := key.(string)
-				if !ok || seen[k] {
-					return false
-				}
-				seen[k] = true
-				if !walk(depth + 1) {
-					return false
-				}
-			}
-			t, err = d.Token()
-			return err == nil && t == json.Delim('}')
-		case json.Delim('['):
-			for d.More() {
-				if !walk(depth + 1) {
-					return false
-				}
-			}
-			t, err = d.Token()
-			return err == nil && t == json.Delim(']')
-		default:
-			_, delim := t.(json.Delim)
-			return !delim
+func (m *Manager) snapshotLocked() ([]byte, uint64, error) {
+	pruneSessions(&m.state, time.Now())
+	for key := range m.threads {
+		if _, ok := m.state.Sessions[key]; !ok {
+			delete(m.threads, key)
 		}
 	}
-	return walk(0) && d.Decode(new(any)) == io.EOF
+	m.saveSeq++
+	b, err := json.Marshal(m.state)
+	return b, m.saveSeq, err
+}
+
+func (m *Manager) write(store *privateStore, b []byte, seq uint64) error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	if seq < m.savedSeq {
+		return nil
+	}
+	if err := atomicPrivate(store, "state.json", b); err != nil {
+		return err
+	}
+	m.savedSeq = seq
+	return nil
+}
+
+// saveSoonLocked batches persistence of request observations. The write runs
+// outside m.mu, so requests never wait for, or fail because of, the disk.
+func (m *Manager) saveSoonLocked() {
+	if m.savePending {
+		return
+	}
+	m.savePending = true
+	time.AfterFunc(2*time.Second, func() {
+		m.mu.Lock()
+		m.savePending = false
+		store := m.store
+		if store == nil {
+			m.mu.Unlock()
+			return
+		}
+		b, seq, err := m.snapshotLocked()
+		m.mu.Unlock()
+		if err == nil {
+			err = m.write(store, b, seq)
+		}
+		if err != nil {
+			log.Printf("desktop relay: save state: %v", err)
+		}
+	})
 }
 
 func rollbackAllowed(err error) bool { return !errors.Is(err, errCommitUncertain) }

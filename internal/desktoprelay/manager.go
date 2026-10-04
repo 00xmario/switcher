@@ -12,19 +12,27 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Manager struct {
-	cfg              Config
-	lifecycle        sync.Mutex
-	mu               sync.Mutex
-	store            *privateStore
-	failed           bool
-	state            diskState
-	run              *runtime
-	condition        string
-	responseSequence uint64
+	cfg         Config
+	lifecycle   sync.Mutex
+	mu          sync.Mutex
+	store       *privateStore
+	state       diskState
+	run         *runtime
+	condition   string
+	threads     map[string]string
+	savePending bool
+	// saveMu orders state.json writes; saveSeq numbers marshalled snapshots
+	// so a slower background write never replaces a newer one.
+	saveMu      sync.Mutex
+	saveSeq     uint64
+	savedSeq    uint64
+	associating atomic.Bool
+	associated  time.Time
 }
 
 type runtime struct {
@@ -36,16 +44,30 @@ type runtime struct {
 	transport    http.RoundTripper
 	mu           sync.Mutex
 	closed       bool
-	conns        map[net.Conn]tunnelRecord
+	conns        map[net.Conn]struct{}
 	wg           sync.WaitGroup
 	shutdownOnce sync.Once
 	finished     chan struct{}
-	requests     chan struct{}
+	inFlight     atomic.Int64
 }
 
-type tunnelRecord struct {
-	scope string
-	blind bool
+// track registers a hijacked connection so shutdown can close it.
+func (r *runtime) track(c net.Conn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	r.conns[c] = struct{}{}
+	r.wg.Add(1)
+	return true
+}
+
+func (r *runtime) untrack(c net.Conn) {
+	r.mu.Lock()
+	delete(r.conns, c)
+	r.mu.Unlock()
+	r.wg.Done()
 }
 
 func New(cfg Config) (*Manager, error) {
@@ -103,12 +125,7 @@ func (m *Manager) initializeLocked(create bool) error {
 		root.Close()
 		return ErrUnavailable
 	}
-	m.store, m.state, m.failed = root, s, false
-	for _, session := range s.Sessions {
-		if session.LastResponse != nil && session.LastResponse.Sequence > m.responseSequence {
-			m.responseSequence = session.LastResponse.Sequence
-		}
-	}
+	m.store, m.state = root, s
 	if !exists {
 		if err := m.saveLocked(); err != nil {
 			root.Close()
@@ -133,9 +150,6 @@ func (m *Manager) startLifecycleLocked(ctx context.Context, resume bool) error {
 	defer m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if m.failed {
-		return ErrUnavailable
 	}
 	if m.run != nil {
 		if m.run.ctx.Err() != nil {
@@ -178,14 +192,13 @@ func (m *Manager) startLifecycleLocked(ctx context.Context, resume bool) error {
 		return ErrUnavailable
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
-	guard := &ingressListener{Listener: l, slots: make(chan struct{}, 128)}
-	r := &runtime{listener: guard, ctx: runCtx, cancel: cancel, done: make(chan struct{}), finished: make(chan struct{}), conns: make(map[net.Conn]tunnelRecord), requests: make(chan struct{}, 32)}
+	r := &runtime{listener: l, ctx: runCtx, cancel: cancel, done: make(chan struct{}), finished: make(chan struct{}), conns: make(map[net.Conn]struct{})}
 	r.transport = m.transport()
 	r.server = ingressServer(m, r)
 	m.run, m.condition = r, "listening"
 	go func() {
 		defer close(r.done)
-		r.server.Serve(guard)
+		r.server.Serve(l)
 	}()
 	return nil
 }
@@ -263,10 +276,8 @@ func (m *Manager) finishShutdownLocked(r *runtime) error {
 	var persistErr error
 	m.run = nil
 	if m.store != nil {
-		if !m.failed {
-			if err := m.saveLocked(); err != nil && persistErr == nil {
-				persistErr = err
-			}
+		if err := m.saveLocked(); err != nil && persistErr == nil {
+			persistErr = err
 		}
 		m.store.Close()
 		m.store = nil
@@ -279,7 +290,6 @@ func (m *Manager) finishShutdownLocked(r *runtime) error {
 	if persistErr != nil {
 		m.condition = "store_error"
 	}
-	m.failed = false
 	return persistErr
 }
 
@@ -291,9 +301,7 @@ func (m *Manager) Status() Status {
 		s.CAPath = filepath.Join(m.cfg.DataRoot, "ca.pem")
 	}
 	if m.run != nil {
-		// Runtime admission slots survive session deletion and cover request
-		// preparation as well as streams. Keep counting while shutdown drains.
-		s.InFlight = uint64(len(m.run.requests))
+		s.InFlight = uint64(m.run.inFlight.Load())
 		if m.run.ctx.Err() == nil {
 			s.Listening = true
 			s.Address = m.run.listener.Addr().String()
@@ -305,7 +313,7 @@ func (m *Manager) Status() Status {
 func (m *Manager) CreateScope(label string) (ScopeSetup, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.run == nil || m.run.ctx.Err() != nil || m.failed {
+	if m.run == nil || m.run.ctx.Err() != nil {
 		return ScopeSetup{}, ErrUnavailable
 	}
 	if len(label) > 256 || len(m.state.Scopes) >= 128 {

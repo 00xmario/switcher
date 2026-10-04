@@ -41,8 +41,15 @@ const (
 type Provider struct {
 	mu          sync.Mutex
 	verifier    map[string]verifierEntry
+	limits      map[string]cachedUsage
 	Native      *claudecode.Manager
 	nativeError error
+}
+
+// cachedUsage lets a burst of 429s share one usage lookup.
+type cachedUsage struct {
+	usage provider.Usage
+	at    time.Time
 }
 
 type verifierEntry struct {
@@ -424,7 +431,20 @@ func (p *Provider) ParseRateLimit(ctx context.Context, a store.Account, status i
 		return time.Time{}, false
 	}
 	exhausted := explicitSubscriptionExhaustion(body)
-	usage, err := p.Usage(ctx, a)
+	p.mu.Lock()
+	cached, ok := p.limits[a.ID]
+	p.mu.Unlock()
+	usage, err := cached.usage, error(nil)
+	if !ok || time.Since(cached.at) > time.Minute {
+		if usage, err = p.Usage(ctx, a); err == nil {
+			p.mu.Lock()
+			if p.limits == nil {
+				p.limits = make(map[string]cachedUsage)
+			}
+			p.limits[a.ID] = cachedUsage{usage: usage, at: time.Now()}
+			p.mu.Unlock()
+		}
+	}
 	if err != nil {
 		if exhausted {
 			return time.Now().Add(time.Hour), true

@@ -81,6 +81,12 @@ required; OpenCode Go uses its own API key.
   credential's health and polling backoff. Expired usage windows are hidden
   individually during an outage; remaining valid windows stay visible.
   Usage polling failures do not change request routing.
+- **Current Codex plan**: successful quota checks update the saved plan from
+  the same response's `plan_type`, including downgrades to Free. Both the menu
+  and web cards display Free instead of retaining the paid tier from login.
+  Free-tier quota windows remain visible when OpenAI reports them; a monthly
+  allowance does not imply a paid subscription. Missing or failed plan data
+  does not guess a replacement tier or model entitlement.
 - **Reset alerts**: opt in under Settings → Menu bar to receive macOS
   notifications at provider-reported usage-window reset times. Switcher
   remembers pending alerts across menu app restarts and catches up within a
@@ -116,40 +122,19 @@ required; OpenCode Go uses its own API key.
   connection. Same-store `CLAUDE_CONFIG_DIR` profiles are supported; split secure
   storage and credential-overriding environment variables block the operation
   with an explanation. See [the source analysis and comparison](docs/claude-swap-analysis.md).
-- **Claude Desktop task relay, fixture-tested preview**: Settings includes an
-  opt-in authenticated loopback relay for future local Desktop Code tasks.
-  Click **Configure Claude Desktop** to start the relay, create its profile,
-  back up the current settings, and merge the proxy and process-local CA fields.
-  Restart Desktop explicitly when current work is finished, then choose an
-  account for an observed task. **Remove Desktop setup** restores the previous
-  connection fields while retaining other settings. The selection
-  applies to subsequent requests; an already admitted stream keeps its account.
-  Peer tasks and unbound requests keep their caller credentials. Messages,
-  tool results, signed thinking, unknown fields, and SSE are forwarded in the
-  native Anthropic protocol without model or body translation. Selected
-  server-thread requests require a full-history retry before forwarding.
-  Configure preserves unrelated Claude settings and never restarts Desktop
-  automatically. The separate restart button asks for confirmation. No system
-  trust root is installed. Advanced controls retain manual profile setup.
-  The default relay port is `8789`, configurable with `--desktop-relay-port`.
-  Real Desktop traffic has been observed through the relay; complete
-  target-account billing and task continuity remain unverified. See
-  [setup and validation](docs/desktop-relay-usage.md), the
-  [module contract](docs/desktop-relay-module.md), and the
-  [five-project source comparison](docs/desktop-reference-map.md).
-  The conversation list shows saved chat titles and project names when an
-  exact session match is available. Requests in progress appear first; idle
-  sessions are collapsed under **Recent conversations** with last-request
-  times. **Default: Claude sign-in** keeps the conversation's original
-  credentials. An account override is optional and applies only to that
-  conversation. Title lookup reads saved metadata, not message transcripts.
-  Verified Desktop conversation identities group related internal request
-  sessions, so an explicit whole-conversation selection follows later verified
-  aliases. A legacy single-ID override is marked **Partially applied** until
-  it is applied to the conversation. **Last upstream response** reports the
-  credential route, model, HTTP status, and response time separately from the
-  selected account. Desktop's sign-in and usage display remain on the original
-  account; a chat answer about quota is not billing evidence.
+- **Claude Desktop account switching (optional, off by default)**: in
+  Settings → Claude Desktop you can pick a Switcher account for individual
+  Desktop Code conversations. Connect once (**Connect Claude Desktop**, then
+  restart Desktop when your work is done); after that, switching is one click
+  and never needs a restart. Conversations you don't pick keep Desktop's login. New
+  messages use the picked account; replies already running finish where they
+  started. **Desktop login** keeps the account Desktop is signed in to. A local
+  relay swaps only the OAuth token (plus the matching OAuth beta and
+  `account_uuid`); errors and rate limits are Anthropic's own. **Disconnect**
+  restores your previous settings. The relay port is `8789`, configurable with
+  `--desktop-relay-port`. See [setup](docs/desktop-relay-usage.md), the
+  [module](docs/desktop-relay-module.md) and the
+  [source comparison](docs/desktop-reference-map.md).
 - **Claude Desktop session sync**: the small two-arrow sync icon after the Claude name in the
   menu bar and web app makes new Claude Code chats discoverable across your
   Desktop account indexes. Clicking it first asks for confirmation, with

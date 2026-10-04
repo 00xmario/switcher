@@ -1,5 +1,5 @@
 // Package codex implements the provider.Provider interface for Codex
-// (ChatGPT Plus/Pro subscription logins). It performs the same OAuth PKCE
+// (ChatGPT Free and paid account logins). It performs the same OAuth PKCE
 // flow the Codex CLI uses and forwards requests to the ChatGPT
 // backend-api Codex endpoint.
 package codex
@@ -37,8 +37,8 @@ const (
 	redirectURI  = "http://localhost:1455/auth/callback"
 )
 
-// Provider implements provider.Provider for Codex (ChatGPT Plus/Pro
-// subscription logins). It performs the same OAuth PKCE flow the Codex CLI
+// Provider implements provider.Provider for Codex (ChatGPT Free and paid
+// account logins). It performs the same OAuth PKCE flow the Codex CLI
 // uses and forwards requests to the ChatGPT backend-api Codex endpoint.
 type Provider struct {
 	mu       sync.Mutex
@@ -237,7 +237,7 @@ func (p *Provider) Usage(ctx context.Context, a store.Account) (provider.Usage, 
 			ResetsAt:    w.ResetAt,
 		})
 	}
-	return provider.Usage{Available: true, Windows: windows}, nil
+	return provider.Usage{Available: true, Windows: windows, Plan: strings.ToLower(strings.TrimSpace(parsed.PlanType))}, nil
 }
 
 // windowLabel names a quota window by its duration.

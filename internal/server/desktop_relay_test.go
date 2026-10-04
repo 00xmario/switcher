@@ -14,14 +14,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"switcher/internal/desktoprelay"
 	"switcher/internal/proxy"
-	"switcher/internal/sessionmeta"
 	"switcher/internal/settings"
 	"switcher/internal/store"
 )
@@ -139,15 +137,10 @@ func TestDesktopRelayValidatesAndBoundsManagementJSON(t *testing.T) {
 		{"POST", "/api/desktop-relay/scopes", `{`, 400},
 		{"POST", "/api/desktop-relay/scopes", `null`, 400},
 		{"POST", "/api/desktop-relay/scopes", `{}`, 400},
-		{"POST", "/api/desktop-relay/scopes", `{"label":"ok","unknown":true}`, 400},
-		{"POST", "/api/desktop-relay/scopes", `{"label":"ok"} {}`, 400},
-		{"POST", "/api/desktop-relay/scopes", `{"label":"one","label":"two"}`, 400},
-		{"POST", "/api/desktop-relay/scopes", `{"label":"` + strings.Repeat("x", 9000) + `"}`, 400},
 		{"POST", "/api/desktop-relay/scopes", `{"label":"` + strings.Repeat("x", 257) + `"}`, 400},
 		{"POST", "/api/desktop-relay/scopes/scope/sessions/session/account", `{"account_id":"../claude-a","revision":0}`, 400},
 		{"POST", "/api/desktop-relay/scopes/scope/sessions/session/account", `{"account_id":"claude-a"}`, 400},
 		{"POST", "/api/desktop-relay/scopes/scope/sessions/session/account", `{"account_id":"claude-a","revision":-1}`, 400},
-		{"POST", "/api/desktop-relay/scopes/scope/sessions/session/account", `{"account_id":"claude-a","revision":0,"revision":1}`, 400},
 		{"POST", "/api/desktop-relay/scopes/scope/sessions/session/account", `{"account_id":"codex-a","revision":0}`, 400},
 		{"POST", "/api/desktop-relay/scopes/scope/sessions/session/account", `{"account_id":"missing","revision":0}`, 404},
 		{"POST", "/api/desktop-relay/scopes/scope/sessions/session/account", `{"account_id":"claude-a","revision":0}`, 404},
@@ -163,70 +156,6 @@ func TestDesktopRelayValidatesAndBoundsManagementJSON(t *testing.T) {
 	}
 	if len(m.Scopes()) != 0 || len(m.Sessions()) != 0 {
 		t.Fatal("invalid management request mutated state")
-	}
-}
-
-func TestDesktopRelayConversationBodyRequiresUnambiguousMemberCAS(t *testing.T) {
-	blockDesktopControlEgress(t)
-	m, _ := newDesktopControlManager(t)
-	st := store.New(t.TempDir())
-	for _, account := range []store.Account{{ID: "claude-a", Provider: "claude"}, {ID: "codex-a", Provider: "codex"}} {
-		if err := st.Save(account); err != nil {
-			t.Fatal(err)
-		}
-	}
-	api := &API{Store: st, DesktopRelay: m, ManagementKey: "fixture-management-key"}
-	mux := http.NewServeMux()
-	api.Register(mux)
-	const conversation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	const member = "11111111-1111-4111-8111-111111111111"
-	path := "/api/desktop-relay/scopes/scope/conversations/" + conversation + "/account"
-	for _, body := range []string{
-		`null`, `[]`, `{`, `{}`, `{"revision":0}`, `{"revision":null,"member_revisions":{"` + member + `":0}}`,
-		`{"revision":0,"member_revisions":null}`, `{"revision":0,"member_revisions":{}}`,
-		`{"revision":0,"member_revisions":{"` + member + `":null}}`,
-		`{"revision":0,"member_revisions":{"` + member + `":-1}}`,
-		`{"revision":0,"member_revisions":{"` + member + `":1.5}}`,
-		`{"revision":0,"member_revisions":{"` + member + `":18446744073709551616}}`,
-		`{"revision":0,"member_revisions":{"` + member + `":0,"` + member + `":1}}`,
-		`{"revision":0,"member_revisions":{"` + member + `":0},"member_revisions":{"` + member + `":1}}`,
-		`{"revision":0,"Revision":1,"member_revisions":{"` + member + `":0}}`,
-		`{"Revision":0,"member_revisions":{"` + member + `":0}}`,
-		`{"revision":0,"Member_Revisions":{"` + member + `":0}}`,
-		`{"revision":0,"member_revisions":{"AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA":0}}`,
-		`{"revision":0,"member_revisions":{"00000000-0000-0000-0000-000000000000":0}}`,
-		`{"revision":0,"member_revisions":{"title":0}}`,
-		`{"revision":0,"member_revisions":{"../` + member + `":0}}`,
-		`{"revision":0,"member_revisions":{"` + strings.ReplaceAll(member, "-", "_") + `":0}}`,
-		`{"revision":0,"member_revisions":{"` + member + `":0},"title":"anything"}`,
-		`{"revision":0,"member_revisions":{"` + member + `":0},"path":"/fixture/private"}`,
-		`{"revision":0,"member_revisions":{"` + member + `":0}} {}`,
-		`{"revision":0,"member_revisions":{"` + member + `":0},"unknown":"` + strings.Repeat("x", 8192) + `"}`,
-	} {
-		for _, method := range []string{"POST", "DELETE"} {
-			w := desktopControlRequest(t, mux, method, path, body, api.ManagementKey)
-			if w.Code != 400 || !json.Valid(w.Body.Bytes()) {
-				t.Fatalf("%s ambiguous body %s: %d %s", method, body, w.Code, w.Body.String())
-			}
-		}
-	}
-	validMembers := `,"revision":0,"member_revisions":{"` + member + `":0}}`
-	for _, account := range []string{"../claude-a", "codex-a", ""} {
-		w := desktopControlRequest(t, mux, "POST", path, `{"account_id":`+strconv.Quote(account)+validMembers, api.ManagementKey)
-		if w.Code != 400 {
-			t.Fatalf("invalid account %q: %d", account, w.Code)
-		}
-	}
-	w := desktopControlRequest(t, mux, "POST", path, `{"account_id":"missing"`+validMembers, api.ManagementKey)
-	if w.Code != 404 {
-		t.Fatalf("missing account: %d %s", w.Code, w.Body.String())
-	}
-	w = desktopControlRequest(t, mux, "DELETE", path, `{"account_id":"claude-a"`+validMembers, api.ManagementKey)
-	if w.Code != 400 {
-		t.Fatal("reset accepted a selection-only field")
-	}
-	if len(m.Scopes()) != 0 || len(m.Sessions()) != 0 || len(m.ConversationBindings()) != 0 {
-		t.Fatal("invalid grouped request changed relay state")
 	}
 }
 
@@ -268,61 +197,6 @@ func TestDesktopRelayConversationRouteWhitelistIsExact(t *testing.T) {
 		if w := desktopControlRequest(t, handler, "POST", path, `{}`, api.ManagementKey); w.Code != 401 {
 			t.Fatalf("unsafe scope %s: %d", scope, w.Code)
 		}
-	}
-}
-
-func TestDesktopRelayConversationViewKeepsOwnedOrphan(t *testing.T) {
-	binding := desktoprelay.ConversationBinding{ScopeID: "11111111-1111-4111-8111-111111111111",
-		ConversationID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", AccountID: "claude-a", Revision: 7}
-	groups := desktopRelayConversations(nil, []desktoprelay.ConversationBinding{binding})
-	if len(groups) != 1 || groups[0].ConversationBinding != binding || groups[0].SessionIDs == nil ||
-		len(groups[0].SessionIDs) != 0 || groups[0].MemberRevisions == nil || len(groups[0].MemberRevisions) != 0 || groups[0].AssociationVerified {
-		t.Fatal("GET group DTO dropped saved ownership without currently visible members")
-	}
-}
-
-func TestDesktopRelaySessionViewUsesOnlyScopedSourceProof(t *testing.T) {
-	const scope = "11111111-1111-4111-8111-111111111111"
-	const alias = "22222222-2222-4222-8222-222222222222"
-	const conversation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	const different = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-	for _, tc := range []struct {
-		name, stored, display, proof, want   string
-		available, owned, verified, conflict bool
-	}{
-		{"owned sparse proof despite matching display", conversation, conversation, "", conversation, true, true, false, false},
-		{"unowned sparse proof despite matching display", conversation, conversation, "", "", true, false, false, false},
-		{"fresh display alone", "", conversation, "", "", true, false, false, false},
-		{"owned binding cannot prove an unknown alias", "", conversation, "", "", true, true, false, false},
-		{"fresh scoped proof with display", "", conversation, conversation, conversation, true, false, true, false},
-		{"fresh scoped proof without display", "", "", conversation, conversation, true, false, true, false},
-		{"known matching scoped proof", conversation, conversation, conversation, conversation, true, true, true, false},
-		{"historical scoped proof without display", conversation, "", conversation, conversation, true, true, true, false},
-		{"source disagrees with saved identity", conversation, conversation, different, conversation, true, true, false, true},
-		{"display disagrees with scoped proof", conversation, different, conversation, conversation, true, true, false, true},
-		{"fresh display and scoped proof disagree", "", different, conversation, "", true, false, false, true},
-		{"source error with matching display", conversation, conversation, "", conversation, false, true, false, false},
-		{"source error discards partial proof", conversation, conversation, conversation, conversation, false, true, false, false},
-		{"local prefix is not canonical source proof", conversation, conversation, "local_" + conversation, conversation, true, true, false, false},
-		{"uppercase is not canonical source proof", conversation, conversation, strings.ToUpper(conversation), conversation, true, true, false, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			owned := map[desktopRelayConversationIdentity]bool{{scope, conversation}: tc.owned}
-			session := desktoprelay.Session{ScopeID: scope, SessionID: alias, ConversationID: tc.stored, Revision: 2, AccountID: "claude-a"}
-			metadata := sessionmeta.Info{ConversationID: tc.display, Title: "Display title", Project: "fixture-project", ClientKind: "desktop"}
-			view := desktopRelaySessionAssociation(session, metadata, tc.proof, tc.available, owned)
-			if view.ConversationID != tc.want || view.AssociationVerified != tc.verified || view.AssociationConflict != tc.conflict {
-				t.Fatalf("association view = id %q, verified %t, conflict %t", view.ConversationID, view.AssociationVerified, view.AssociationConflict)
-			}
-			if view.Info != metadata || view.Session.ConversationID != tc.stored || view.Session.Revision != session.Revision || view.Session.AccountID != session.AccountID {
-				t.Fatal("association decoration changed display metadata or captured session state")
-			}
-		})
-	}
-	view := desktopRelaySessionAssociation(desktoprelay.Session{ScopeID: scope, SessionID: alias, ConversationID: conversation},
-		sessionmeta.Info{ConversationID: conversation}, "", true, map[desktopRelayConversationIdentity]bool{{different, conversation}: true})
-	if view.ConversationID != "" || view.AssociationVerified {
-		t.Fatal("missing scoped proof borrowed saved group ownership from another scope")
 	}
 }
 

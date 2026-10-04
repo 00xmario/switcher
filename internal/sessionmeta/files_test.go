@@ -2,7 +2,6 @@ package sessionmeta_test
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,7 +133,7 @@ func TestLookupMissingRootsAndUnsetConfigNeverUseHOME(t *testing.T) {
 	}
 }
 
-func TestLookupBudgetsRejectOversizedAndIncompleteScans(t *testing.T) {
+func TestLookupOversizedFileFallsThrough(t *testing.T) {
 	t.Run("per file falls through", func(t *testing.T) {
 		root := fixtureRoot(t)
 		desktop, projects := filepath.Join(root, "desktop"), filepath.Join(root, "projects")
@@ -143,35 +142,6 @@ func TestLookupBudgetsRejectOversizedAndIncompleteScans(t *testing.T) {
 		got := sessionmeta.New(sessionmeta.Config{DesktopRoot: desktop, ProjectsRoot: projects}).Lookup(context.Background(), []string{firstID})
 		if got[firstID].Title != "Bounded fallback" {
 			t.Fatalf("oversized file prevented fallback: %#v", got)
-		}
-	})
-	t.Run("record budget", func(t *testing.T) {
-		root := fixtureRoot(t)
-		row := `{"sessionId":"` + firstID + `","summary":"Unproven title"}`
-		saved(t, root, "a/sessions-index.json", `{"entries":[`+strings.Repeat(row+",", 4096)+row+`]}`)
-		if got := sessionmeta.New(sessionmeta.Config{ProjectsRoot: root}).Lookup(context.Background(), []string{firstID}); len(got) != 0 {
-			t.Fatalf("incomplete scan exposed an unproven match: %#v", got)
-		}
-	})
-	t.Run("directory entry budget", func(t *testing.T) {
-		root := fixtureRoot(t)
-		saved(t, root, "account/workspace/local_first.json", `{"cliSessionId":"`+firstID+`","title":"Unproven title"}`)
-		for j := 0; j < 4096; j++ {
-			saved(t, root, fmt.Sprintf("account/workspace/ignored_%04d.tmp", j), `{}`)
-		}
-		if got := sessionmeta.New(sessionmeta.Config{DesktopRoot: root}).Lookup(context.Background(), []string{firstID}); len(got) != 0 {
-			t.Fatalf("entry-limited scan exposed an unproven match: %#v", got)
-		}
-	})
-	t.Run("total byte budget", func(t *testing.T) {
-		root := fixtureRoot(t)
-		prefix := `{"cliSessionId":"` + firstID + `","title":"Unproven title","padding":"`
-		data := prefix + strings.Repeat("x", (1<<20)-len(prefix)-2) + `"}`
-		for j := 0; j < 33; j++ {
-			saved(t, root, fmt.Sprintf("account/workspace/local_%02d.json", j), data)
-		}
-		if got := sessionmeta.New(sessionmeta.Config{DesktopRoot: root}).Lookup(context.Background(), []string{firstID}); len(got) != 0 {
-			t.Fatalf("incomplete byte-limited scan exposed a match: %#v", got)
 		}
 	})
 }

@@ -50,8 +50,12 @@ func TestTransientRefreshFailureDoesNotParkOrSwitch(t *testing.T) {
 			if err := m.Activate("a"); err != nil {
 				t.Fatal(err)
 			}
+			want := http.StatusUnauthorized // Anthropic's own answer
+			if expired {
+				want = http.StatusServiceUnavailable // no usable token to send
+			}
 			response := doRequest(t, m, "/v1/responses")
-			if response.Code != http.StatusServiceUnavailable || m.ActiveID("fake") != "a" {
+			if response.Code != want || m.ActiveID("fake") != "a" {
 				t.Fatalf("transient outage switched billing: status=%d active=%s", response.Code, m.ActiveID("fake"))
 			}
 			if _, parked := m.Exhausted("a"); parked {
@@ -397,7 +401,7 @@ func TestCredentialPreparationLockWaitRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, err := m.PrepareAccount(ctx, "a"); done <- err }()
+	go func() { _, err := m.RefreshAccountAfter401(ctx, "a", "rejected"); done <- err }()
 	select {
 	case err := <-done:
 		lock.Unlock()

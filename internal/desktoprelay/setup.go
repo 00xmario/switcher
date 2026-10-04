@@ -119,7 +119,7 @@ func validSetupRecords(s diskState, dataRoot string) bool {
 		}
 		for _, env := range []map[string]json.RawMessage{r.OriginalEnv, r.BeforeEnv} {
 			for k, v := range env {
-				if (k != setupKeys[0] && k != setupKeys[1]) || !uniqueJSON(v) {
+				if (k != setupKeys[0] && k != setupKeys[1]) || !json.Valid(v) {
 					return false
 				}
 			}
@@ -331,12 +331,6 @@ func (m *Manager) SetupStatus(path string) SetupStatus {
 		s.ScopeID = r.ScopeID
 		s.BackupPath = filepath.Join(m.cfg.DataRoot, "backups", r.BackupName)
 	}
-	if owned && m.failed {
-		s.Condition = "pending"
-		s.RestartRequired = true
-		s.Message = "Desktop setup durability is uncertain; reload relay state before retrying"
-		return s
-	}
 	dir, err := openSetupDirectory(filepath.Dir(path), false)
 	var current setupFile
 	if err == nil {
@@ -371,7 +365,7 @@ func (m *Manager) SetupStatus(path string) SetupStatus {
 		s.Message = "Desktop proxy settings changed after setup"
 		return s
 	}
-	if m.failed || m.run == nil || m.run.ctx.Err() != nil {
+	if m.run == nil || m.run.ctx.Err() != nil {
 		s.Message = "Desktop relay is not listening"
 		return s
 	}
@@ -414,9 +408,6 @@ func (m *Manager) restoreSetup(ctx context.Context, path string) error {
 	}
 	if err := m.initializeLocked(false); err != nil {
 		return err
-	}
-	if m.failed {
-		return setupError("setup_unavailable", ErrUnavailable)
 	}
 	r, ok := m.state.Setups[path]
 	if !ok || r.Phase == "restored" {

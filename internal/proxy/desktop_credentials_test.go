@@ -89,7 +89,8 @@ func TestDesktopCredentialSourcePreparesExplicitClaudeAccountWithoutActivation(t
 	if err != nil || credential.AccountID != "claude-b" || credential.AccessToken != "fixture-target-access" {
 		t.Fatalf("explicit preparation failed: %v", err)
 	}
-	if m.ActiveID("claude") != "claude-a" || p.activations != 0 || strings.Join(p.synced, ",") != "claude-b" {
+	// A valid stored token is returned without native sync or refresh.
+	if m.ActiveID("claude") != "claude-a" || p.activations != 0 || len(p.synced) != 0 {
 		t.Fatal("preparation changed or followed the native/global active account")
 	}
 	if _, err := source.RefreshRejected(context.Background(), "claude-b", "fixture-target-access"); err != nil {
@@ -129,7 +130,7 @@ func TestDesktopCredentialSourceRejectsOtherProvidersAndSanitizesOwnedErrors(t *
 		{errors.New("fixture-provider-body-secret"), desktoprelay.ErrUnavailable},
 	} {
 		p.err = tc.err
-		credential, err := source.Prepare(context.Background(), "claude-b")
+		credential, err := source.RefreshRejected(context.Background(), "claude-b", "fixture-target-access")
 		if !errors.Is(err, tc.want) || strings.Contains(err.Error(), "fixture-provider-body-secret") || credential.AccessToken != "" {
 			t.Fatal("adapter lost error classification or disclosed provider error")
 		}

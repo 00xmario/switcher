@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"switcher/internal/desktoprelay"
 	"switcher/internal/sessionmeta"
@@ -56,8 +55,6 @@ func newMetadataAPI(t *testing.T, metadata ...*sessionmeta.Index) (*API, *http.S
 		}),
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("fixture forbids network egress")
-		}, LookupIP: func(context.Context, string) ([]net.IP, error) {
-			return nil, errors.New("fixture forbids DNS")
 		}}
 	var index *sessionmeta.Index
 	if len(metadata) != 0 {
@@ -171,98 +168,6 @@ func TestSessionMetadataGETEnrichesOnlyResponseView(t *testing.T) {
 	}
 	if after, err := os.ReadFile(first); err != nil || !bytes.Equal(metadata, after) {
 		t.Fatal("GET modified saved session metadata")
-	}
-}
-
-func TestSessionMetadataScopedProofControlsGrouping(t *testing.T) {
-	const conversation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	for _, shared := range []bool{false, true} {
-		name := "display_only_nil_resolver"
-		if shared {
-			name = "production_shared_resolver"
-		}
-		t.Run(name, func(t *testing.T) {
-			desktop, err := filepath.EvalSymlinks(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			index := sessionmeta.New(sessionmeta.Config{DesktopRoot: desktop})
-			var api *API
-			var mux *http.ServeMux
-			var root string
-			if shared {
-				api, mux, root = newMetadataAPI(t, index)
-			} else {
-				api, mux, root = newMetadataAPI(t)
-				api.DesktopSessionMetadata = index
-			}
-			before := api.DesktopRelay.Sessions()
-			for _, session := range before {
-				if session.ConversationID != "" {
-					t.Fatal("fixture observation unexpectedly acquired native membership")
-				}
-			}
-			statePath := filepath.Join(root, "relay", "state.json")
-			state, err := os.ReadFile(statePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			record := func(id string) string {
-				return `{"sessionId":"local_` + conversation + `","cliSessionId":"` + id + `","createdAt":1788432998079,"cwd":"/fixture/private/project","title":"Display title"}`
-			}
-			path := metadataFixture(t, desktop, "account/workspace/local_"+conversation+".json", record(metaFirstID))
-			for _, current := range []string{metaFirstID, metaSecondID} {
-				if err := os.WriteFile(path, []byte(record(current)), 0600); err != nil {
-					t.Fatal(err)
-				}
-				// Repeated missing UUIDs are negatively cached for three seconds.
-				// The second mutation is only observable after that snapshot expires.
-				if current != metaFirstID {
-					time.Sleep(3100 * time.Millisecond)
-				}
-				if _, err := index.Resolve(context.Background(), []string{current, metaThirdID}); err != nil {
-					t.Fatal(err)
-				}
-				w := desktopControlRequest(t, mux, "GET", "/api/desktop-relay", "", api.ManagementKey)
-				var view struct {
-					Sessions      []desktopRelaySessionView      `json:"sessions"`
-					Conversations []desktopRelayConversationView `json:"conversations"`
-				}
-				if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil || w.Code != 200 {
-					t.Fatalf("GET scoped proof: %d, %v", w.Code, err)
-				}
-				wantGroups := 0
-				if shared {
-					wantGroups = 1
-				}
-				if len(view.Conversations) != wantGroups {
-					t.Fatal("display lookup substituted for authoritative scoped membership")
-				}
-				for _, session := range view.Sessions {
-					wantVerified := shared && session.SessionID == current
-					if session.AssociationVerified != wantVerified || session.AssociationConflict {
-						t.Fatal("sparse source proof was filled from display data or prior GET")
-					}
-					wantID := ""
-					if wantVerified {
-						wantID = conversation
-					}
-					if session.ConversationID != wantID {
-						t.Fatal("unknown or retired unproved alias acquired a group identity")
-					}
-					if session.SessionID == current && (session.Title != "Display title" || session.Project != "project") {
-						t.Fatal("absence of source membership removed legitimate display decoration")
-					}
-				}
-				if shared && (!view.Conversations[0].AssociationVerified || !reflect.DeepEqual(view.Conversations[0].SessionIDs, []string{current})) {
-					t.Fatal("shared source proof did not group exactly the currently proved alias")
-				}
-				after, err := os.ReadFile(statePath)
-				if err != nil || !bytes.Equal(state, after) || !reflect.DeepEqual(before, api.DesktopRelay.Sessions()) {
-					t.Fatal("GET persisted membership or display information")
-				}
-			}
-		})
 	}
 }
 

@@ -54,7 +54,7 @@ func (s *DesktopCredentialSource) prepare(ctx context.Context, id string, reject
 	if a.ID != id || a.Provider != "claude" || a.Token.AccessToken == "" {
 		return desktoprelay.Credential{}, desktoprelay.ErrUnavailable
 	}
-	return desktoprelay.Credential{AccountID: id, AccessToken: a.Token.AccessToken}, nil
+	return desktoprelay.Credential{AccountID: id, AccessToken: a.Token.AccessToken, AccountUUID: a.Token.AccountID}, nil
 }
 
 // Preserve only local classifications. Provider bodies, native paths and OAuth

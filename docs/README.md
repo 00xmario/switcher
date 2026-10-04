@@ -36,19 +36,16 @@ Successful relay forwarding is not proof of independent provider-side billing.
 Complete account-B billing, task continuity, and bundled-client compatibility
 have not been conclusively verified together.
 
-Version 0.5.10 caused local conversation-association 503s on ordinary traffic.
-Version 0.5.12 removes metadata-I/O dependency from caller and exact-session
-traffic when there is no active conversation-group selection in that scope.
-Cached discovery is nonblocking, and repeated unknown-ID lookups use a bounded
-negative cache. Group-selected requests still require appropriate association
-proof before substituting credentials; they never silently fall back to a
-different account. Keep regressions for this distinction when changing routing.
+For a picked conversation the relay sends the request as Claude Code logged in
+to that account would (token, OAuth beta, `account_uuid`). It does not enforce
+local concurrency limits, request policies or metadata checks on the request
+path; errors and rate limits come from Anthropic. Metadata lookup failures leave a
+request on the caller's own credential rather than failing it.
 
 ## Guides
 
 - [Setup, usage, and live validation](desktop-relay-usage.md)
 - [Relay module and wire contract](desktop-relay-module.md)
-- [Conversation identity and upstream response evidence](desktop-conversation-identity.md)
 - [Initial implementation plan and subsequent setup changes](desktop-relay-plan.md)
 - [claude-swap native credential integration analysis](claude-swap-analysis.md)
 

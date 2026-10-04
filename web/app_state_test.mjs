@@ -116,18 +116,22 @@ const accountContext = vm.createContext({
   data: { active: { codex: 'active-id' } },
   pendingRechecks: new Map(),
   pendingActivations: new Set(),
-  PLAN_NAMES: { pro: 'Pro 20x', prolite: 'Pro 5x' },
+  PLAN_NAMES: { pro: 'Pro 20x', prolite: 'Pro 5x', free: 'Free' },
+  PROVIDER_NAMES: { codex: 'Codex', claude: 'Claude' },
+  PROVIDER_BAR_COLORS: { codex: 'var(--bar-codex)' },
+  resetTime: hover.resetTime || (() => null),
+  unknownResetText: () => 'Reset time not reported',
   ADD_METHOD: { codex: 'browser', opencode: 'key' },
   LOGOS: { codex: '<svg aria-hidden="true"></svg>' },
   statusOf: account => ({ cls: account.id === 'active-id' ? 'active' : '', label: 'Idle' }),
   healthText: () => 'Usage current',
   escapeHTML: hover.escapeHTML,
-  windowHTML: () => '',
+  windowHTML: w => w.label,
   fmtRemaining: seconds => seconds > Date.now() / 1000 ? '1h' : null,
 });
 vm.runInContext(source.slice(formatStart, formatEnd) + '\n' +
   source.slice(windowEnd, source.indexOf('\n// Update banner:', windowEnd)) +
-  '\nthis.accountHTML = accountHTML; this.accountMenuHTML = accountMenuHTML;', accountContext);
+  '\nthis.accountHTML = accountHTML; this.accountMenuHTML = accountMenuHTML; this.mergedWindowsHTML = mergedWindowsHTML; this.accountInitials = accountInitials;', accountContext);
 const withoutCredit = accountContext.accountHTML({ id: 'active-id', provider: 'codex',
   email: 'active@example.com', plan: 'pro', health: { condition: 'usage_current' } });
 const withCredit = accountContext.accountHTML({ id: 'banked-id', provider: 'codex',
@@ -170,6 +174,15 @@ assert.match(compactCard, /Banked reset expiry[\s\S]*Reset 1[\s\S]*title="Banked
 const activeCompact = accountContext.compactAccountHTML({ id: 'active-id', provider: 'codex', email: 'active@example.com', plan: 'pro' });
 assert.match(activeCompact, /class="identity-line"[\s\S]*class="email"[\s\S]*class="account-badge active-status"/);
 assert.doesNotMatch(activeCompact, /data-act="activate"/);
+const freeAccount = { id: 'free-id', provider: 'codex', email: 'free@example.test', plan: 'free',
+  health: { condition: 'usage_current' }, usage: { available: true, windows: [
+    { label: 'Monthly', used_percent: 0, resets_at: reset },
+  ] } };
+for (const html of [accountContext.accountHTML(freeAccount), accountContext.compactAccountHTML(freeAccount)]) {
+  assert.match(html, />Free</);
+  assert.match(html, /Monthly/);
+  assert.doesNotMatch(html, /Pro 20x|Pro 5x/);
+}
 const nativeNotSelected = accountContext.compactAccountHTML({ id: 'active-id', provider: 'claude', email: 'fixture@example.test', native_switch_available: true, native_active: false });
 assert.match(nativeNotSelected, /Use in Claude Code/);
 assert.doesNotMatch(nativeNotSelected, /account-badge active-status/);
@@ -382,3 +395,17 @@ assert.match(source, /<details class="cli-setup-details"><summary>/);
 }
 
 console.log('State ordering and fast Recheck reconciliation: OK');
+
+// Merged view: one card per window, a bar per account, average headline.
+{
+  const merged = accountContext.mergedWindowsHTML([
+    { id: 'active-id', provider: 'codex', email: 'mario.makdis@example.test', usage: { windows: [{ label: 'Weekly', used_percent: 40 }] } },
+    { id: 'other', provider: 'codex', email: 'mo@example.test', usage: { windows: [{ label: 'Weekly', used_percent: 0 }, { label: 'Monthly', used_percent: 10 }] } },
+  ], 'codex');
+  assert.equal((merged.match(/class="window merged-window"/g) || []).length, 2);
+  assert.match(merged, /Weekly[\s\S]*80%<span>left<\/span>/, 'headline is the average remaining share');
+  assert.match(merged, /bar-name">Codex<\/span><span class="bar-pct">60%/, 'the selected account is labeled with the provider');
+  assert.match(merged, /acct-initials">MO<\/span><span class="bar-pct">100%/);
+  assert.match(merged, /Monthly[\s\S]*<div class="merged-slot"><\/div>/, 'an account without the window leaves its slot empty');
+  assert.equal(accountContext.accountInitials({ email: 'mario.makdis@x.y' }), 'MM');
+}

@@ -5,35 +5,27 @@ import (
 	"net/http"
 )
 
-// CredentialError exposes a stable classification without retaining a source
-// error, its message, or its chain. Unwrap returns only a module sentinel.
+// CredentialError classifies a selected-account credential failure without
+// exposing the source error, which may carry provider text or tokens.
 type CredentialError struct {
 	Code string `json:"error_code"`
 	kind error
 }
 
 func (e *CredentialError) Error() string {
-	switch e.Code {
-	case "account_not_found":
-		return "desktop relay selected account no longer exists"
-	case "credential_busy":
-		return "desktop relay credential source busy"
-	default:
-		return "desktop relay selected credential unavailable"
+	if e.Code == "account_not_found" {
+		return "Switcher: the selected account no longer exists"
 	}
+	return "Switcher could not get a valid credential for the selected account; check the account in Switcher"
 }
 func (e *CredentialError) Unwrap() error     { return e.kind }
 func (e *CredentialError) ErrorCode() string { return e.Code }
 
 func credentialFailure(err error) *CredentialError {
-	switch {
-	case errors.Is(err, ErrNotFound):
+	if errors.Is(err, ErrNotFound) {
 		return &CredentialError{Code: "account_not_found", kind: ErrNotFound}
-	case errors.Is(err, ErrBusy) || errors.Is(err, ErrCredentialBusy):
-		return &CredentialError{Code: "credential_busy", kind: ErrCredentialBusy}
-	default:
-		return &CredentialError{Code: "credential_unavailable", kind: ErrUnavailable}
 	}
+	return &CredentialError{Code: "credential_unavailable", kind: ErrUnavailable}
 }
 
 func replyCredentialFailure(w http.ResponseWriter, err error) {

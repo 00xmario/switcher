@@ -7,7 +7,6 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
-	"errors"
 	"io"
 	"log"
 	"net"
@@ -17,25 +16,18 @@ import (
 	"time"
 )
 
-const maxHeaders = 32 << 10
-
 func quietServer(h http.Handler) *http.Server {
-	return &http.Server{Handler: h, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: maxHeaders, ErrorLog: log.New(io.Discard, "", 0)}
+	return &http.Server{Handler: h, ReadHeaderTimeout: 30 * time.Second, ErrorLog: log.New(io.Discard, "", 0)}
 }
 
 func ingressServer(m *Manager, r *runtime) *http.Server {
 	s := quietServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { m.connect(r, w, req) }))
 	s.BaseContext = func(net.Listener) context.Context { return r.ctx }
-	s.ConnContext = ingressContext
 	return s
 }
 
 func (m *Manager) authenticate(req *http.Request) (string, bool) {
-	v := req.Header.Values("Proxy-Authorization")
-	if len(v) != 1 || !strings.HasPrefix(v[0], "Basic ") || len(v[0]) > 512 {
-		return "", false
-	}
-	b, err := base64.StdEncoding.Strict().DecodeString(strings.TrimPrefix(v[0], "Basic "))
+	b, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(req.Header.Get("Proxy-Authorization"), "Basic "))
 	if err != nil {
 		return "", false
 	}
@@ -45,63 +37,37 @@ func (m *Manager) authenticate(req *http.Request) (string, bool) {
 	}
 	m.mu.Lock()
 	s, exists := m.state.Scopes[id]
-	if m.failed {
-		exists = false
-	}
 	m.mu.Unlock()
 	expected := sha256.Sum256([]byte(s.Secret))
 	actual := sha256.Sum256([]byte(secret))
-	valid := subtle.ConstantTimeCompare(expected[:], actual[:]) == 1
-	return id, exists && valid
+	return id, exists && subtle.ConstantTimeCompare(expected[:], actual[:]) == 1
 }
 
-func (m *Manager) scopeExists(id string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_, ok := m.state.Scopes[id]
-	return ok
-}
-
+// connect intercepts api.anthropic.com so the credential can be swapped, and
+// tunnels every other destination unchanged.
 func (m *Manager) connect(r *runtime, w http.ResponseWriter, req *http.Request) {
-	closeBody := m.guardBody(w, req)
-	defer closeBody()
-	// One outer admission attempt per socket. Inner TLS HTTP keepalive is
-	// independent; rejected CONNECT attempts must never reuse captured headers.
-	w.Header().Set("Connection", "close")
-	peer, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil || !net.ParseIP(peer).IsLoopback() {
-		http.Error(w, "loopback required", 403)
-		return
-	}
 	if req.Method != http.MethodConnect {
-		http.Error(w, "CONNECT required", 405)
+		http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
 		return
 	}
-	id, ok := m.authenticate(req)
+	scope, ok := m.authenticate(req)
 	if !ok {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="Switcher Desktop relay"`)
-		http.Error(w, "scope admission required", 407)
+		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
-	host, err := authority(req.RequestURI)
-	wire, _ := req.Context().Value(ingressContextKey{}).(*ingressConn)
-	if err != nil || req.Host != req.RequestURI || wire == nil || wire.hostCount != 1 || wire.host != req.RequestURI || req.ContentLength > 0 || len(req.TransferEncoding) != 0 {
-		http.Error(w, "invalid CONNECT authority", 400)
-		return
-	}
-	closeBody()
 	var upstream net.Conn
-	if host != originHost {
-		upstream, err = m.dialPublic(req.Context(), "tcp", req.RequestURI)
-		if err != nil {
-			http.Error(w, "destination unavailable or forbidden", 403)
+	if req.Host != originHost+":443" {
+		var err error
+		if upstream, err = m.dial(req.Context(), "tcp", req.Host); err != nil {
+			http.Error(w, "destination unavailable", http.StatusBadGateway)
 			return
 		}
 		defer upstream.Close()
 	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "CONNECT unavailable", 503)
+		http.Error(w, "CONNECT unavailable", http.StatusInternalServerError)
 		return
 	}
 	c, rw, err := hj.Hijack()
@@ -109,29 +75,19 @@ func (m *Manager) connect(r *runtime, w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	defer c.Close()
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
+	if !r.track(c) {
 		return
 	}
-	r.conns[c] = tunnelRecord{scope: id, blind: upstream != nil}
-	r.wg.Add(1)
-	r.mu.Unlock()
-	defer func() { r.mu.Lock(); delete(r.conns, c); r.mu.Unlock(); r.wg.Done() }()
-	if !m.scopeExists(id) {
-		return
-	}
-	c.SetDeadline(time.Now().Add(15 * time.Second))
+	defer r.untrack(c)
 	if _, err = rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
 	if err = rw.Flush(); err != nil {
 		return
 	}
-	// Hijack may have buffered a pipelined ClientHello or blind tunnel bytes.
+	// Hijack may have buffered a pipelined ClientHello or tunnel bytes.
 	buffered := &bufferConn{Conn: c, reader: rw.Reader}
 	if upstream != nil {
-		c.SetDeadline(time.Time{})
 		splice(r.ctx, buffered, upstream)
 		return
 	}
@@ -142,20 +98,13 @@ func (m *Manager) connect(r *runtime, w http.ResponseWriter, req *http.Request) 
 	if err != nil {
 		return
 	}
-	tc := tls.Server(buffered, &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		if hello.ServerName != originHost {
-			return nil, errors.New("SNI outside relay origin")
-		}
-		return &leaf, nil
-	}})
+	tc := tls.Server(buffered, &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}, Certificates: []tls.Certificate{leaf}})
 	if err := tc.HandshakeContext(r.ctx); err != nil {
 		return
 	}
-	c.SetDeadline(time.Time{})
-	one := newOneListener(tc)
-	inner := quietServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { m.forward(r, id, w, req) }))
+	inner := quietServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { m.forward(r, scope, w, req) }))
 	inner.BaseContext = func(net.Listener) context.Context { return r.ctx }
-	inner.Serve(one)
+	inner.Serve(newOneListener(tc))
 	inner.Close()
 }
 
@@ -180,6 +129,7 @@ type closeConn struct {
 
 func (c *closeConn) Close() error { c.once.Do(func() { close(c.closed) }); return c.Conn.Close() }
 
+// oneListener serves exactly one already-accepted connection.
 type oneListener struct {
 	conn *closeConn
 	once bool

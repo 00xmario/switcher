@@ -157,7 +157,7 @@ func TestAutomaticResetDoesNotSpendWhenFailoverLookupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	awaitResetWorker(t, m, "a")
-	if response.Code != 503 || p.spends() != 0 {
+	if response.Code != 429 || p.spends() != 0 {
 		t.Fatalf("spent without proving last-resort eligibility: status=%d spends=%d", response.Code, p.spends())
 	}
 }

@@ -6,115 +6,32 @@ import (
 	"time"
 )
 
-func usable(c Credential, account string) bool {
-	return c.AccountID == account && c.AccessToken != "" && len(c.AccessToken) <= 16384 && !strings.ContainsAny(c.AccessToken, " \r\n\t")
-}
-
+// Bind selects an account for one request session. The account is prepared
+// first so a broken account is reported here rather than on the next request.
 func (m *Manager) Bind(ctx context.Context, scopeID, sessionID, accountID string, expectedRevision uint64) (Session, error) {
 	scopeID, sessionID = strings.ToLower(scopeID), strings.ToLower(sessionID)
-	key := taskKey(scopeID, sessionID)
-	m.mu.Lock()
-	s, ok := m.state.Sessions[key]
-	if !ok {
-		m.mu.Unlock()
-		return Session{}, ErrNotFound
-	}
-	if s.Revision != expectedRevision {
-		m.mu.Unlock()
-		return Session{}, ErrConflict
-	}
-	if m.activeConversationLocked(s) {
-		m.mu.Unlock()
-		return Session{}, ErrConflict
-	}
-	if m.run == nil || m.run.ctx.Err() != nil || m.failed || !m.state.Enabled || m.cfg.Source == nil || accountID == "" || len(accountID) > 256 {
-		m.mu.Unlock()
+	if accountID == "" {
 		return Session{}, ErrUnavailable
 	}
-	runCtx := m.run.ctx
-	recordedConversationKey := taskKey(scopeID, s.ConversationID)
-	recordedConversationRevision := m.state.ConversationBindings[recordedConversationKey].Revision
-	m.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	stop := context.AfterFunc(runCtx, cancel)
-	defer stop()
-	resolved, err := m.resolveConversations(ctx, scopeID, []string{sessionID})
-	if err != nil {
-		return Session{}, err
-	}
-	if m.cfg.Conversations != nil {
-		if err := verifiedAssociation(s, resolved[sessionID]); err != nil {
-			return Session{}, err
-		}
-	}
-	m.mu.Lock()
-	if m.state.ConversationBindings[recordedConversationKey].Revision != recordedConversationRevision {
-		m.mu.Unlock()
-		return Session{}, ErrConflict
-	}
-	conversationID := resolved[sessionID]
-	if conversationID == "" {
-		conversationID = s.ConversationID
-	}
-	conversationKey := taskKey(scopeID, conversationID)
-	conversationBinding := m.state.ConversationBindings[conversationKey]
-	active := conversationBinding.AccountID != ""
-	m.mu.Unlock()
-	if active {
-		return Session{}, ErrConflict
-	}
-	c, err := m.cfg.Source.Prepare(ctx, accountID)
-	if err != nil || !usable(c, accountID) {
+	if _, err := m.prepare(ctx, accountID); err != nil {
 		return Session{}, credentialFailure(err)
-	}
-	if err := ctx.Err(); err != nil {
-		return Session{}, err
-	}
-	checked, err := m.resolveConversations(ctx, scopeID, []string{sessionID})
-	if err != nil {
-		return Session{}, err
-	}
-	if checked[sessionID] != resolved[sessionID] {
-		return Session{}, ErrConflict
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	current, ok := m.state.Sessions[key]
+	key := taskKey(scopeID, sessionID)
+	s, ok := m.state.Sessions[key]
 	if !ok {
 		return Session{}, ErrNotFound
 	}
-	if current.Revision != expectedRevision {
+	if s.Revision != expectedRevision || m.activeConversationLocked(s) {
 		return Session{}, ErrConflict
 	}
-	// Empty-account records are reset epochs too. A reset must fence an older
-	// exact selection even when clearing an already-default member changed no
-	// member revision and the conversation is still inactive.
-	if m.state.ConversationBindings[recordedConversationKey].Revision != recordedConversationRevision || m.state.ConversationBindings[conversationKey].Revision != conversationBinding.Revision {
-		return Session{}, ErrConflict
-	}
-	if m.activeConversationLocked(current) || m.state.ConversationBindings[taskKey(scopeID, checked[sessionID])].AccountID != "" {
-		return Session{}, ErrConflict
-	}
-	if m.run == nil || m.run.ctx != runCtx || m.run.ctx.Err() != nil || m.failed || !m.state.Enabled {
-		return Session{}, ErrUnavailable
-	}
-	if current.Revision == ^uint64(0) {
-		return Session{}, ErrBusy
-	}
-	updated := current
+	updated := s
 	updated.AccountID = accountID
 	updated.Revision++
-	// Waiting for the final lock can outlive management cancellation even
-	// after preparation succeeded. Check at the mutation's commit boundary.
-	if err := ctx.Err(); err != nil {
-		return Session{}, err
-	}
 	m.state.Sessions[key] = updated
 	if err := m.saveLocked(); err != nil {
-		if rollbackAllowed(err) {
-			m.state.Sessions[key] = current
-		}
+		m.state.Sessions[key] = s
 		return Session{}, err
 	}
 	return publicSession(updated), nil
@@ -132,26 +49,15 @@ func (m *Manager) Unbind(scopeID, sessionID string, expectedRevision uint64) (Se
 	if !ok {
 		return Session{}, ErrNotFound
 	}
-	if m.store == nil || m.failed {
-		return Session{}, ErrUnavailable
-	}
-	if s.Revision != expectedRevision {
+	if s.Revision != expectedRevision || m.activeConversationLocked(s) {
 		return Session{}, ErrConflict
-	}
-	if m.activeConversationLocked(s) {
-		return Session{}, ErrConflict
-	}
-	if s.Revision == ^uint64(0) {
-		return Session{}, ErrBusy
 	}
 	updated := s
 	updated.AccountID = ""
 	updated.Revision++
 	m.state.Sessions[key] = updated
 	if err := m.saveLocked(); err != nil {
-		if rollbackAllowed(err) {
-			m.state.Sessions[key] = s
-		}
+		m.state.Sessions[key] = s
 		return Session{}, err
 	}
 	return publicSession(updated), nil
@@ -169,207 +75,171 @@ func (m *Manager) DeleteScope(id string) error {
 			return setupError("setup_owned", ErrConflict)
 		}
 	}
-	s, ok := m.state.Scopes[id]
-	if !ok {
+	if _, ok := m.state.Scopes[id]; !ok {
 		return ErrNotFound
 	}
-	if m.store == nil || m.failed {
-		return ErrUnavailable
-	}
-	removed := make(map[string]Session)
-	removedBindings := make(map[string]ConversationBinding)
 	delete(m.state.Scopes, id)
 	for k, v := range m.state.Sessions {
 		if v.ScopeID == id {
-			removed[k] = v
 			delete(m.state.Sessions, k)
 		}
 	}
 	for k, v := range m.state.ConversationBindings {
 		if v.ScopeID == id {
-			removedBindings[k] = v
 			delete(m.state.ConversationBindings, k)
 		}
 	}
-	if err := m.saveLocked(); err != nil {
-		if rollbackAllowed(err) {
-			m.state.Scopes[id] = s
-			for k, v := range removed {
-				m.state.Sessions[k] = v
-			}
-			for k, v := range removedBindings {
-				m.state.ConversationBindings[k] = v
-			}
-		}
-		return err
-	}
-	// Opaque tunnels have no visible HTTP admission boundary to recheck.
-	if m.run != nil {
-		m.run.mu.Lock()
-		for c, record := range m.run.conns {
-			if record.scope == id && record.blind {
-				c.Close()
-			}
-		}
-		m.run.mu.Unlock()
-	}
-	return nil
+	return m.saveLocked()
 }
 
-func (m *Manager) observe(ctx context.Context, scope string, v identityView) (Session, error) {
-	if err := ctx.Err(); err != nil {
-		return Session{}, err
-	}
-	m.mu.Lock()
-	activeScope := false
-	for _, binding := range m.state.ConversationBindings {
-		if binding.ScopeID == scope && binding.AccountID != "" {
-			activeScope = true
-			break
-		}
-	}
-	m.mu.Unlock()
-	resolved := map[string]string{}
-	var lookupErr error
-	if v.SessionID != "" {
-		ids := []string{v.SessionID}
-		if activeScope {
-			resolved, lookupErr = m.resolveConversations(ctx, scope, ids)
-		} else if cached, ok := m.cfg.Conversations.(CachedConversationResolver); ok {
-			resolved, lookupErr = validateConversations(ids, cached.ResolveCached(ids, m.knownConversationAssociations(scope, ids)))
-		}
-		if lookupErr != nil {
-			resolved = map[string]string{}
-		}
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failed {
-		return Session{}, ErrUnavailable
-	}
-	if err := ctx.Err(); err != nil {
-		return Session{}, err
-	}
-	if _, ok := m.state.Scopes[scope]; !ok {
-		return Session{}, ErrNotFound
-	}
+// route records the request's session and returns it with the account to use.
+// An empty AccountID means the caller's own credential. Routing never fails a
+// request: unknown sessions and unavailable metadata keep the caller credential.
+func (m *Manager) route(ctx context.Context, scope string, v identityView) Session {
 	if v.SessionID == "" {
-		return Session{}, nil
+		return Session{}
 	}
 	key := taskKey(scope, v.SessionID)
+	conversation := m.lookupConversation(ctx, scope, key, v.SessionID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	s, exists := m.state.Sessions[key]
-	previous := s
 	if !exists {
-		if len(m.state.Sessions)+len(m.state.ConversationBindings) >= 4096 {
-			return Session{}, ErrBusy
-		}
 		s = Session{ScopeID: scope, SessionID: v.SessionID, Revision: 1}
 	}
-	if m.activeConversationLocked(s) {
-		if lookupErr != nil {
-			return Session{}, lookupErr
-		}
-		if !activeScope {
-			return Session{}, ErrConflict
-		}
-		if err := verifiedAssociation(s, resolved[v.SessionID]); err != nil {
-			return Session{}, err
-		}
-	}
-	// Stale or unavailable metadata has no authority over caller/exact routes.
-	// Keep a prior observation rather than reassociating it to another chat.
-	changed := false
-	if conversation := resolved[v.SessionID]; conversation != "" && s.ConversationID == "" {
+	changed := !exists
+	if s.ConversationID == "" && conversation != "" {
 		s.ConversationID = conversation
 		changed = true
-	}
-	s.conversationRevision = 0
-	if binding, ok := m.state.ConversationBindings[taskKey(scope, s.ConversationID)]; ok && binding.AccountID != "" {
-		if !activeScope {
-			return Session{}, ErrConflict
-		}
-		if m.cfg.Conversations == nil {
-			return Session{}, associationFailure("conversation_association_unavailable", ErrUnavailable)
-		}
-		if s.AccountID != binding.AccountID {
-			s.AccountID = binding.AccountID
-			changed = true
-		}
-		s.conversationRevision = binding.Revision
-	}
-	if changed && exists {
-		if s.Revision == ^uint64(0) {
-			return Session{}, ErrBusy
-		}
-		s.Revision++
-	}
-	s.LastSeen = time.Now().UTC()
-	s.Requests++
-	s.Model = v.Model
-	if v.AgentID != "" {
-		s.AgentID = v.AgentID
 	}
 	if v.ParentID != "" {
 		s.ParentSessionID = v.ParentID
 	}
+	// A subagent session belongs to its parent's conversation.
+	parent := m.state.Sessions[taskKey(scope, s.ParentSessionID)]
+	if s.ConversationID == "" && parent.ConversationID != "" {
+		s.ConversationID = parent.ConversationID
+		changed = true
+	}
+	if binding := m.state.ConversationBindings[taskKey(scope, s.ConversationID)]; s.ConversationID != "" && binding.AccountID != "" && s.AccountID != binding.AccountID {
+		s.AccountID = binding.AccountID
+		s.Revision++
+		changed = true
+	}
+	s.LastSeen = time.Now().UTC()
+	s.Requests++
+	s.InFlight++
+	s.Model = v.Model
+	if v.AgentID != "" {
+		s.AgentID = v.AgentID
+	}
 	m.state.Sessions[key] = s
-	if !exists || changed {
-		if err := m.saveLocked(); err != nil {
-			if rollbackAllowed(err) {
-				if exists {
-					m.state.Sessions[key] = previous
-				} else {
-					delete(m.state.Sessions, key)
-				}
-			}
-			return Session{}, err
-		}
+	if changed {
+		m.saveSoonLocked()
 	}
-	return s, nil
+	// A subagent without its own selection follows its parent's exact selection.
+	if s.AccountID == "" && parent.AccountID != "" && !m.activeConversationLocked(s) {
+		s.AccountID = parent.AccountID
+	}
+	return s
 }
 
-// admit is the account snapshot's linearization point. No credential is sent
-// until preparation and the revision check have both completed.
-func (m *Manager) admit(scope string, s Session) (func(), error) {
+// lookupConversation finds the Desktop conversation of an unlinked session.
+// Only a brand-new session in a scope with a selected conversation waits, for
+// at most two seconds, because Desktop may write its metadata just after the
+// first request. Everything else is linked in the background. Failures are
+// ignored: the request keeps the caller's credential.
+func (m *Manager) lookupConversation(ctx context.Context, scope, key, id string) string {
+	if m.cfg.Conversations == nil {
+		return ""
+	}
+	m.mu.Lock()
+	session, exists := m.state.Sessions[key]
+	if session.ConversationID != "" {
+		m.mu.Unlock()
+		return ""
+	}
+	active := false
+	for _, binding := range m.state.ConversationBindings {
+		if binding.ScopeID == scope && binding.AccountID != "" {
+			active = true
+			break
+		}
+	}
+	m.mu.Unlock()
+	ids := []string{id}
+	if cached, ok := m.cfg.Conversations.(CachedConversationResolver); ok {
+		if conversation := cached.ResolveCached(ids)[id]; validUUID(conversation) {
+			return conversation
+		}
+	}
+	if exists || !active {
+		m.associateSoon()
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for {
+		if resolved, err := m.cfg.Conversations.Resolve(ctx, ids); err == nil && validUUID(resolved[id]) {
+			return resolved[id]
+		}
+		select {
+		case <-ctx.Done():
+			m.associateSoon()
+			return ""
+		case <-time.After(400 * time.Millisecond):
+		}
+	}
+}
+
+// associateSoon links unlinked sessions in the background, at most every
+// fifteen seconds, so one Desktop conversation shows up as one entry.
+func (m *Manager) associateSoon() {
+	m.mu.Lock()
+	due := time.Since(m.associated) > 15*time.Second
+	if due {
+		m.associated = time.Now()
+	}
+	m.mu.Unlock()
+	if due && m.associating.CompareAndSwap(false, true) {
+		go func() {
+			defer m.associating.Store(false)
+			m.AssociateConversations(context.Background())
+		}()
+	}
+}
+
+// threadOnAccount reports whether a message thread may be sent with the
+// session's current account. A continued thread is refused only when the
+// session's last thread request used a different account.
+func (m *Manager) threadOnAccount(s Session, thread string) bool {
+	if thread == "" || s.SessionID == "" {
+		return true
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.failed || m.run == nil || m.run.ctx.Err() != nil || !m.state.Enabled {
-		return nil, ErrUnavailable
+	key := taskKey(s.ScopeID, s.SessionID)
+	if previous, seen := m.threads[key]; thread == "continue" && seen && previous != s.AccountID {
+		return false
 	}
-	if _, ok := m.state.Scopes[scope]; !ok {
-		return nil, ErrNotFound
+	if m.threads == nil {
+		m.threads = make(map[string]string)
 	}
+	m.threads[key] = s.AccountID
+	return true
+}
+
+func (m *Manager) finish(s Session) {
 	if s.SessionID == "" {
-		return func() {}, nil
+		return
 	}
-	key := taskKey(scope, s.SessionID)
-	current, ok := m.state.Sessions[key]
-	if !ok {
-		return nil, ErrNotFound
-	}
-	if current.Revision != s.Revision {
-		return nil, ErrConflict
-	}
-	if m.state.ConversationBindings[taskKey(scope, s.ConversationID)].Revision != s.conversationRevision && m.activeConversationLocked(s) {
-		return nil, ErrConflict
-	}
-	current.InFlight++
-	m.state.Sessions[key] = current
-	return func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if current, ok := m.state.Sessions[key]; ok && current.InFlight > 0 {
-			current.InFlight--
-			m.state.Sessions[key] = current
-		}
-	}, nil
-}
-
-func (m *Manager) bindingCurrent(s Session) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	current, ok := m.state.Sessions[taskKey(s.ScopeID, s.SessionID)]
-	return ok && current.Revision == s.Revision && current.AccountID == s.AccountID && (!m.activeConversationLocked(s) || m.state.ConversationBindings[taskKey(s.ScopeID, s.ConversationID)].Revision == s.conversationRevision)
+	key := taskKey(s.ScopeID, s.SessionID)
+	if current, ok := m.state.Sessions[key]; ok && current.InFlight > 0 {
+		current.InFlight--
+		m.state.Sessions[key] = current
+	}
 }
 
 func (m *Manager) activeConversationLocked(s Session) bool {

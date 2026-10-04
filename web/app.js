@@ -463,16 +463,13 @@ function windowHTML(win, providerID) {
   const remaining = fmtRemaining(win.resets_at);
   const exact = remaining ? resetTime(win.resets_at) : null;
   const exactTitle = exact ? ` title="${escapeHTML(exact.title)}"` : '';
-  const exactDate = exact ? ` datetime="${exact.iso}"` : '';
-  const resetText = exact ? `↻ ${remaining}` : unknownResetText(win.resets_at);
-  const recovery = left < 100 && exact
-    ? `<div class="recover"${exactTitle}>↻ +${used}% in ${remaining}</div>`
-    : '';
+  const recovery = left < 100 && exact ? `<div class="recover"${exactTitle}>↻ +${used}% in ${remaining}</div>` : '';
   const color = PROVIDER_BAR_COLORS[providerID] || 'var(--text)';
-  const fill = `<div class="fill" style="width:${left}%; background-color:${color}"></div>`;
-  const hatch = `<div class="hatch" style="width:${used}%; color:${color}"></div>`;
-  const bar = `<div class="bar" role="progressbar" aria-label="${escapeHTML(win.label)} quota remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${left}">${fill}${hatch}</div>
-    <div class="bar-caption"><span>${used}% used</span>${exact ? `<time class="reset-badge"${exactDate}${exactTitle}>${resetText}</time>` : `<span class="reset-badge">${resetText}</span>`}</div>`;
+  const fill = left > 0 ? `<div class="fill" style="width:${left}%; background-color:${color}"></div>` : '';
+  const hatch = used > 0 ? `<div class="hatch" style="width:${used}%; color:${color}"></div>` : '';
+  const reset = exact
+    ? `<time class="reset-badge" datetime="${exact.iso}"${exactTitle}>↻ ${remaining}</time>`
+    : `<span class="reset-badge">${unknownResetText(win.resets_at)}</span>`;
   return `
     <div class="window" data-quota-window="${escapeHTML(win.label)}">
       <div class="win-left">
@@ -481,7 +478,8 @@ function windowHTML(win, providerID) {
         ${recovery}
       </div>
       <div class="win-bar">
-        ${bar}
+        <div class="bar" role="progressbar" aria-label="${escapeHTML(win.label)} quota remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${left}">${fill}${hatch}<span class="bar-label"><span class="bar-name">${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</span><span class="bar-pct">${left}%</span></span></div>
+        ${reset}
       </div>
     </div>`;
 }
@@ -516,10 +514,10 @@ function accountHTML(account) {
           <div class="account-health ${escapeHTML(health.condition)}"><span class="health-mark" aria-hidden="true"></span>${escapeHTML(healthText(health))}</div>
         </div>
         <div class="actions">
+          ${isActive ? '' : `<button class="use" data-act="activate" ${activationPending ? 'disabled aria-busy="true"' : ''} ${account.native_switch_available ? 'title="Switch Claude Code’s native login and Switcher’s Claude proxy"' : ''}>${activationPending ? 'Switching…' : account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
           <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-label="Recheck account usage" title="Recheck usage" aria-disabled="${recheckPending}">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
           </button>
-          ${isActive ? '' : `<button class="use" data-act="activate" ${activationPending ? 'disabled aria-busy="true"' : ''} ${account.native_switch_available ? 'title="Switch Claude Code’s native login and Switcher’s Claude proxy"' : ''}>${activationPending ? 'Switching…' : account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
           <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
         </div>
       </div>
@@ -589,6 +587,86 @@ function compactAccountHTML(account) {
     </div>`;
 }
 
+// accountInitials labels an account in merged bars without showing its email.
+function accountInitials(account) {
+  const local = String(account.email || account.id || '?').split('@')[0];
+  const parts = local.split(/[._+\-\s]+/).filter(Boolean);
+  return (parts.length > 1 ? parts[0][0] + parts[1][0] : local.slice(0, 2)).toUpperCase();
+}
+
+// mergedAccountHTML is the one-line account row of the merged view.
+function mergedAccountHTML(account) {
+  const isActive = accountIsSelected(account);
+  const activationPending = pendingActivations.has(account.id);
+  const recheckPending = pendingRechecks.has(account.id);
+  const health = recheckPending ? { condition: 'checking' } : (account.health || { condition: 'checking' });
+  const plan = PLAN_NAMES[account.plan] || account.plan || '';
+  return `
+    <div class="account merged-account ${isActive ? 'active' : ''}" data-id="${escapeHTML(account.id)}">
+      <div class="account-head">
+        <span class="acct-initials" aria-hidden="true">${escapeHTML(accountInitials(account))}</span>
+        <div class="who">
+          ${accountIdentityHTML(account, isActive)}
+          <div class="meta">
+            ${plan ? `<span>${escapeHTML(plan)}</span>` : ''}
+            ${statusOf(account).cls === 'exhausted' ? '<span class="routing-warning">Out of usage</span>' : ''}
+            ${account.reset_credits?.count > 0 ? `<span class="banked" title="Banked usage-limit resets available">⚡ ${account.reset_credits.count} banked</span>` : ''}
+          </div>
+          <div class="account-health ${escapeHTML(health.condition)}"><span class="health-mark" aria-hidden="true"></span>${escapeHTML(healthText(health))}</div>
+        </div>
+        <div class="actions">
+          ${isActive ? '' : `<button class="use" data-act="activate" ${activationPending ? 'disabled aria-busy="true"' : ''}>${activationPending ? 'Switching…' : account.native_switch_available ? 'Use in Claude Code' : 'Use this account'}</button>`}
+          <button class="recheck-btn ${recheckPending ? 'busy' : ''}" data-act="recheck" type="button" aria-label="Recheck account usage" title="Recheck usage" aria-disabled="${recheckPending}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg>
+          </button>
+          <button class="account-menu-trigger" data-account-menu type="button" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ${escapeHTML(account.email)}" title="More account actions">⋯</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// mergedWindowsHTML shows one card per quota window with a bar per account,
+// like T3 Code. The headline is the average remaining share.
+function mergedWindowsHTML(accounts, providerID) {
+  const labels = [];
+  for (const account of accounts) {
+    for (const win of account.usage?.windows || []) if (!labels.includes(win.label)) labels.push(win.label);
+  }
+  if (!labels.length) return '<div class="merged-windows"></div>';
+  const color = PROVIDER_BAR_COLORS[providerID] || 'var(--text)';
+  const cards = labels.map(label => {
+    const lefts = [];
+    const bars = accounts.map(account => {
+      const win = (account.usage?.windows || []).find(w => w.label === label);
+      if (!win) return '<div class="merged-slot"></div>';
+      const left = Math.max(0, Math.min(100, 100 - win.used_percent));
+      lefts.push(left);
+      const remaining = fmtRemaining(win.resets_at);
+      const exact = remaining ? resetTime(win.resets_at) : null;
+      const name = accountIsSelected(account)
+        ? `<span class="bar-name">${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</span>`
+        : `<span class="acct-initials">${escapeHTML(accountInitials(account))}</span>`;
+      return `<div class="merged-slot win-bar">
+        <div class="bar" role="progressbar" aria-label="${escapeHTML(label)} quota remaining" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${left}">
+          ${left > 0 ? `<div class="fill" style="width:${left}%; background-color:${color}"></div>` : ''}${left < 100 ? `<div class="hatch" style="width:${100 - left}%; color:${color}"></div>` : ''}
+          <span class="bar-label">${name}<span class="bar-pct">${left}%</span></span>
+        </div>
+        ${exact ? `<time class="reset-badge" datetime="${exact.iso}" title="${escapeHTML(exact.title)}">↻ ${remaining}</time>` : `<span class="reset-badge" title="${escapeHTML(unknownResetText(win.resets_at))}">—</span>`}
+      </div>`;
+    });
+    const average = Math.round(lefts.reduce((sum, left) => sum + left, 0) / lefts.length);
+    return `<div class="window merged-window" data-quota-window="${escapeHTML(label)}">
+      <div class="win-left">
+        <div class="win-label">${escapeHTML(label)}</div>
+        <div class="win-pct ${average <= 20 ? 'low-quota' : ''}">${average}%<span>left</span></div>
+        ${average < 100 ? `<div class="recover">↻ +${100 - average}%</div>` : ''}
+      </div>
+      <div class="merged-bars" style="--accounts:${accounts.length}">${bars.join('')}</div>
+    </div>`;
+  });
+  return `<div class="merged-windows">${cards.join('')}</div>`;
+}
+
 function accountIdentityHTML(account, active) {
   const proxyActive = account.id === data.active?.[account.provider];
   const native = account.native_switch_available === true;
@@ -641,6 +719,7 @@ function updateBannerHTML() {
 function render() {
   if (authState.locked) return;
   const compact = data.compact_accounts === true;
+  const merge = data.merge_accounts === true;
   document.body.classList.toggle('compact-account-view', compact);
   const focusedRecheck = document.activeElement?.matches?.('button[data-act="recheck"]')
     ? document.activeElement.closest('.account')?.dataset.id : null;
@@ -675,9 +754,10 @@ function render() {
             <button data-menu="${providerID}" title="Provider options">⋯</button>
           </span>
         </div>
+        ${merge && accounts.length > 1 ? `<div class="account-list merged-list">${accounts.map(mergedAccountHTML).join('')}</div>${mergedWindowsHTML(accounts, providerID)}` : `
         <div class="account-list ${compact && accounts.length ? 'compact-grid' : ''}">
           ${accounts.length ? accounts.map(compact ? compactAccountHTML : accountHTML).join('') : `<div class="unknown">No accounts yet.</div>`}
-        </div>
+        </div>`}
       </section>`;
   });
   const previousFocus = document.activeElement;
@@ -709,7 +789,7 @@ function render() {
     card?.querySelector('[data-account-menu]')?.focus({ preventScroll: true });
   }
   if (activeAccountMenu) positionAccountMenu(activeAccountMenu.menu, activeAccountMenu.anchor);
-  settingsPage.desktopRelay?.update();
+  if (typeof settingsPage !== 'undefined') settingsPage.desktopRelay?.update();
 }
 
 /* ---------- usage ---------- */
@@ -1909,9 +1989,9 @@ settingsPage.desktopRelay = createDesktopRelay({
     controllerKey: data.hub_management_key || '',
   }),
   copy: text => navigator.clipboard.writeText(text),
-  confirmStop: ({ inFlight, activeTasks }) => confirmDialog({
-    title: 'Stop the Desktop task relay?',
-    message: `The relay has ${inFlight} request${inFlight === 1 ? '' : 's'} in flight. ${activeTasks} observed task${activeTasks === 1 ? ' is' : 's are'} active. Stopping affects tasks using this relay. Switcher may reject Stop until their streams finish.`,
+  confirmStop: ({ inFlight }) => confirmDialog({
+    title: 'Stop the Desktop relay?',
+    message: `${inFlight} request${inFlight === 1 ? ' is' : 's are'} still running through the relay. Stopping cuts them off.`,
     confirmLabel: 'Stop relay', danger: true, initialFocus: 'cancel',
   }),
   confirmRestart: () => confirmDialog({
@@ -1936,7 +2016,7 @@ setPage = function (page) {
   document.querySelector('footer.footnote').hidden = page !== 'accounts';
   usagePage.hidden = page !== 'usage';
   settingsPage.hidden = page !== 'settings';
-  if (page !== 'settings') settingsPage.desktopRelay?.setActive(false);
+  settingsPage.desktopRelay?.setActive(page === 'settings');
   if (page === 'usage') loadUsage();
   if (page === 'settings') renderSettings();
 };
@@ -2054,8 +2134,6 @@ async function renderSettings() {
     return;
   }
   if (authState.locked || settingsPage.hidden || request !== settingsRenderGeneration || epoch !== stateEpoch) return;
-  const relayFocus = settingsPage.querySelector('#desktop-relay-settings')?.contains(document.activeElement)
-    ? document.activeElement?.dataset.relayFocus : null;
   settingsPage.innerHTML = `
     <div class="settings-grid">
       <section class="settings-card appearance-card" id="appearance-settings" aria-label="Appearance"></section>
@@ -2082,14 +2160,17 @@ async function renderSettings() {
           <div><strong>Compact account view</strong><span class="dim"> · side-by-side cards with every quota window</span></div>
           <label class="switch-wrap"><input type="checkbox" id="compact-accounts" aria-label="Show compact account cards" ${status.compact_accounts ? 'checked' : ''}><span class="switch-visual"></span></label>
         </div>
-        <p class="settings-sub">Providers with several accounts show cards in two columns when space allows. Reset times and account actions stay available; single accounts fill the row.</p>
+        <div class="settings-row">
+          <div><strong>Merge accounts</strong><span class="dim"> · one card per quota window with every account side by side</span></div>
+          <label class="switch-wrap"><input type="checkbox" id="merge-accounts" aria-label="Merge accounts per quota window" ${status.merge_accounts ? 'checked' : ''}><span class="switch-visual"></span></label>
+        </div>
       </div>
       ${status.claude_code ? `<section class="settings-card">
         <h2>Claude Code login</h2>
-        <p class="settings-sub">${status.claude_code.available ? 'Claude account actions switch the native Claude Code login and Switcher proxy. Existing Code sessions may take about 30 seconds to update on macOS. Reopen Code for immediate application. Desktop sign-in is separate.' : 'Native switching is unavailable in this server environment.'}</p>
-        <div class="settings-row"><div><strong>${escapeHTML(status.claude_code.condition || 'Checking')}</strong><span class="dim">${status.claude_code.email ? ` · ${escapeHTML(status.claude_code.email)}` : ''}</span></div></div>
+        <p class="settings-sub">${status.claude_code.available ? '“Use in Claude Code” switches Claude Code’s own login. Running Code sessions pick it up within about 30 seconds. Claude Desktop’s sign-in is separate.' : 'Switching the Claude Code login is unavailable here.'}</p>
+        <div class="settings-row"><div><strong>${escapeHTML(({ ready: 'Logged in', logged_out: 'Logged out', unmanaged: 'Logged in with an account not in Switcher', unavailable: 'Unavailable', not_configured: 'Not set up' })[status.claude_code.condition] || status.claude_code.condition || 'Checking')}</strong><span class="dim">${status.claude_code.email ? ` · ${escapeHTML(status.claude_code.email)}` : ''}</span></div></div>
         ${status.claude_code.message ? `<p class="settings-sub">${escapeHTML(status.claude_code.message)}</p>` : ''}
-        <p class="settings-sub">Native refresh tokens are synchronized with Code rather than refreshed independently. Local config, credentials, and switch journals are backed up under ~/.switcher/claude-native/. Use Claude Code /login then import to recover a revoked login. Avoid /logout when changing accounts because it can revoke the old refresh token.</p>
+        <p class="settings-sub">Switcher keeps Claude Code’s tokens in sync and backs up its config in ~/.switcher/claude-native/. To recover a revoked login, run /login in Claude Code and import it. Avoid /logout when switching; it can revoke the old token.</p>
       </section>` : ''}
       <div class="settings-card">
         <h2>Banked resets</h2>
@@ -2097,11 +2178,11 @@ async function renderSettings() {
           <div><strong>Use automatically</strong><span class="dim"> · when an account is out of usage</span></div>
           <label class="switch-wrap"><input type="checkbox" id="auto-use-reset" aria-label="Use a banked reset automatically when an account is out of usage" ${status.auto_use_reset ? 'checked' : ''}><span class="switch-visual"></span></label>
         </div>
-        <p class="settings-sub">Switcher fails over to another usable account first. Only when there is nowhere to go does it spend one banked reset and retry the same account. Any account can override this in its ⋯ menu.</p>
+        <p class="settings-sub">When an account runs out, Switcher moves to another account first and only spends a banked reset if none is left. Each account can override this in its ⋯ menu.</p>
       </div>
       <div class="settings-card">
         <h2>Security</h2>
-        <p class="settings-sub">Authentication is off by default: Switcher only accepts local connections. Turn it on before exposing the server beyond this machine.</p>
+        <p class="settings-sub">Without a password Switcher only accepts connections from this Mac. Set one before using it from other devices.</p>
         ${status.auth_enabled ? `
           <div class="settings-row">
             <div><strong>Password</strong><span class="dim"> · set</span></div>
@@ -2114,7 +2195,6 @@ async function renderSettings() {
           <div class="settings-row"><div><strong>Disable authentication</strong><span class="dim"> · turns everything off</span></div>
             <button id="disable-auth" type="button" class="danger">Disable</button></div>
         ` : `
-          <p class="settings-sub">No password set. Set one to enable authentication and unlock the LAN option.</p>
           <form id="set-password-form">
             <input type="password" id="pw-next" placeholder="New password (8+ characters)" autocomplete="new-password" required minlength="8">
             <button type="submit">Set password</button>
@@ -2127,7 +2207,7 @@ async function renderSettings() {
           <div><strong>Bind LAN</strong><span class="dim"> · ${lanStateText(status)}</span></div>
           <label class="switch-wrap"><input type="checkbox" id="bind-lan" ${status.bind_lan ? 'checked' : ''} ${status.auth_enabled && status.password_set ? '' : 'disabled'}><span class="switch-visual"></span></label>
         </div>
-        <p class="settings-sub">The LAN listener is always TLS (self-signed; browsers ask you to trust it once). The local listener stays plain HTTP so the CLIs need no changes. Note: the CLI proxy paths stay open on the LAN, so devices on your network can use your subscriptions through them; only enable this on networks you trust.</p>
+        <p class="settings-sub">The LAN listener uses TLS with a self-signed certificate. Devices on your network can use your subscriptions through it, so only enable it on networks you trust.</p>
         <div class="settings-row"><div><strong>Device token</strong><span class="dim"> · menu bar app authenticates with it</span></div>
           <button id="rotate-token" type="button">Rotate</button></div>
       </div>
@@ -2141,12 +2221,12 @@ async function renderSettings() {
           <div><strong>Reset alerts</strong><span class="dim"> · at provider-reported usage reset times</span></div>
           <label class="switch-wrap"><input type="checkbox" id="reset-notifications" aria-label="Notify when a usage window is due to reset" ${status.reset_notifications ? 'checked' : ''}><span class="switch-visual"></span></label>
         </div>
-        <p class="settings-sub">Requires the Switcher menu bar app and macOS notification permission. The menu shows delivery status and has a test alert. Focus can send banners to Notification Center instead. Switcher remembers resets across app restarts and catches up within a day after sleep.</p>
+        <p class="settings-sub">Needs the Switcher menu bar app and notification permission. The menu has a test alert.</p>
       </div>
     </div>`;
 
   appearance.mount(settingsPage.querySelector('#appearance-settings'));
-  settingsPage.desktopRelay.mount(settingsPage.querySelector('#desktop-relay-settings'), relayFocus);
+  settingsPage.desktopRelay.mountSettings(settingsPage.querySelector('#desktop-relay-settings'));
   const setupList = settingsPage.querySelector('#cli-setup-list');
   const setupAnnouncer = settingsPage.querySelector('#cli-setup-announcer');
   const setupStatus = settingsPage.querySelector('#cli-setup-status');
@@ -2222,6 +2302,25 @@ async function renderSettings() {
       toast(err.message);
     } finally {
       compactAccounts.disabled = false;
+    }
+  });
+
+  const mergeAccounts = settingsPage.querySelector('#merge-accounts');
+  mergeAccounts.addEventListener('change', async () => {
+    const enabled = mergeAccounts.checked;
+    mergeAccounts.disabled = true;
+    try {
+      await api('/api/settings', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ merge_accounts: enabled }),
+      });
+      await refreshState();
+      toast('Account view preference saved');
+    } catch (err) {
+      mergeAccounts.checked = !enabled;
+      toast(err.message);
+    } finally {
+      mergeAccounts.disabled = false;
     }
   });
 

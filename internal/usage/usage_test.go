@@ -254,7 +254,7 @@ type ratesTransport func(*http.Request) (*http.Response, error)
 
 func (f ratesTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func fixtureService(t *testing.T, client *http.Client) *Service {
+func fixtureService(t *testing.T, client *http.Client, now time.Time) *Service {
 	t.Helper()
 	dir := t.TempDir()
 	projects := filepath.Join(dir, "claude", "projects")
@@ -264,9 +264,11 @@ func fixtureService(t *testing.T, client *http.Client) *Service {
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Dir(projects))
 	t.Setenv("CODEX_HOME", filepath.Join(dir, "absent-codex"))
 	t.Setenv("GROK_HOME", filepath.Join(dir, "absent-grok"))
-	line := fmt.Sprintf(`{"type":"assistant","timestamp":%q,"sessionId":"fixture","message":{"id":"fixture","model":"fixture-model","usage":{"input_tokens":1}}}`+"\n", time.Now().UTC().Format(time.RFC3339Nano))
+	line := fmt.Sprintf(`{"type":"assistant","timestamp":%q,"sessionId":"fixture","message":{"id":"fixture","model":"fixture-model","usage":{"input_tokens":1}}}`+"\n", now.UTC().Format(time.RFC3339Nano))
 	writeUsageFile(t, filepath.Join(projects, "fixture.jsonl"), line)
-	return NewService(filepath.Join(dir, "data"), client)
+	s := NewService(filepath.Join(dir, "data"), client)
+	s.now = func() time.Time { return now }
+	return s
 }
 
 func TestServiceRefreshesExpiredRates(t *testing.T) {
@@ -275,8 +277,9 @@ func TestServiceRefreshesExpiredRates(t *testing.T) {
 		calls++
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"fixture-model":{"input_cost_per_token":2,"output_cost_per_token":0}}`))}, nil
 	})}
-	s := fixtureService(t, client)
-	data, err := json.Marshal(ratesSnapshot{FetchedAtMs: time.Now().Add(-25 * time.Hour).UnixMilli(), Document: RateTable{"fixture-model": {Input: 1}}})
+	now := time.Date(2026, 10, 4, 0, 30, 0, 0, time.Local)
+	s := fixtureService(t, client, now)
+	data, err := json.Marshal(ratesSnapshot{FetchedAtMs: now.Add(-25 * time.Hour).UnixMilli(), Document: RateTable{"fixture-model": {Input: 1}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,8 +304,10 @@ func TestServiceHonorsDiskRateTTLAndKeepsStaleRatesOnFailure(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"fixture-model":{"input_cost_per_token":2,"output_cost_per_token":0}}`))}, nil
 	})}
-	s := fixtureService(t, client)
-	base := time.Now().UTC().Truncate(time.Millisecond)
+	// Match the service's local clock: near midnight, the UTC date can differ
+	// from the local day used by SummaryFor.
+	base := time.Date(2026, 10, 4, 0, 30, 0, 0, time.Local)
+	s := fixtureService(t, client, base)
 	now := base
 	s.now = func() time.Time { return now }
 	data, err := json.Marshal(ratesSnapshot{FetchedAtMs: base.Add(-23 * time.Hour).UnixMilli(), Document: RateTable{"fixture-model": {Input: 1}}})

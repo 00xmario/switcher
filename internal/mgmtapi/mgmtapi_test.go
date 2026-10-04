@@ -134,11 +134,13 @@ func TestAPICallPreparesExpiredAndNativeCredentialsWithoutSwitching(t *testing.T
 			var prov provider.Provider = &managementProvider{}
 			access, want := "expired", "fresh"
 			if native {
-				prov, access, want = &managementNativeProvider{managementProvider: &managementProvider{}}, "saved-predecessor", "native-successor"
+				// Claude Code rotated the login; Switcher's stored copy is rejected
+				// and the retry adopts Claude Code's token without a new grant.
+				prov, access, want = &managementNativeProvider{managementProvider: &managementProvider{}}, "saved-predecessor", "native-current"
 			}
 			api := managementFixture(t, prov, access)
 			mockManagementNetwork(t, func(r *http.Request) (*http.Response, error) {
-				if native && r.Header.Get("Authorization") == "Bearer native-current" {
+				if native && r.Header.Get("Authorization") == "Bearer saved-predecessor" {
 					return managementResponse(401, ""), nil
 				}
 				if r.Header.Get("Authorization") != "Bearer "+want {

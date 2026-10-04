@@ -315,11 +315,6 @@ func (m *Manager) writeSetupFile(ctx context.Context, dir *os.File, name string,
 }
 
 func (m *Manager) setupCommitUncertainLocked() error {
-	m.failed = true
-	m.condition = "store_error"
-	if m.run != nil {
-		m.run.cancel()
-	}
 	return errors.Join(setupError("setup_unavailable", ErrUnavailable), errCommitUncertain)
 }
 

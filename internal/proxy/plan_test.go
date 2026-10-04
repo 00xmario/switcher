@@ -71,3 +71,64 @@ func TestManualRecheckRetriesFailedPlanLookup(t *testing.T) {
 		t.Fatal("manual check did not recover plan")
 	}
 }
+
+type currentPlanProvider struct {
+	*planTestProvider
+	plan     string
+	usageErr error
+}
+
+func (p *currentPlanProvider) Usage(context.Context, store.Account) (provider.Usage, error) {
+	return provider.Usage{Available: p.usageErr == nil, Plan: p.plan, Windows: []provider.UsageWindow{{Label: "Monthly", UsedPercent: 0}}}, p.usageErr
+}
+
+func TestUsagePlanTracksDowngradeAndUpgradeWithoutRelogin(t *testing.T) {
+	a := account("a")
+	a.Plan = "pro"
+	yes := true
+	a.AutoUseReset = &yes
+	m := newManager(t, nil, a)
+	p := &currentPlanProvider{planTestProvider: &planTestProvider{fakeProvider: &fakeProvider{id: "fake"}}, plan: "free"}
+	m.providers["fake"] = p
+	if err := m.Activate(a.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, plan := range []string{"free", "prolite", "free"} {
+		p.plan = plan
+		m.RefreshUsage(context.Background(), a)
+		saved, err := m.store.Get(a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u, ok := m.LastUsage(a.ID)
+		if saved.Plan != plan || !ok || u.Plan != plan || len(u.Windows) != 1 || u.Windows[0].UsedPercent != 0 {
+			t.Fatalf("plan/quota not reconciled: saved=%s usage=%+v", saved.Plan, u)
+		}
+		if saved.Token.AccessToken != a.Token.AccessToken || saved.AutoUseReset == nil || !*saved.AutoUseReset || m.ActiveID("fake") != a.ID {
+			t.Fatal("plan update changed credentials, preferences, or routing")
+		}
+	}
+	if p.calls != 0 {
+		t.Fatal("separate plan lookup replaced current response metadata")
+	}
+	p.plan, p.usageErr = "pro", errors.New("fixture quota unavailable")
+	m.RefreshUsage(context.Background(), a)
+	saved, _ := m.store.Get(a.ID)
+	if saved.Plan != "free" {
+		t.Fatal("failed usage response replaced verified free plan")
+	}
+}
+
+func TestUsageWithoutPlanRetainsSavedPlan(t *testing.T) {
+	a := account("a")
+	a.Plan = "free"
+	m := newManager(t, nil, a)
+	p := &healthProvider{usage: func(context.Context, store.Account) (provider.Usage, error) { return goodUsage(), nil }}
+	p.fakeProvider = &fakeProvider{id: "fake"}
+	m.providers["fake"] = p
+	m.RefreshUsage(context.Background(), a)
+	saved, _ := m.store.Get(a.ID)
+	if saved.Plan != "free" {
+		t.Fatal("missing plan metadata erased saved plan")
+	}
+}

@@ -234,13 +234,13 @@ with live Desktop validation deferred until current tasks finish.
 
 | Concern | Reference logic | Switcher implementation and difference |
 |---|---|---|
-| First-party ingress | OpenCodex's host-selective CONNECT and extra-CA environment | `ingress.go`, `admission.go`, `network.go`, and `ca.go` use authenticated loopback CONNECT, an Anthropic-only CA, verified fixed-origin inference, and public-only blind tunnels |
-| Account selection | OpenCodex provider-wide selector and CLIProxyAPI affinity | `control.go` uses explicit observed scope/session bindings and revision CAS; no model-wide selection, inferred prompt cohort, or automatic peer inheritance |
+| First-party ingress | OpenCodex's host-selective CONNECT and extra-CA environment | `ingress.go`, `network.go`, and `ca.go` use authenticated loopback CONNECT, an Anthropic-only CA, and opaque tunnels for every other destination |
+| Account selection | OpenCodex provider-wide selector and CLIProxyAPI affinity | `control.go` and `conversation.go` use explicit session or conversation selections; no model-wide selection, inferred prompt cohort, or automatic peer inheritance |
 | Native payloads | OpenCodex and CLIProxyAPI normalize some fields or translate selected routes | `forward.go` retains raw body/query bytes, model, signatures, deferred tools, unknown fields, and complete native response/SSE content |
 | Refresh ownership | CLIProxyAPI selected-generation recovery and claude-swap native ownership | `proxy/desktop_credentials.go` delegates to Switcher's serialized credential owner; the relay stores no OAuth tokens and never activates the native login |
-| Thread continuation | OpenCodex refuses translated thread deltas before dispatch | Selected Messages and count-tokens requests receive the same `thread_unsupported_request` contract; unbound requests retain caller-native threads |
+| Thread continuation | OpenCodex refuses translated thread deltas before dispatch | Adopted narrowly: only a `continue` thread whose session changed account since its last thread request gets the same 400; everything else is passed through |
 | Setup and trust | CC Switch/CCR owned 3P profiles and OpenCodex first-party settings writer | One-click first-party Configure backs up settings and merges only owned proxy/CA fields, with durable recovery and selective restore. Manual profiles remain Advanced; no OS trust or browser-picker interception, and Desktop restart requires a separate explicit confirmation |
-| Stream ownership | CLIProxyAPI pre-output recovery and OpenCodex request snapshots | One same-account 401 recovery before output; acknowledged selection changes apply to later admissions, and already admitted streams keep their captured account |
+| Stream ownership | CLIProxyAPI pre-output recovery and OpenCodex request snapshots | One same-account 401 recovery before output; selection changes apply to later requests, and running streams keep their account |
 | Control authority | Local proxy tokens and manager authentication in the references | Independent local management authority is separate from scope admission; cookie controls require CSRF, and LAN requests cannot change relay selections |
 
 Implementation code is independently written Go. No source code, comments,

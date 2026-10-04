@@ -733,11 +733,20 @@ func (m *Manager) refreshAccount(ctx context.Context, id string, gen uint64, for
 		}
 		return m.recordUsage(id, gen, provider.Usage{}, false, err)
 	}
+	// Keep plan and quota from the same successful response together. Login
+	// claims can outlive a subscription, so current usage metadata wins.
+	if usage.Plan != "" && usage.Plan != a.Plan {
+		a.Plan = usage.Plan
+		if err := m.store.Save(a); err != nil {
+			log.Printf("proxy: save usage plan: %v", err)
+			return m.recordUsage(id, gen, provider.Usage{}, false, err)
+		}
+	}
 	// Some providers expose plan metadata separately from usage. Save it
 	// under the same account lock as rotating credentials and preferences.
 	if reader, ok := prov.(interface {
 		ResolvePlan(context.Context, store.Account) (string, error)
-	}); ok {
+	}); ok && usage.Plan == "" {
 		m.mu.Lock()
 		due := force || time.Since(m.planChecked[id]) >= time.Hour
 		if due {
@@ -1014,20 +1023,12 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case resp.StatusCode == http.StatusUnauthorized && !refreshed[account.ID]:
 			refreshed[account.ID] = true
 			drain(resp)
-			_, _, err = m.prepareAccount(r.Context(), account.ID, &account.Token.AccessToken, true)
-			if err != nil {
-				if errors.Is(err, provider.ErrNativeCredentialBusy) {
-					writeError(w, http.StatusServiceUnavailable, err.Error())
-					return
-				}
+			// On a failed refresh the next attempt sends the same token; its
+			// 401 is then returned as Anthropic sent it.
+			if _, _, err = m.prepareAccount(r.Context(), account.ID, &account.Token.AccessToken, true); err != nil {
 				log.Printf("proxy: refresh %s after 401 failed: %v", account.Email, err)
-				if errors.Is(err, provider.ErrReloginRequired) {
-					continue
-				}
-				writeError(w, http.StatusServiceUnavailable, "account credentials could not be refreshed")
-				return
 			}
-			continue // retry the same account with fresh tokens
+			continue // retry with fresh tokens
 
 		case resp.StatusCode >= 400:
 			body429, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
@@ -1043,8 +1044,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			retry, stateErr := m.handleExhaustion(providerID, account.ID, until, epoch)
 			if stateErr != nil {
-				writeError(w, http.StatusServiceUnavailable, "routing state could not be saved")
-				return
+				log.Printf("proxy: save routing state: %v", stateErr)
 			}
 			if retry {
 				continue
@@ -1054,8 +1054,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				retry, spent, resetErr := m.autoUseBankedResetForRequest(r.Context(), prov, account, &epoch)
 				usedAutoReset = spent
 				if resetErr != nil {
-					writeError(w, http.StatusServiceUnavailable, "reset routing state could not be saved")
-					return
+					log.Printf("proxy: save reset routing state: %v", resetErr)
 				}
 				if retry {
 					continue

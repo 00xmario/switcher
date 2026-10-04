@@ -33,6 +33,7 @@ type Settings struct {
 	MenuUsageBars      *bool  `json:"menu_usage_bars,omitempty"` // nil means on
 	ResetNotifications bool   `json:"reset_notifications,omitempty"`
 	CompactAccounts    bool   `json:"compact_accounts,omitempty"`
+	MergeAccounts      bool   `json:"merge_accounts,omitempty"` // one card per quota window with every account's bar
 	AutoUseReset       bool   `json:"auto_use_reset,omitempty"` // spend a banked reset when an account runs out
 	CSRFToken          string `json:"csrf_token,omitempty"`
 	UpdatedAt          int64  `json:"updated_at,omitempty"`

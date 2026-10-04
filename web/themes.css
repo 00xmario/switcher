@@ -3,8 +3,6 @@
 .settings-grid { align-items: start; }
 input::placeholder { color: var(--dim); opacity: 1; }
 .theme-switch button:focus-visible { outline-offset: -3px; }
-.switch-visual::after { background: var(--text); }
-.switch-wrap input:checked + .switch-visual::after { background: var(--on-accent); }
 [data-theme-delete] { color: var(--danger); }
 .theme-switch, .provider-head .add-provider, .provider-tools button,
 .settings-card input, .settings-card select { border-radius: var(--button-radius); }

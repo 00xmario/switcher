@@ -51,6 +51,16 @@ export function patchProviderList(container, html) {
       });
       for (const node of current.values()) node.remove();
     }
+    // The merged view's per-window cards follow the account list.
+    const merged = section.querySelector('.merged-windows');
+    const oldMerged = old.querySelector('.merged-windows');
+    if (merged && oldMerged) {
+      if (oldMerged.innerHTML !== merged.innerHTML) oldMerged.innerHTML = merged.innerHTML;
+    } else if (merged) {
+      list.after(merged);
+    } else {
+      oldMerged?.remove();
+    }
     place(container, old, index);
   });
   for (const node of existing.values()) node.remove();
