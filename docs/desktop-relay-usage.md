@@ -17,7 +17,9 @@ conversations you pick it for.
 1. Open Switcher on this Mac (localhost) and go to **Settings → Claude Desktop**.
 2. Click **Connect Claude Desktop**. This starts the relay, creates its profile,
    backs up `~/.claude/settings.json` (or the file in `CLAUDE_CONFIG_DIR`) and
-   adds only `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` to its `env`. Other
+   adds `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` to its `env`, plus the local
+   hosts in `NO_PROXY` so local servers such as T3 Code's MCP endpoint are
+   reached directly. Other
    settings stay as they are. No system trust root or Keychain item is added.
 3. When your current work is done, click **Restart Claude Desktop** and confirm.
    Switcher never restarts Desktop on its own.

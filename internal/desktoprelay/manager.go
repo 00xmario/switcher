@@ -42,6 +42,7 @@ type runtime struct {
 	done         chan struct{}
 	server       *http.Server
 	transport    http.RoundTripper
+	plain        http.RoundTripper // plain proxy requests to other destinations
 	mu           sync.Mutex
 	closed       bool
 	conns        map[net.Conn]struct{}
@@ -194,6 +195,7 @@ func (m *Manager) startLifecycleLocked(ctx context.Context, resume bool) error {
 	runCtx, cancel := context.WithCancel(context.Background())
 	r := &runtime{listener: l, ctx: runCtx, cancel: cancel, done: make(chan struct{}), finished: make(chan struct{}), conns: make(map[net.Conn]struct{})}
 	r.transport = m.transport()
+	r.plain = &http.Transport{Proxy: nil, DialContext: m.dial, ForceAttemptHTTP2: true, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second}
 	r.server = ingressServer(m, r)
 	m.run, m.condition = r, "listening"
 	go func() {
@@ -269,8 +271,10 @@ func (m *Manager) stop(ctx context.Context, disable bool) error {
 // binding mutations. Only a completed runtime can release its store ownership.
 func (m *Manager) finishShutdownLocked(r *runtime) error {
 	if r != nil {
-		if t, ok := r.transport.(interface{ CloseIdleConnections() }); ok {
-			t.CloseIdleConnections()
+		for _, transport := range []http.RoundTripper{r.transport, r.plain} {
+			if t, ok := transport.(interface{ CloseIdleConnections() }); ok {
+				t.CloseIdleConnections()
+			}
 		}
 	}
 	var persistErr error

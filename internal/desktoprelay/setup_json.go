@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 )
 
 const maxSetupSettings = 1 << 20
@@ -169,4 +170,32 @@ func setupFailure(err error) error {
 		return errors.Join(setupError("setup_unavailable", ErrUnavailable), errCommitUncertain)
 	}
 	return setupError("setup_unavailable", ErrUnavailable)
+}
+
+// localNoProxy are the hosts Claude Code must reach directly, never through
+// the relay.
+var localNoProxy = []string{"localhost", "127.0.0.1", "::1"}
+
+// withLocalNoProxy adds localNoProxy to an existing NO_PROXY string value and
+// keeps everything already listed. A non-string value is left untouched.
+func withLocalNoProxy(raw json.RawMessage) json.RawMessage {
+	var current string
+	if len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &current) != nil {
+		return raw
+	}
+	var entries []string
+	seen := make(map[string]bool)
+	for _, entry := range strings.Split(current, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" && !seen[strings.ToLower(entry)] {
+			seen[strings.ToLower(entry)] = true
+			entries = append(entries, entry)
+		}
+	}
+	for _, host := range localNoProxy {
+		if !seen[host] {
+			entries = append(entries, host)
+		}
+	}
+	b, _ := json.Marshal(strings.Join(entries, ","))
+	return b
 }

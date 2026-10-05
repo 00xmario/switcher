@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -379,5 +381,39 @@ func TestSubagentFollowsItsParentsSelection(t *testing.T) {
 	child := `{"metadata":{"user_id":"{\"session_id\":\"` + sessionB + `\",\"parent_session_id\":\"` + sessionA + `\"}"}}`
 	if got := drain(t, send(t, c, br, "/v1/messages", child, "", nil)); got != "Bearer token-A" {
 		t.Fatalf("subagent used %q", got)
+	}
+}
+
+// Plain proxy requests (T3 Code's local MCP server) are forwarded with their
+// streamed response, with or without the proxy login.
+func TestPlainHTTPProxyRequestsAreForwarded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Proxy-Authorization") != "" {
+			t.Error("proxy login leaked to the destination")
+		}
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		io.WriteString(w, "data: "+r.Method+" "+r.URL.Path+" "+string(b)+"\n\n")
+		w.(http.Flusher).Flush()
+		io.WriteString(w, "data: done\n\n")
+	}))
+	defer upstream.Close()
+	cfg := fixtureConfig(t)
+	cfg.DialContext = (&net.Dialer{}).DialContext
+	_, s := startFixture(t, cfg)
+	proxy, _ := url.Parse(s.ProxyURL)
+	for _, withLogin := range []bool{true, false} {
+		if !withLogin {
+			proxy.User = nil
+		}
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxy)}}
+		resp, err := client.Post(upstream.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := drain(t, resp); resp.StatusCode != 200 || got != "data: POST /mcp {\"jsonrpc\":\"2.0\"}\n\ndata: done\n\n" {
+			t.Fatalf("login=%v: %d %q", withLogin, resp.StatusCode, got)
+		}
 	}
 }

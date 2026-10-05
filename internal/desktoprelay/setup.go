@@ -67,6 +67,9 @@ type setupRecord struct {
 	BeforeDigest   string                     `json:"before_digest"`
 	AfterDigest    string                     `json:"after_digest"`
 	BeforeEnv      map[string]json.RawMessage `json:"before_env"`
+	// NoProxy is the NO_PROXY value Configure wrote. Restore puts the original
+	// back only while the file still holds exactly this value.
+	NoProxy json.RawMessage `json:"no_proxy,omitempty"`
 }
 
 func setupPath(path string) bool {
@@ -259,6 +262,10 @@ func (m *Manager) configure(ctx context.Context, path string) error {
 	}
 	r.BeforeEnv = doc.values()
 	r.BeforeDigest = setupDigest(before.data, before.exists)
+	// Local servers such as T3 Code's MCP endpoint stay off the relay. This
+	// key is merged into whatever the user already lists.
+	doc.env["NO_PROXY"] = withLocalNoProxy(doc.env["NO_PROXY"])
+	r.NoProxy = doc.env["NO_PROXY"]
 	after, err := doc.patch(setupStrings(r.OwnedEnv), "object")
 	if err != nil {
 		return err
@@ -457,6 +464,13 @@ func (m *Manager) restoreSetup(ctx context.Context, path string) error {
 	old := r
 	r.BeforeEnv = doc.values()
 	r.BeforeDigest = setupDigest(before.data, true)
+	if len(r.NoProxy) > 0 && bytes.Equal(bytes.TrimSpace(doc.env["NO_PROXY"]), bytes.TrimSpace(r.NoProxy)) {
+		if original, ok := baseline.env["NO_PROXY"]; ok {
+			doc.env["NO_PROXY"] = original
+		} else {
+			delete(doc.env, "NO_PROXY")
+		}
+	}
 	after, err := doc.patch(r.OriginalEnv, r.EnvShape)
 	if err != nil {
 		return err

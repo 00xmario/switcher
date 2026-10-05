@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -265,5 +266,31 @@ func TestSetupForeignOwnedChangeIsNeverClobbered(t *testing.T) {
 				t.Fatal("conflict leaked scopes")
 			}
 		})
+	}
+}
+
+func TestSetupKeepsLocalServersOffTheRelayAndRestoresNoProxy(t *testing.T) {
+	m, _, path := setupFixture(t)
+	if err := os.Mkdir(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`{"env":{"NO_PROXY":"corp.example"},"theme":"dark"}` + "\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Configure(context.Background(), path); err != nil {
+		t.Fatal(err)
+	}
+	if got := setupEnv(t, path)["NO_PROXY"]; got != "corp.example,localhost,127.0.0.1,::1" {
+		t.Fatalf("NO_PROXY after connect = %q", got)
+	}
+	if _, err := m.RestoreSetup(context.Background(), path); err != nil {
+		t.Fatal(err)
+	}
+	var before, after any
+	json.Unmarshal(original, &before)
+	json.Unmarshal(setupRead(t, path), &after)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("disconnect left %s", setupRead(t, path))
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"strings"
 	"sync"
 	"time"
@@ -47,7 +48,7 @@ func (m *Manager) authenticate(req *http.Request) (string, bool) {
 // tunnels every other destination unchanged.
 func (m *Manager) connect(r *runtime, w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodConnect {
-		http.Error(w, "CONNECT required", http.StatusMethodNotAllowed)
+		m.forwardPlain(r, w, req)
 		return
 	}
 	scope, ok := m.authenticate(req)
@@ -106,6 +107,34 @@ func (m *Manager) connect(r *runtime, w http.ResponseWriter, req *http.Request) 
 	inner.BaseContext = func(net.Listener) context.Context { return r.ctx }
 	inner.Serve(newOneListener(tc))
 	inner.Close()
+}
+
+// forwardPlain relays a plain proxy request such as POST http://127.0.0.1:3773/
+// (T3 Code's MCP server) unchanged, including streamed and upgraded responses.
+// It never adds a credential, so it needs no proxy login: any local process
+// could make the same request directly.
+func (m *Manager) forwardPlain(r *runtime, w http.ResponseWriter, req *http.Request) {
+	if !req.URL.IsAbs() || (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "" {
+		http.Error(w, "this is Switcher's Desktop relay; use it as an HTTP proxy", http.StatusBadRequest)
+		return
+	}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL = pr.In.URL
+			pr.Out.Host = pr.In.URL.Host
+			pr.Out.Header.Del("Proxy-Authorization")
+			pr.Out.Header.Del("Proxy-Connection")
+		},
+		Transport:     r.plain,
+		FlushInterval: -1,
+		ErrorLog:      log.New(io.Discard, "", 0),
+		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+			if req.Context().Err() == nil {
+				http.Error(w, "destination unavailable", http.StatusBadGateway)
+			}
+		},
+	}
+	proxy.ServeHTTP(w, req)
 }
 
 type bufferConn struct {

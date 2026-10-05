@@ -11,7 +11,9 @@ listed under [Local responses](#local-responses).
 1. Desktop's Code worker connects with `HTTPS_PROXY` (Basic auth with a scope
    ID and secret) and trusts the relay CA through `NODE_EXTRA_CA_CERTS`.
 2. `CONNECT api.anthropic.com:443` is terminated with a leaf certificate from
-   the relay CA. Every other destination is tunneled unchanged.
+   the relay CA. Every other destination is tunneled unchanged, and plain
+   proxy requests such as `POST http://127.0.0.1:3773/` (T3 Code's MCP server)
+   are forwarded unchanged with streaming and upgrades, without a proxy login.
 3. For `POST /v1/messages` and `/v1/messages/count_tokens`, the relay reads the
    session UUID from `X-Claude-Code-Session-Id`, or from `session_id` in the
    JSON string `metadata.user_id`. Unreadable or missing identity means the
@@ -98,7 +100,8 @@ whose scope no longer exists.
 ## Setup
 
 `Configure` merges `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` into the Claude
-settings file's `env`, keeps a private backup, and records the original values
+settings file's `env`, adds `localhost,127.0.0.1,::1` to `NO_PROXY` (keeping
+existing entries; Restore puts the original back), keeps a private backup, and records the original values
 so `RestoreSetup` can put them back without touching unrelated edits. Neither
 restarts any application.
 
