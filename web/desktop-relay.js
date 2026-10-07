@@ -1,6 +1,9 @@
 // Claude Desktop account switching in Settings: connection controls and an
 // opt-in account per conversation, fed by GET /api/desktop-relay.
+import { switcherMark as brandMark, playMark } from './brand.js';
+
 const base = '/api/desktop-relay';
+const DESKTOP_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>';
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const text = value => typeof value === 'string' ? value : '';
 const count = value => Number.isSafeInteger(value) && value > 0 ? value : 0;
@@ -68,7 +71,7 @@ export function desktopRelayEntries(body) {
 // All I/O belongs to the dashboard adapter. Constructing this controller does
 // nothing until it is activated.
 export function createDesktopRelay({ api, getContext, getAccounts = () => [], copy = async () => {},
-  confirmStop = async () => false, confirmRestart = async () => false, now = () => Date.now() }) {
+  confirmStop = async () => false, confirmRestart = async () => false, now = () => Date.now(), claudeLogo = '' }) {
   let active = false, snapshot = null, entries = [], loadedAt = 0, reading = null, epoch = 0;
   let busy = null, message = '', failed = false, showAll = false, profile = null;
   const rowErrors = new Map();
@@ -145,10 +148,12 @@ export function createDesktopRelay({ api, getContext, getAccounts = () => [], co
     busy = { kind: 'choose', key, account: accountID };
     rowErrors.delete(key);
     render();
+    let switched = false;
     try {
       await request(path, { method: accountID ? 'POST' : 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       item.account = accountID;
       item.sessionOnly = false;
+      switched = true;
       return true;
     } catch (error) {
       rowErrors.set(key, errorText(error, 'Could not switch this conversation.'));
@@ -157,24 +162,35 @@ export function createDesktopRelay({ api, getContext, getAccounts = () => [], co
       busy = null;
       await load();
       render();
+      // Back on Switcher's default: the mark switches on.
+      if (switched && !accountID) {
+        const row = [...(views.settings?.querySelectorAll('[data-dr-key]') || [])].find(node => node.dataset.drKey === key);
+        playMark(row?.querySelector('[data-dr-account=""]'));
+      }
     }
   }
 
+  // Marks get ids in render order, so an unchanged view renders identical
+  // markup and paint() leaves the DOM alone.
+  let markSeq = 0;
+  const switcherMark = options => brandMark({ ...options, id: `dr-mark-${markSeq++}` });
   const accountLabel = account => text(account?.email).split('@')[0] || account?.id || '';
   function pickerHTML(item) {
     const accounts = claudeAccounts();
     const pending = busy?.kind === 'choose' && busy.key === item.key;
     const selected = pending ? busy.account : accounts.some(a => a.id === item.account) ? item.account : '';
     const disabled = !access() || !!busy;
-    const options = [{ id: '', label: 'Desktop login', title: 'The account Claude Desktop is signed in to' },
+    // The default is Switcher itself: requests pass through with Desktop's
+    // own login. Picking an account switches just this conversation.
+    const options = [{ id: '', label: 'Desktop login', title: 'Default: Claude Desktop’s own login, through Switcher' },
       ...accounts.map(a => ({ id: a.id, label: accountLabel(a), title: a.email }))];
     if (options.length > 4) {
       return `<select class="dr-select" data-dr-choose="${escape(item.key)}" aria-label="Account for ${escape(item.title || 'this conversation')}" ${disabled ? 'disabled' : ''}>
-        ${options.map(o => `<option value="${escape(o.id)}" ${o.id === selected ? 'selected' : ''}>${escape(o.id ? o.title : o.label)}</option>`).join('')}</select>`;
+        ${options.map(o => `<option value="${escape(o.id)}" ${o.id === selected ? 'selected' : ''}>${escape(o.id ? o.title : 'Desktop login (default)')}</option>`).join('')}</select>`;
     }
     return `<div class="dr-segmented" role="radiogroup" aria-label="Account for ${escape(item.title || 'this conversation')}">
-      ${options.map(o => `<button type="button" role="radio" aria-checked="${o.id === selected}" data-dr-choose="${escape(item.key)}" data-dr-account="${escape(o.id)}" title="${escape(o.title)}" ${disabled ? 'disabled' : ''}>
-        ${pending && o.id === selected ? '<span class="dr-spinner" aria-hidden="true"></span>' : ''}${escape(o.label)}</button>`).join('')}
+      ${options.map(o => `<button type="button" role="radio" aria-checked="${o.id === selected}" data-dr-choose="${escape(item.key)}" data-dr-account="${escape(o.id)}" title="${escape(o.title)}" ${o.id ? '' : `aria-label="${escape(o.label)}" class="dr-default"`} ${disabled ? 'disabled' : ''}>
+        ${o.id ? `${pending && o.id === selected ? '<span class="dr-spinner" aria-hidden="true"></span>' : ''}${escape(o.label)}` : switcherMark({ size: 18 })}</button>`).join('')}
     </div>`;
   }
 
@@ -208,18 +224,35 @@ export function createDesktopRelay({ api, getContext, getAccounts = () => [], co
   function conversationsHTML() {
     if (!connected() && !entries.length) return '';
     const shown = showAll ? entries : entries.slice(0, VISIBLE);
-    return `<div class="dr-conversations">
-      <h3>Per-conversation accounts</h3>
-      <p class="settings-sub">Off unless you pick one: conversations use Desktop's own login. A pick applies to that conversation's new messages; running replies finish where they started.</p>
+    return `<div class="settings-card dr-conversations">
+      <div class="set-card-head"><h3>Per-conversation accounts</h3>
+      <p class="settings-sub">Every conversation goes through Switcher with Desktop's own login (${switcherMark({ size: 14 })}) until you pick an account for it. A pick applies to that conversation's new messages; running replies finish where they started.</p></div>
       ${entries.length ? `<ul class="dr-list">${shown.map(rowHTML).join('')}</ul>` : '<p class="settings-sub">Conversations appear here after you send a message in Claude Desktop.</p>'}
       ${entries.length > VISIBLE ? `<button type="button" class="quiet" data-dr-action="toggle-all">${showAll ? 'Show fewer' : `Show all ${entries.length}`}</button>` : ''}
     </div>`;
   }
 
+  // flowHTML draws Desktop's requests through Switcher to Anthropic, live
+  // while the relay runs.
+  function flowHTML() {
+    const status = snapshot?.status || {};
+    const live = count(status.in_flight);
+    const state = connected() ? (live ? 'is-on is-busy' : 'is-on') : 'is-off';
+    return `<div class="flow ${state}" aria-hidden="true">
+      <div class="flow-node"><span class="flow-icon">${DESKTOP_ICON}</span><strong>Claude Desktop</strong><small>Code tab</small></div>
+      <div class="flow-wire"><span></span></div>
+      <div class="flow-node is-switcher"><span class="flow-icon">${switcherMark({ tile: true, size: 40 })}</span><strong>Switcher</strong>
+        <small>${connected() ? (live ? `${live} replying` : 'picks the account') : 'not in between'}</small></div>
+      <div class="flow-wire"><span></span></div>
+      <div class="flow-node"><span class="flow-icon flow-claude">${claudeLogo}</span><strong>Anthropic</strong><small>your accounts</small></div>
+    </div>`;
+  }
+
   function settingsHTML() {
+    markSeq = 0;
     const context = getContext();
     if (context.locked || context.loggingOut) return '';
-    if (!context.loopback) return `<h2>Claude Desktop</h2><p class="settings-sub">Open Switcher on this Mac (localhost) to manage Claude Desktop.</p>`;
+    if (!context.loopback) return `<div class="settings-card"><p class="settings-sub">Open Switcher on this Mac (localhost) to manage Claude Desktop.</p></div>`;
     const status = snapshot?.status || {}, setup = snapshot?.setup || {};
     const doing = kind => busy?.kind === kind;
     const disabled = !access() || !!busy;
@@ -227,22 +260,26 @@ export function createDesktopRelay({ api, getContext, getAccounts = () => [], co
     const state = !snapshot ? 'Loading…' : connected() ? 'Connected' : configured ? 'Relay stopped'
       : setup.condition === 'changed' ? 'Settings changed' : setup.condition === 'pending' ? 'Setup pending' : 'Not connected';
     const scopes = snapshot?.scopes || [];
-    return `<div class="dr-settings-head">
-        <div><h2>Claude Desktop</h2><p class="settings-sub">Optional: pick a Switcher account for individual Desktop conversations. Desktop stays signed in as it is.</p></div>
-        <span class="dr-status ${connected() ? 'ok' : 'warn'}">${state}</span>
+    const lead = connected()
+      ? 'Desktop’s requests go through Switcher. Conversations use Desktop’s own login until you pick an account below; switching never needs a restart.'
+      : configured ? 'Switcher is set up for Desktop, but its relay is stopped. Start it under Advanced to resume.'
+        : 'Optional. Connect once and Desktop’s requests go through Switcher, so you can pick an account per conversation. Desktop stays signed in as it is.';
+    return `<div class="settings-card dr-hero">
+        ${flowHTML()}
+        <div class="dr-settings-head"><span class="dr-status ${connected() ? 'ok' : 'warn'}">${state}</span></div>
+        <p class="settings-sub dr-lead">${lead}</p>
+        ${message ? `<p class="dr-message ${failed ? 'error' : ''}" role="${failed ? 'alert' : 'status'}">${escape(message)}</p>` : ''}
+        <div class="dr-actions">
+          ${!configured || setup.condition === 'changed' ? `<button type="button" class="primary" data-dr-action="configure" ${disabled ? 'disabled' : ''}>${doing('configure') ? 'Connecting…' : 'Connect Claude Desktop'}</button>` : ''}
+          ${configured || setup.restart_required ? `<button type="button" data-dr-action="restart" ${disabled ? 'disabled' : ''}>${doing('restart') ? 'Restarting…' : 'Restart Claude Desktop'}</button>` : ''}
+          ${configured || ['changed', 'pending'].includes(setup.condition) ? `<button type="button" class="quiet" data-dr-action="restore" ${disabled ? 'disabled' : ''}>${doing('restore') ? 'Disconnecting…' : 'Disconnect'}</button>` : ''}
+        </div>
       </div>
-      ${message ? `<p class="dr-message ${failed ? 'error' : ''}" role="${failed ? 'alert' : 'status'}">${escape(message)}</p>` : ''}
-      <div class="dr-actions">
-        ${!configured || setup.condition === 'changed' ? `<button type="button" class="primary" data-dr-action="configure" ${disabled ? 'disabled' : ''}>${doing('configure') ? 'Connecting…' : 'Connect Claude Desktop'}</button>` : ''}
-        ${configured || setup.restart_required ? `<button type="button" data-dr-action="restart" ${disabled ? 'disabled' : ''}>${doing('restart') ? 'Restarting…' : 'Restart Claude Desktop'}</button>` : ''}
-        ${configured || ['changed', 'pending'].includes(setup.condition) ? `<button type="button" class="quiet" data-dr-action="restore" ${disabled ? 'disabled' : ''}>${doing('restore') ? 'Disconnecting…' : 'Disconnect'}</button>` : ''}
-      </div>
-      ${configured && !status.listening ? '<p class="settings-sub">Start the relay below to resume switching.</p>' : ''}
       ${conversationsHTML()}
-      <p class="settings-sub">Connecting adds a local proxy to <code>${escape(setup.settings_path || '~/.claude/settings.json')}</code> and keeps a backup. Restart Desktop once after connecting or disconnecting; switching accounts never needs a restart.</p>
-      <details class="dr-advanced">
+      <details class="settings-card dr-advanced">
         <summary>Advanced</summary>
         <div class="dr-advanced-body">
+          <p class="settings-sub">Connecting adds a local proxy to <code>${escape(setup.settings_path || '~/.claude/settings.json')}</code> and keeps a backup. Restart Desktop once after connecting or disconnecting.</p>
           <div class="settings-row"><div><strong>Relay</strong><span class="dim"> · ${status.listening ? escape(status.address || 'listening') : 'stopped'}${count(status.in_flight) ? ` · ${count(status.in_flight)} in flight` : ''}</span></div>
             ${status.listening
               ? `<button type="button" data-dr-action="stop" ${disabled || configured ? 'disabled' : ''} ${configured ? 'title="Disconnect Claude Desktop first"' : ''}>${doing('stop') ? 'Stopping…' : 'Stop'}</button>`

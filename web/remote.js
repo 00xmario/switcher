@@ -14,6 +14,8 @@ function remaining(value, now) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
+const MAC_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="10.5" rx="1.8"/><path d="M2 18.5h20"/></svg>';
+
 export function createRemote({ api, confirm = async () => true, onConnectionChange = () => {}, now = () => Date.now() }) {
   // error belongs to the last action and stays until the next one; loadError
   // is the status poll's own.
@@ -64,7 +66,7 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
 
   function hostHTML(host) {
     const addresses = [...(host.lan || []), ...(host.tailscale || []).map(a => `${a} (Tailscale)`)];
-    return `<div class="remote-section">
+    return `<div class="settings-card remote-section">
       <div class="settings-row">
         <div><strong>Share this Switcher</strong><span class="dim"> · let your other Macs use the accounts on ${escape(host.name)}</span></div>
         <label class="switch-wrap"><input type="checkbox" data-remote-action="share" aria-label="Share this Switcher with my other Macs" ${host.enabled ? 'checked' : ''} ${busy ? 'disabled' : ''}><span class="switch-visual"></span></label>
@@ -86,7 +88,7 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
 
   function clientHTML(client) {
     if (client.connected) {
-      return `<div class="remote-section">
+      return `<div class="settings-card remote-section">
         <div class="remote-connected">
           <span class="dr-status ${client.reachable ? 'ok' : 'warn'}">${client.reachable ? 'Connected' : 'Unreachable'}</span>
           <div><strong>Using ${escape(client.host_name)}</strong><span class="dim"> · via ${escape(client.address)}</span></div>
@@ -97,7 +99,7 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
       </div>`;
     }
     const hosts = found || [];
-    return `<div class="remote-section">
+    return `<div class="settings-card remote-section">
       <div class="settings-row"><div><strong>Use another Switcher</strong><span class="dim"> · run on the accounts of another Mac</span></div>
         <button type="button" data-remote-action="scan" ${scanning || busy ? 'disabled' : ''}>${scanning ? 'Looking…' : 'Look again'}</button></div>
       ${hosts.length ? `<ul class="remote-found">${hosts.map(h => `<li>
@@ -126,7 +128,7 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
       </div>`;
     else if (t.enabled && t.state === 'Running') detail = `<p class="settings-sub">On Tailscale as <code>${escape(t.dns_name || t.name)}</code>${t.tailnet ? ` in ${escape(t.tailnet)}` : ''}. Your Macs find each other from anywhere.</p>`;
     else if (t.enabled) detail = '<p class="settings-sub">Connecting to Tailscale…</p>';
-    return `<div class="remote-section remote-tailnet">
+    return `<div class="settings-card remote-section remote-tailnet">
       <div class="settings-row">
         <div><strong>Away from home</strong><span class="dim"> · reach your Macs over Tailscale from anywhere${t.installed ? '' : '; downloads a 19 MB add-on'}</span></div>
         <label class="switch-wrap"><input type="checkbox" data-remote-action="tailnet" aria-label="Use Switcher away from home with Tailscale" ${on ? 'checked' : ''} ${busy || t.downloading ? 'disabled' : ''}><span class="switch-visual"></span></label>
@@ -136,13 +138,35 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
     </div>`;
   }
 
-  function html() {
-    if (!status) return `<h2>Share between Macs</h2><p class="settings-sub">${escape(error || loadError || 'Loading…')}</p>`;
+  // heroHTML draws which Mac keeps the accounts and which use them.
+  function heroHTML() {
     const { host, client } = status;
-    return `<div class="dr-settings-head">
-        <div><h2>Share between Macs</h2><p class="settings-sub">Use one Mac's accounts from your other Macs. Accounts and tokens stay on that Mac, and every request to Claude or Codex leaves from it.</p></div>
-        ${host?.enabled ? `<span class="dr-status ok">Sharing</span>` : ''}
-      </div>
+    const me = escape(status.device_name || host?.name || 'This Mac');
+    const tailnet = status.tailnet?.state === 'Running' ? '<em class="flow-tag">Tailscale</em>' : '';
+    const node = (name, sub, keeps) => `<div class="flow-node ${keeps ? 'is-host' : ''}"><span class="flow-icon">${MAC_ICON}</span><strong>${name}</strong><small>${sub}</small></div>`;
+    let flow, pill;
+    if (client.connected) {
+      flow = `<div class="flow ${client.reachable ? 'is-on' : 'is-warn'}" aria-hidden="true">${node(me, 'this Mac')}<div class="flow-wire"><span></span>${tailnet}</div>${node(escape(client.host_name), 'keeps the accounts', true)}</div>`;
+      pill = client.reachable ? '<span class="dr-status ok">Connected</span>' : '<span class="dr-status warn">Unreachable</span>';
+    } else if (host?.enabled) {
+      const n = host.devices.length;
+      flow = `<div class="flow is-on" aria-hidden="true">${node(n ? `${n} paired Mac${n === 1 ? '' : 's'}` : 'Your other Macs', n ? 'use these accounts' : 'pair one below')}<div class="flow-wire"><span></span>${tailnet}</div>${node(escape(host.name || status.device_name || 'This Mac'), 'this Mac keeps the accounts', true)}</div>`;
+      pill = '<span class="dr-status ok">Sharing</span>';
+    } else {
+      flow = `<div class="flow is-off" aria-hidden="true">${node(me, 'this Mac')}<div class="flow-wire"><span></span></div>${node('Your other Macs', 'not connected')}</div>`;
+      pill = '<span class="dr-status warn">Off</span>';
+    }
+    return `<div class="settings-card remote-hero">
+      ${flow}
+      <div class="dr-settings-head">${pill}</div>
+      <p class="settings-sub dr-lead">One Mac keeps the accounts and tokens; your other Macs use them through it. Every request to Claude or Codex leaves from that Mac.</p>
+    </div>`;
+  }
+
+  function html() {
+    if (!status) return `<div class="settings-card"><p class="settings-sub">${escape(error || loadError || 'Loading…')}</p></div>`;
+    const { host, client } = status;
+    return `${heroHTML()}
       ${error || loadError ? `<p class="remote-error" role="alert">${escape(error || loadError)}</p>` : ''}
       ${client.connected ? clientHTML(client) : `${host ? hostHTML(host) : ''}${host?.enabled ? '' : clientHTML(client)}`}
       ${tailnetHTML(status.tailnet)}`;

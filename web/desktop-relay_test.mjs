@@ -82,6 +82,9 @@ test('the list shows each conversation with a one-click account picker', async (
   assert.match(html, /aria-checked="true" data-dr-choose="c:[^"]+" data-dr-account="claude-a"/);
   assert.doesNotMatch(html, /codex-a/, 'only Claude accounts can be picked');
   assert.match(html, /Desktop login/);
+  assert.match(html, /data-dr-account="" title="Default: Claude Desktop’s own login, through Switcher" aria-label="Desktop login" class="dr-default"[^>]*>\s*<svg class="switcher-mark"/,
+    'the default option is the Switcher mark, named for screen readers');
+  assert.equal(relay.settingsHTML(), relay.settingsHTML(), 'an unchanged view renders identical markup, so polling leaves the DOM alone');
 });
 
 test('picking an account switches the whole conversation; Desktop login clears it', async () => {

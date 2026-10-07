@@ -32,8 +32,9 @@ through the relay with their own credentials unless you pick an account for them
 
 Per-conversation routing is off by default. **Settings → Claude Desktop →
 Per-conversation accounts** lists recent conversations with their saved title
-and project. Pick an account in a row's switcher; **Desktop login** (the
-default) means the account Desktop is signed in to.
+and project. Pick an account in a row's switcher. The first option, the
+Switcher mark, is the default: the conversation goes through Switcher with the
+account Desktop is signed in to.
 
 - New messages in that conversation use the picked account, including sessions
   Desktop starts for it later and its subagents.

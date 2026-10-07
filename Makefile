@@ -40,6 +40,9 @@ verify:
 	node web/desktop-relay_test.mjs
 	node --check web/remote.js
 	node web/remote_test.mjs
+	node --check web/brand.js
+	node --check web/settings-visuals.js
+	node web/settings-visuals_test.mjs
 	cd cmd/switcher-tailnet && test -z "$$(gofmt -l .)" && go vet . && go build -o /dev/null .
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
@@ -64,7 +67,7 @@ benchmark-menu:
 		cp build/macos/Info.plist "$$app/Contents/Info.plist"; \
 		plutil -replace CFBundleIdentifier -string sh.switcher.benchmark "$$app/Contents/Info.plist"; \
 		plutil -replace CFBundleExecutable -string MenuBench "$$app/Contents/Info.plist"; \
-		cp build/macos/logos/*.svg web/logo.svg build/macos/AppIcon.icns "$$app/Contents/Resources/"; \
+		cp build/macos/logos/*.svg build/macos/AppIcon.icns build/macos/MenubarTemplate*.png "$$app/Contents/Resources/"; \
 		swiftc -O -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
 			build/macos/menubar_perf_test.swift -o "$$app/Contents/MacOS/MenuBench"; \
 		"$$app/Contents/MacOS/MenuBench"

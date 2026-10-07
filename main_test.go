@@ -14,12 +14,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"switcher/internal/config"
 	"switcher/internal/desktoprelay"
+	"switcher/internal/login"
 	"switcher/internal/server"
 	"switcher/internal/sessionmeta"
 	"switcher/internal/settings"
@@ -475,5 +477,28 @@ func TestIgnoreOwnRelayProxy(t *testing.T) {
 	}
 	if os.Getenv("HTTP_PROXY") == "" || os.Getenv("ALL_PROXY") == "" {
 		t.Fatal("unrelated proxies were removed")
+	}
+}
+
+// `switcher login finish` reads the callback's outcome as JSON; browsers keep
+// getting the HTML page.
+func TestCallbackAnswersJSONToTheCommandLine(t *testing.T) {
+	handler := callbackHandler(login.New(nil))
+	r := httptest.NewRequest("GET", "/callback?code=abc&state=unknown", nil)
+	r.Header.Set("Accept", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, r)
+	var answer struct {
+		OK    bool   `json:"ok"`
+		State string `json:"state"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &answer); err != nil || answer.OK || answer.State != "unknown" || answer.Error == "" {
+		t.Fatalf("%v %+v", err, answer)
+	}
+	w = httptest.NewRecorder()
+	handler(w, httptest.NewRequest("GET", "/callback?code=abc&state=unknown", nil))
+	if !strings.HasPrefix(w.Header().Get("Content-Type"), "text/html") {
+		t.Fatal("browsers should get the HTML page")
 	}
 }

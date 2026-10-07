@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -92,12 +93,25 @@ func ignoreOwnRelayProxy(relayPort int) {
 func main() {
 	port := flag.Int("port", config.DefaultPort, "port for the Switcher server (UI + proxy)")
 	desktopRelayPort := flag.Int("desktop-relay-port", defaultDesktopRelayPort, "port for the opt-in Desktop task relay")
+	// Command flags may also come before the command: switcher --json status.
+	jsonOutput := flag.Bool("json", false, "machine-readable output for commands")
+	serverURL := flag.String("url", "", "Switcher to talk to, for commands")
+	flag.Usage = func() { runCommand([]string{"help"}, config.DefaultPort) }
 	flag.Parse()
 	ignoreOwnRelayProxy(*desktopRelayPort)
 
 	args := flag.Args()
 	switch {
-	case len(args) > 0 && args[0] == "install":
+	case len(args) == 0 || args[0] == "serve":
+		if len(args) > 1 {
+			log.Fatal("usage: switcher [-port N] [-desktop-relay-port N] serve")
+		}
+		if err := validateServerPorts(*port, *desktopRelayPort); err != nil {
+			log.Fatal(err)
+		}
+		run(*port, *desktopRelayPort)
+
+	case args[0] == "install":
 		if len(args) > 2 || (len(args) == 2 && args[1] != "--reselect") {
 			log.Fatal("usage: switcher [-port N] install [--reselect]")
 		}
@@ -113,7 +127,7 @@ func main() {
 		}
 		fmt.Printf("Codex user config checked at %s; native requests not tested.\n", path)
 
-	case len(args) > 0 && args[0] == "uninstall":
+	case args[0] == "uninstall":
 		if len(args) > 2 || (len(args) == 2 && args[1] != "--legacy-remove") {
 			log.Fatal("usage: switcher uninstall [--legacy-remove]")
 		}
@@ -132,16 +146,19 @@ func main() {
 		}
 		fmt.Printf("Switcher-owned Codex settings removed from %s.\n", path)
 
-	case len(args) > 0 && args[0] == "version":
+	case args[0] == "version":
 		fmt.Println("switcher " + version)
-	case len(args) > 0 && args[0] == "licenses":
+	case args[0] == "licenses":
 		fmt.Print(thirdPartyNotices)
 
 	default:
-		if err := validateServerPorts(*port, *desktopRelayPort); err != nil {
-			log.Fatal(err)
+		if *jsonOutput {
+			args = append(args, "--json")
 		}
-		run(*port, *desktopRelayPort)
+		if *serverURL != "" {
+			args = append(args, "--url", *serverURL)
+		}
+		os.Exit(runCommand(args, *port))
 	}
 }
 
@@ -204,6 +221,13 @@ func sessionMetadataRoots(goos, home, configDir string) sessionmeta.Config {
 
 // run starts the OAuth callback listener and the main server, then blocks.
 func run(port, desktopRelayPort int) {
+	// A second Switcher on this Mac stops here, before it refreshes accounts,
+	// resumes the Desktop relay or starts the Tailscale add-on.
+	if probe, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err != nil {
+		log.Fatalf("Switcher is already running here, or port %d is in use: %v", port, err)
+	} else {
+		probe.Close()
+	}
 	st := store.New(config.Dir())
 	claudeProvider := claude.New()
 	if err := claudeProvider.ConfigureNative(st, config.Dir()); err != nil {
@@ -564,6 +588,17 @@ func callbackHandler(logins *login.Manager) http.HandlerFunc {
 			state = logins.SinglePending()
 		}
 		err := logins.Complete(r.Context(), state, code)
+		// `switcher login finish` delivers an address pasted from another
+		// device and reads the outcome as JSON.
+		if strings.Contains(r.Header.Get("Accept"), "application/json") {
+			w.Header().Set("Content-Type", "application/json")
+			answer := map[string]any{"ok": err == nil, "state": state}
+			if err != nil {
+				answer["error"] = err.Error()
+			}
+			json.NewEncoder(w).Encode(answer)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err != nil {
 			fmt.Fprintf(w, callbackPage, "Login failed", html.EscapeString(err.Error()))

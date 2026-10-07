@@ -7,7 +7,6 @@ input::placeholder { color: var(--dim); opacity: 1; }
 .theme-switch, .provider-head .add-provider, .provider-tools button,
 .settings-card input, .settings-card select { border-radius: var(--button-radius); }
 .device-modal { border-radius: calc(var(--card-radius) + 4px); }
-.brand-mark g { stroke: var(--on-accent); }
 .menu-chips button[aria-checked="true"] { color: var(--on-accent); }
 .confirm-actions .danger { color: var(--on-danger, #fff); }
 html[data-button-style="filled"] :is(.account-head .actions, .compact-actions) .use,

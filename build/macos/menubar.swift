@@ -983,7 +983,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         } catch {
             NSLog("Switcher could not load reset alerts: %@", error.localizedDescription)
         }
-        statusItem?.button?.title = "⇄"
+        // The Switcher mark as a template image, so macOS tints it for the
+        // menu bar's appearance.
+        if let mark = Bundle.main.image(forResource: "MenubarTemplate") {
+            mark.isTemplate = true
+            mark.size = NSSize(width: 18, height: 18)
+            statusItem?.button?.image = mark
+        } else {
+            statusItem?.button?.title = "⇄"
+        }
         statusItem?.button?.toolTip = "Switcher"
         menu.autoenablesItems = false
         statusItem?.menu = menu
@@ -1345,9 +1353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let blockWidth = 36 + 10 + textColumn
         let blockX = (menuWidth - blockWidth) / 2
         let logo = NSImageView(frame: NSRect(x: blockX, y: 11, width: 36, height: 36))
-        // Same SVG as the web app header, so the two marks are identical.
-        logo.image = providerLogoImage("logo")
-            ?? Bundle.main.image(forResource: "AppIcon")
+        logo.image = Bundle.main.image(forResource: "AppIcon") ?? NSApp.applicationIconImage
         headerView.addSubview(logo)
         let nameField = label("Switcher", font: nameFont, color: inkColor)
         nameField.frame = NSRect(x: blockX + 46, y: 30, width: textColumn, height: 17)

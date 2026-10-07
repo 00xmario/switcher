@@ -44,6 +44,8 @@ request on the caller's own credential rather than failing it.
 
 ## Guides
 
+- [Switcher in detail](details.md): every feature, providers, switching rules, security
+- [Command line](cli.md): commands, JSON output for agents, signing in over SSH
 - [Share between Macs](sharing.md)
 - [Setup, usage, and live validation](desktop-relay-usage.md)
 - [Relay module and wire contract](desktop-relay-module.md)

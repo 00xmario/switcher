@@ -11,10 +11,16 @@
     <section class="login-card" aria-labelledby="login-title">
       <span class="brand-mark" aria-hidden="true">
         <svg viewBox="0 0 48 48">
-          <rect width="48" height="48" rx="11" fill="currentColor"/>
-          <g stroke="#fff" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" fill="none">
-            <path d="M13.5 19.5h21"/><path d="M29.5 14.5l5 5-5 5"/>
-            <path d="M34.5 28.5h-21"/><path d="M18.5 23.5l-5 5 5 5"/>
+          <defs>
+            <linearGradient id="brand-bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#22332b"/><stop offset="1" stop-color="#0a120e"/></linearGradient>
+            <linearGradient id="brand-track" gradientUnits="userSpaceOnUse" x1="30" y1="22" x2="62" y2="80"><stop offset="0" stop-color="#d4f76e"/><stop offset=".5" stop-color="#43dc8d"/><stop offset="1" stop-color="#10a89a"/></linearGradient>
+            <mask id="brand-cut" maskUnits="userSpaceOnUse" x="0" y="0" width="100" height="100"><rect width="100" height="100" fill="#fff"/><circle cx="68" cy="28" r="13.4" fill="#000"/></mask>
+          </defs>
+          <rect width="48" height="48" rx="11" fill="url(#brand-bg)"/>
+          <rect x=".5" y=".5" width="47" height="47" rx="10.5" fill="none" stroke="#fff" stroke-opacity=".1"/>
+          <g transform="translate(24 24) scale(.5) translate(-52.9 -47.1)">
+            <path d="M68 28H44A11 11 0 0 0 44 50H56A11 11 0 0 1 56 72H32" fill="none" stroke="url(#brand-track)" stroke-width="10.5" stroke-linecap="round" stroke-linejoin="round" mask="url(#brand-cut)"/>
+            <circle cx="68" cy="28" r="11" fill="#f4fff8"/>
           </g>
         </svg>
       </span>
