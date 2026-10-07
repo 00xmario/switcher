@@ -123,8 +123,9 @@ required; OpenCode Go uses its own API key.
   storage and credential-overriding environment variables block the operation
   with an explanation. See [the source analysis and comparison](docs/claude-swap-analysis.md).
 - **Share between Macs**: let your other Macs use one Mac's accounts. Pair once
-  with a code (Switchers on your network are found automatically; Tailscale
-  works away from home). Accounts, tokens and every provider request stay on
+  with a code (Switchers on your network are found automatically). The optional
+  **Away from home** add-on, downloaded only when turned on, connects your Macs
+  over Tailscale from anywhere. Accounts, tokens and every provider request stay on
   that Mac; the other Macs' account views, Codex, T3 Code hub, Claude Code and
   Claude Desktop follow it. See [sharing](docs/sharing.md).
 - **Claude Desktop account switching (optional, off by default)**: in

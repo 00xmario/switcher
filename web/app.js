@@ -698,7 +698,7 @@ function accountMenuHTML(account) {
           ${['global', 'on', 'off'].map(v => `<button type="button" role="menuitemradio" aria-checked="${mode === v}" data-act="auto-reset" data-mode="${v}" data-account-id="${escapeHTML(account.id)}">${labels[v]}</button>`).join('')}
         </div>
       </div>` : ''}
-    ${ADD_METHOD[account.provider] === 'key' ? '' : `<button type="button" role="menuitem" data-act="relogin" data-provider="${escapeHTML(account.provider)}" data-account-id="${escapeHTML(account.id)}">Relogin</button>`}
+    ${ADD_METHOD[account.provider] === 'key' || data.remote?.role === 'client' ? '' : `<button type="button" role="menuitem" data-act="relogin" data-provider="${escapeHTML(account.provider)}" data-account-id="${escapeHTML(account.id)}">Relogin</button>`}
     <button type="button" role="menuitem" data-act="delete" data-account-id="${escapeHTML(account.id)}">Remove</button>`;
 }
 

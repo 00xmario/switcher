@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -121,23 +124,48 @@ func TestPairingRejectsWrongCodesAndRevokedDevices(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{}`))
-	resp, _, err := client2.Inference(context.Background(), "", r, []byte(`{}`))
-	if err != nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("revoked device: %v %v", resp, err)
+	if _, _, err := client2.Inference(context.Background(), "", r, []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "pair again") {
+		t.Fatalf("revoked device: %v", err)
 	}
-	resp.Body.Close()
 	if s := client2.Status(); s.Reachable || !strings.Contains(s.Error, "pair again") {
 		t.Fatalf("client status after revocation: %+v", s)
 	}
 }
 
 // A device in the middle with its own certificate cannot use a code it relays.
-func TestPairingProofIsBoundToTheHostCertificate(t *testing.T) {
-	if pairingProof("ABCD-EFGH", "aa") == pairingProof("ABCD-EFGH", "bb") {
+func TestPairingProofIsBoundToTheHostCertificateAndRole(t *testing.T) {
+	a, _ := pairingKey("ABCD-EFGH", "aa")
+	b, _ := pairingKey("ABCD-EFGH", "bb")
+	c, _ := pairingKey("abcd efgh", "aa")
+	if pairingProof(a, "client", "n") == pairingProof(b, "client", "n") {
 		t.Fatal("proof ignores the certificate")
 	}
-	if pairingProof("abcd efgh", "aa") != pairingProof("ABCD-EFGH", "aa") {
+	if pairingProof(a, "client", "n") != pairingProof(c, "client", "n") {
 		t.Fatal("code formatting changes the proof")
+	}
+	if pairingProof(a, "client", "n") == pairingProof(a, "host", "n") {
+		t.Fatal("the host could replay the client's proof")
+	}
+}
+
+// A device pretending to be the host, without the code, cannot complete a
+// pairing: the client checks the host's proof before saving anything.
+func TestClientRefusesAHostThatDoesNotKnowTheCode(t *testing.T) {
+	var asked bool
+	rogue := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = true
+		json.NewEncoder(w).Encode(pairResponse{DeviceID: "d", Token: "stolen", HostName: "Studio Mac", HostProof: "made-up"})
+	}))
+	defer rogue.Close()
+	host, port, _ := net.SplitHostPort(rogue.Listener.Addr().String())
+	n, _ := strconv.Atoi(port)
+	client := NewClient(t.TempDir(), "")
+	_, err := client.Connect(context.Background(), host, n, "ABCD-EFGH", "Laptop")
+	if !asked || err == nil || client.Connected() {
+		t.Fatalf("paired with a host that does not know the code: asked=%v err=%v", asked, err)
+	}
+	if _, statErr := os.Stat(client.path()); !os.IsNotExist(statErr) {
+		t.Fatal("pairing was saved")
 	}
 }
 
@@ -154,4 +182,29 @@ func TestDisconnectRestoresLocalRoutes(t *testing.T) {
 	if w.Body.String() != "local" || len(changes) != 2 || changes[0] != true || changes[1] != false {
 		t.Fatalf("after disconnect: %q %v", w.Body.String(), changes)
 	}
+}
+
+func TestHostServesOnlyThisMacTheLocalNetworkAndTailscale(t *testing.T) {
+	for ip, want := range map[string]bool{
+		"127.0.0.1": true, "::1": true, "192.168.178.20": true, "10.0.0.4": true, "172.16.5.1": true,
+		"169.254.1.2": true, "fe80::1": true, "fd12:3456::1": true, "100.101.2.3": true, "fd7a:115c:a1e0::1": true,
+		"::ffff:192.168.1.5": true,
+		"8.8.8.8":            false, "84.105.1.2": false, "100.128.0.1": false, "2a02:a210::1": false, "::ffff:84.105.1.2": false,
+	} {
+		if got := privateSource(net.ParseIP(ip)); got != want {
+			t.Errorf("%s: accepted=%v, want %v", ip, got, want)
+		}
+	}
+}
+
+func TestClientLearnsTheHostsNewAddresses(t *testing.T) {
+	host, client := pairedPair(t)
+	host.addresses = func() ([]string, []string) { return []string{"studio.local"}, []string{"100.101.2.3"} }
+	client.refreshAddresses()
+	saved := NewClient(client.dir, "")
+	want := []string{"studio.local", "100.101.2.3", "127.0.0.1"}
+	if got := saved.cfg.Addresses; strings.Join(got[:3], ",") != strings.Join(want, ",") {
+		t.Fatalf("saved addresses %v, want first %v", got, want)
+	}
+	client.refreshAddresses() // rate limited: no second request within two minutes
 }

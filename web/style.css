@@ -1118,3 +1118,9 @@ button.quiet.danger { color: var(--danger); }
 .remote-banner.offline .remote-banner-dot { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
 .provider-head .count + .provider-tools { margin-left: auto; }
 .settings-card .remote-connect input[name="code"]::placeholder { font-family: inherit; letter-spacing: 0; text-transform: none; }
+.remote-tailnet { border-top: 1px solid var(--border); padding-top: 4px; }
+.remote-tailnet .settings-row { border-top: 0; }
+.remote-tailnet-login { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+a.button { display: inline-flex; align-items: center; padding: 7px 14px; border: 1px solid var(--border); border-radius: var(--button-radius); font-size: 13.5px; font-weight: 550; text-decoration: none; color: var(--text); background: var(--surface); }
+a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+a.button.primary:hover { filter: brightness(1.06); }

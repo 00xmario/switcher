@@ -37,3 +37,27 @@ test('a connected Mac shows its host and how to disconnect', async () => {
   assert.match(html, /data-remote-action="disconnect"/);
   assert.doesNotMatch(html, /Share this Switcher/);
 });
+
+test('away from home: off, signing in, and running on Tailscale', async () => {
+  const base = { host: host(), client: { connected: false } };
+  let { html } = await render({ ...base, tailnet: { installed: false, enabled: false, running: false, peers: [] } });
+  assert.match(html, /Away from home/);
+  assert.match(html, /downloads a 19 MB add-on/);
+  assert.doesNotMatch(html, /Remove add-on/);
+  ({ html } = await render({ ...base, tailnet: { installed: true, enabled: true, running: true, state: 'NeedsLogin', auth_url: 'https://login.tailscale.com/a/abc', peers: [] } }));
+  assert.match(html, /href="https:\/\/login\.tailscale\.com\/a\/abc"[^>]*>Sign in with Tailscale/);
+  ({ html } = await render({ ...base, tailnet: { installed: true, enabled: true, running: true, state: 'Running', dns_name: 'switcher-studio.tail1234.ts.net', peers: [] } }));
+  assert.match(html, /On Tailscale as <code>switcher-studio\.tail1234\.ts\.net<\/code>/);
+  assert.match(html, /Remove add-on and sign out/);
+});
+
+test('an action error stays visible after the status reloads', async () => {
+  const status = { host: host(), client: { connected: false } };
+  const remote = createRemote({ api: async () => status, now: () => now });
+  await remote.act('connect', async () => { throw new Error('pairing failed: check the code shown on the other Mac'); });
+  assert.match(remote.html(), /role="alert">pairing failed: check the code/);
+  await remote.load();
+  assert.match(remote.html(), /pairing failed/, 'a status poll does not hide it');
+  await remote.act('scan', async () => {});
+  assert.doesNotMatch(remote.html(), /pairing failed/, 'the next action clears it');
+});

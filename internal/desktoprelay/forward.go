@@ -72,7 +72,7 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 		if resp, ok, err := remote(ctx, task.AccountID, r, body); ok {
 			if err != nil {
 				if ctx.Err() == nil {
-					relayError(w, http.StatusBadGateway, "api_error", "Switcher could not reach the Switcher host this Mac is connected to", "")
+					relayError(w, http.StatusBadGateway, "api_error", err.Error(), "")
 				}
 				return
 			}

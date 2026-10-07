@@ -66,7 +66,8 @@ type API struct {
 	// RemoteClient uses another Switcher's. Either may be nil.
 	RemoteHost        *remote.Host
 	RemoteClient      *remote.Client
-	CodexConfigPath   string // optional test override
+	Tailnet           *remote.Tailnet // optional "Away from home" add-on
+	CodexConfigPath   string          // optional test override
 	probeCodexForTest func(context.Context) proxy.ProbeCodexResult
 	syncClaudeForTest func(context.Context, map[string]string) (claudesync.Result, error)
 
@@ -1150,6 +1151,16 @@ func (a *API) handleActivate(w http.ResponseWriter, r *http.Request) {
 	account, err := a.Store.Get(id)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such account"})
+		return
+	}
+	// A paired Mac picks which account the host uses for its requests; the
+	// host's own Claude Code login stays as it is.
+	if _, paired := remote.PairedDevice(r); paired {
+		if err := a.Proxy.Activate(id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not activate account"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "active": id})
 		return
 	}
 	if native, ok := a.Providers[account.Provider].(provider.NativeLoginProvider); ok && native.NativeEnabled() {

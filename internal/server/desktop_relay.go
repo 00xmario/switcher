@@ -334,6 +334,19 @@ func (a *API) handleDesktopRelayConversationSelection(w http.ResponseWriter, r *
 }
 
 func (a *API) desktopRelayClaudeAccount(w http.ResponseWriter, id string) bool {
+	// A client's conversations use the host's accounts.
+	if a.RemoteClient != nil && a.RemoteClient.Connected() {
+		provider, ok := a.RemoteClient.HostAccount(id)
+		if !ok {
+			writeDesktopRelayError(w, desktoprelay.ErrNotFound)
+			return false
+		}
+		if provider != "claude" {
+			writeDesktopRelayBadRequest(w)
+			return false
+		}
+		return true
+	}
 	if a.Store == nil {
 		writeDesktopRelayError(w, desktoprelay.ErrUnavailable)
 		return false

@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"html"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -378,16 +379,25 @@ func run(port, desktopRelayPort int) {
 	// (with this Switcher's management key) and Claude inference here.
 	shared := http.NewServeMux()
 	shared.HandleFunc("/remote/anthropic/", func(w http.ResponseWriter, r *http.Request) {
+		// Paired Macs may send Claude messages and token counts, nothing else.
+		path := strings.TrimPrefix(r.URL.Path, "/remote/anthropic")
+		if r.Method != http.MethodPost || (path != "/v1/messages" && path != "/v1/messages/count_tokens") {
+			http.NotFound(w, r)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
 		account := r.Header.Get(remote.AccountHeader)
 		r.Header.Del(remote.AccountHeader)
 		if account == "" {
 			account = proxyManager.ActiveID("claude")
 		}
 		if desktopRelay == nil || account == "" {
-			http.Error(w, `{"type":"error","error":{"type":"api_error","message":"The Switcher host has no Claude account selected"}}`, http.StatusServiceUnavailable)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"The Switcher host has no Claude account selected"}}`)
 			return
 		}
-		desktopRelay.ServeAccount(w, r, strings.TrimPrefix(r.URL.Path, "/remote/anthropic"), account)
+		desktopRelay.ServeAccount(w, r, path, account)
 	})
 	shared.Handle("/v0/management/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("Authorization", "Bearer "+managementKey)
@@ -399,8 +409,16 @@ func run(port, desktopRelayPort int) {
 		log.Printf("sharing unavailable: %v", err)
 	} else {
 		api.RemoteHost = remoteHost
+		// The optional Tailscale add-on is downloaded only when turned on.
+		tailnet := remote.NewTailnet(filepath.Join(config.Dir(), "remote"), version, remote.DefaultPort)
+		api.Tailnet = tailnet
+		remoteHost.AlsoReachableAt(tailnet.Addresses)
+		remoteClient.UseTailnet(tailnet.Dial)
 		remoteHost.Start()
+		tailnet.ForwardWhen(remoteHost.Listening)
+		tailnet.Start()
 		defer remoteHost.Close()
+		defer tailnet.Close()
 	}
 	if desktopRelay != nil {
 		remoteClient.OnChange(func(connected bool) {

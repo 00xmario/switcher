@@ -29,15 +29,29 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
+          # The optional "Away from home" Tailscale add-on, downloaded by the
+          # app only when a user turns it on. Its digest is built into the
+          # matching Switcher binary, which trusts nothing else.
+          for arch in arm64 amd64; do
+            (cd cmd/switcher-tailnet && CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w" -o "../../dist/switcher-tailnet_${VERSION}_darwin_${arch}" .)
+            sum=$(shasum -a 256 "dist/switcher-tailnet_${VERSION}_darwin_${arch}" | cut -d' ' -f1)
+            echo "ADDON_SHA256_${arch}=${sum}" >> "$GITHUB_ENV"
+            eval "ADDON_SHA256_${arch}=${sum}"
+          done
           for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
             os="${target%/*}"
             arch="${target#*/}"
+            addon=""
+            if [ "$os" = darwin ]; then
+              eval "addon=\${ADDON_SHA256_${arch}}"
+            fi
             GOOS="$os" GOARCH="$arch" \
-              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X switcher/internal/remote.addonSHA256=${addon}" \
               -o "dist/switcher-server_${VERSION}_${os}_${arch}" .
           done
           cd dist
-          for f in switcher-server_*; do
+          for f in switcher-server_* switcher-tailnet_*; do
             shasum -a 256 "$f" | tee "$f.sha256"
           done
 
@@ -53,7 +67,7 @@ jobs:
           cp THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/ThirdPartyNotices.md"
           sed "s/VERSION_TOKEN/${VERSION}/g" build/macos/Info.plist > "$APP/Contents/Info.plist"
           GOOS=darwin GOARCH=arm64 \
-            go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X switcher/internal/remote.addonSHA256=${ADDON_SHA256_arm64}" \
             -o "$APP/Contents/MacOS/SwitcherServer" .
           swiftc -parse-as-library -O -o "$APP/Contents/MacOS/Switcher" build/macos/menubar.swift
           # Ad-hoc signing: without it Apple Silicon reports quarantined

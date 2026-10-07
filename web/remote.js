@@ -15,14 +15,16 @@ function remaining(value, now) {
 }
 
 export function createRemote({ api, confirm = async () => true, onConnectionChange = () => {}, now = () => Date.now() }) {
-  let view = null, status = null, found = null, scanning = false, busy = '', error = '', target = null, timer = null;
+  // error belongs to the last action and stays until the next one; loadError
+  // is the status poll's own.
+  let view = null, status = null, found = null, scanning = false, busy = '', error = '', loadError = '', target = null, timer = null;
 
   async function load() {
     try {
       status = await api('/api/remote');
-      error = '';
+      loadError = '';
     } catch (e) {
-      error = e.message || 'Could not load sharing status.';
+      loadError = e.message || 'Could not load sharing status.';
     }
     render();
   }
@@ -110,23 +112,53 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
     </div>`;
   }
 
+  // "Away from home": the optional Tailscale add-on, downloaded on demand.
+  function tailnetHTML(t) {
+    if (!t) return '';
+    const on = t.enabled || t.downloading;
+    let detail = '';
+    if (t.downloading) detail = '<p class="settings-sub">Downloading the Tailscale add-on…</p>';
+    else if (t.enabled && t.error) detail = `<p class="remote-error">${escape(t.error)}</p>`;
+    else if (t.enabled && !t.running) detail = '<p class="settings-sub">Starting…</p>';
+    else if (t.enabled && t.state === 'NeedsLogin' && t.auth_url) detail = `<div class="remote-tailnet-login">
+        <p class="settings-sub">Sign in once to add this Mac to your Tailscale network. Use the same Tailscale account on your other Macs.</p>
+        <a class="button primary" href="${escape(t.auth_url)}" target="_blank" rel="noopener noreferrer">Sign in with Tailscale</a>
+      </div>`;
+    else if (t.enabled && t.state === 'Running') detail = `<p class="settings-sub">On Tailscale as <code>${escape(t.dns_name || t.name)}</code>${t.tailnet ? ` in ${escape(t.tailnet)}` : ''}. Your Macs find each other from anywhere.</p>`;
+    else if (t.enabled) detail = '<p class="settings-sub">Connecting to Tailscale…</p>';
+    return `<div class="remote-section remote-tailnet">
+      <div class="settings-row">
+        <div><strong>Away from home</strong><span class="dim"> · reach your Macs over Tailscale from anywhere${t.installed ? '' : '; downloads a 19 MB add-on'}</span></div>
+        <label class="switch-wrap"><input type="checkbox" data-remote-action="tailnet" aria-label="Use Switcher away from home with Tailscale" ${on ? 'checked' : ''} ${busy || t.downloading ? 'disabled' : ''}><span class="switch-visual"></span></label>
+      </div>
+      ${detail}
+      ${t.installed && !t.downloading ? `<div><button type="button" class="quiet danger" data-remote-action="tailnet-remove" ${busy ? 'disabled' : ''}>Remove add-on and sign out</button></div>` : ''}
+    </div>`;
+  }
+
   function html() {
-    if (!status) return `<h2>Share between Macs</h2><p class="settings-sub">${escape(error || 'Loading…')}</p>`;
+    if (!status) return `<h2>Share between Macs</h2><p class="settings-sub">${escape(error || loadError || 'Loading…')}</p>`;
     const { host, client } = status;
     return `<div class="dr-settings-head">
         <div><h2>Share between Macs</h2><p class="settings-sub">Use one Mac's accounts from your other Macs. Accounts and tokens stay on that Mac, and every request to Claude or Codex leaves from it.</p></div>
-        ${host.enabled ? `<span class="dr-status ok">Sharing</span>` : ''}
+        ${host?.enabled ? `<span class="dr-status ok">Sharing</span>` : ''}
       </div>
-      ${error ? `<p class="remote-error" role="alert">${escape(error)}</p>` : ''}
-      ${client.connected ? clientHTML(client) : `${hostHTML(host)}${host.enabled ? '' : clientHTML(client)}`}`;
+      ${error || loadError ? `<p class="remote-error" role="alert">${escape(error || loadError)}</p>` : ''}
+      ${client.connected ? clientHTML(client) : `${host ? hostHTML(host) : ''}${host?.enabled ? '' : clientHTML(client)}`}
+      ${tailnetHTML(status.tailnet)}`;
   }
 
+  let shown = '';
   function render() {
     if (!view) return;
+    // The status poll often changes nothing; leave the card and its inputs alone.
+    const markup = html();
+    if (markup === shown) return;
+    shown = markup;
     const focused = view.contains(document.activeElement) ? document.activeElement : null;
     const keep = focused?.name ? { name: focused.name, value: focused.value } : null;
     const values = Object.fromEntries([...view.querySelectorAll('[data-remote-form] input')].map(i => [i.name, i.value]));
-    view.innerHTML = html();
+    view.innerHTML = markup;
     for (const [name, value] of Object.entries(values)) {
       const input = view.querySelector(`[data-remote-form] input[name="${name}"]`);
       if (input && value) input.value = value;
@@ -141,6 +173,10 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
       if (event.target.matches('[data-remote-action="share"]')) {
         const enabled = event.target.checked;
         act('share', () => post('/api/remote/host', { enabled }));
+      }
+      if (event.target.matches('[data-remote-action="tailnet"]')) {
+        const enabled = event.target.checked;
+        act('tailnet', () => post('/api/remote/tailnet', { enabled }));
       }
     });
     root.addEventListener('click', async event => {
@@ -158,6 +194,9 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
           view.querySelector('[data-remote-form] input[name="address"]').value = target.address;
           view.querySelector('[data-remote-form] input[name="code"]')?.focus();
           return;
+        case 'tailnet-remove':
+          if (!await confirm({ title: 'Remove the Tailscale add-on?', message: 'This Mac signs out of Tailscale and can only reach your other Macs at home again.', confirmLabel: 'Remove', danger: true })) return;
+          return act('tailnet-remove', () => post('/api/remote/tailnet/remove'));
         case 'disconnect':
           if (!await confirm({ title: `Stop using ${status?.client?.host_name || 'the other Mac'}?`, message: 'This Mac goes back to its own accounts.', confirmLabel: 'Disconnect' })) return;
           if (await act('disconnect', () => post('/api/remote/disconnect'))) onConnectionChange(false);
@@ -179,15 +218,18 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
 
   function mount(root) {
     view = root;
+    shown = '';
+    error = '';
     bind(root);
     render();
     load().then(() => { if (!status?.client?.connected && !status?.host?.enabled && found === null) scan(); });
     clearInterval(timer);
     timer = setInterval(() => {
       if (!view?.isConnected) { clearInterval(timer); timer = null; return; }
-      if (status?.host?.pairing || status?.host?.enabled || status?.client?.connected) load();
+      const t = status?.tailnet;
+      if (status?.host?.pairing || status?.host?.enabled || status?.client?.connected || t?.downloading || (t?.enabled && t?.state !== 'Running')) load();
     }, 3000);
   }
 
-  return { mount, html, load };
+  return { mount, html, load, act };
 }

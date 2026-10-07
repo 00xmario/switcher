@@ -47,7 +47,8 @@ type CachedConversationResolver interface {
 
 // RemoteInference sends a Claude inference request to the Switcher host this
 // Mac is connected to, which applies account (or its own selection when
-// empty). ok is false when no host is connected.
+// empty). ok is false when no host is connected; err's message is shown to
+// the user.
 type RemoteInference func(ctx context.Context, account string, r *http.Request, body []byte) (resp *http.Response, ok bool, err error)
 
 type Config struct {

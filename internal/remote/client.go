@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
@@ -54,6 +55,15 @@ type Client struct {
 	checkedAt     time.Time
 	hostState     map[string]any
 	onChange      func(bool)
+	refreshedAt   time.Time
+	tailnet       func(ctx context.Context, address string) (net.Conn, bool, error)
+}
+
+// UseTailnet reaches tailnet addresses through the Tailscale add-on.
+func (c *Client) UseTailnet(dial func(ctx context.Context, address string) (net.Conn, bool, error)) {
+	c.mu.Lock()
+	c.tailnet = dial
+	c.mu.Unlock()
 }
 
 // NewClient loads a saved pairing from dir. managementKey authenticates this
@@ -98,6 +108,8 @@ func (c *Client) newTransport(cfg *clientFile) *http.Transport {
 		ForceAttemptHTTP2:   true,
 		MaxIdleConnsPerHost: 32,
 		IdleConnTimeout:     90 * time.Second,
+		// Notice a connection that died with sleep or a network change.
+		HTTP2: &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 5 * time.Second},
 	}
 }
 
@@ -112,8 +124,9 @@ func pinned(fp string) *tls.Config {
 		}}
 }
 
-// dial tries the address that worked last, then the host's other addresses,
-// so moving between home Wi-Fi and Tailscale needs no reconfiguration.
+// dial races the host's addresses, the one that worked last first and the
+// others shortly after, so moving between home Wi-Fi and Tailscale needs no
+// reconfiguration and a stale address costs no waiting.
 func (c *Client) dial(ctx context.Context, network, _ string) (net.Conn, error) {
 	c.mu.Lock()
 	if c.cfg == nil {
@@ -121,30 +134,69 @@ func (c *Client) dial(ctx context.Context, network, _ string) (net.Conn, error) 
 		return nil, errors.New("no Switcher host connected")
 	}
 	port := c.cfg.Port
+	viaTailnet := c.tailnet
 	addresses := append([]string(nil), c.cfg.Addresses...)
 	if c.lastGood != "" {
 		addresses = append([]string{c.lastGood}, addresses...)
 	}
 	c.mu.Unlock()
-	var lastErr error
+	var unique []string
 	seen := map[string]bool{}
-	for _, address := range addresses {
-		if seen[address] {
-			continue
+	for _, a := range addresses {
+		if !seen[a] {
+			seen[a] = true
+			unique = append(unique, a)
 		}
-		seen[address] = true
-		d := net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}
-		conn, err := d.DialContext(ctx, network, net.JoinHostPort(address, strconv.Itoa(port)))
-		if err == nil {
+	}
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	type result struct {
+		conn    net.Conn
+		address string
+		err     error
+	}
+	results := make(chan result, len(unique))
+	for i, address := range unique {
+		go func(i int, address string) {
+			select {
+			case <-time.After(time.Duration(i) * 250 * time.Millisecond):
+			case <-ctx.Done():
+				results <- result{err: ctx.Err()}
+				return
+			}
+			target := net.JoinHostPort(address, strconv.Itoa(port))
+			var conn net.Conn
+			var err error
+			handled := false
+			if viaTailnet != nil {
+				conn, handled, err = viaTailnet(ctx, target)
+			}
+			if !handled {
+				d := net.Dialer{KeepAlive: 30 * time.Second}
+				conn, err = d.DialContext(ctx, network, target)
+			}
+			results <- result{conn, address, err}
+		}(i, address)
+	}
+	var lastErr error
+	for range unique {
+		r := <-results
+		if r.err == nil {
+			cancel()
+			// Close the slower winners that still arrive.
+			go func(left int) {
+				for ; left > 0; left-- {
+					if late := <-results; late.conn != nil {
+						late.conn.Close()
+					}
+				}
+			}(len(unique) - 1)
 			c.mu.Lock()
-			c.lastGood = address
+			c.lastGood = r.address
 			c.mu.Unlock()
-			return conn, nil
+			return r.conn, nil
 		}
-		lastErr = err
-		if ctx.Err() != nil {
-			break
-		}
+		lastErr = r.err
 	}
 	return nil, fmt.Errorf("the Switcher host is unreachable: %w", lastErr)
 }
@@ -187,14 +239,30 @@ func (c *Client) Connect(ctx context.Context, address string, port int, code, de
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	// Tailscale addresses go through the add-on when it runs.
+	c.mu.Lock()
+	viaTailnet := c.tailnet
+	c.mu.Unlock()
+	dialRaw := func(ctx context.Context, _, addr string) (net.Conn, error) {
+		if viaTailnet != nil {
+			if conn, handled, err := viaTailnet(ctx, addr); handled {
+				return conn, err
+			}
+		}
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", addr)
+	}
 	// Read the host's certificate, then prove the code against exactly it.
 	var fp string
-	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(address, strconv.Itoa(port)))
+	raw, err := dialRaw(ctx, "tcp", net.JoinHostPort(address, strconv.Itoa(port)))
 	if err != nil {
 		return ClientStatus{}, fmt.Errorf("could not reach a Switcher at %s: is sharing turned on there?", address)
 	}
-	if certs := conn.(*tls.Conn).ConnectionState().PeerCertificates; len(certs) > 0 {
+	conn := tls.Client(raw, &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true})
+	if err := conn.HandshakeContext(ctx); err != nil {
+		raw.Close()
+		return ClientStatus{}, fmt.Errorf("could not reach a Switcher at %s: is sharing turned on there?", address)
+	}
+	if certs := conn.ConnectionState().PeerCertificates; len(certs) > 0 {
 		fp = fingerprint(certs[0].Raw)
 	}
 	conn.Close()
@@ -202,8 +270,13 @@ func (c *Client) Connect(ctx context.Context, address string, port int, code, de
 		return ClientStatus{}, errors.New("the host did not present a certificate")
 	}
 	cfg := &clientFile{Addresses: []string{address}, Port: port, Fingerprint: fp}
-	body, _ := json.Marshal(pairRequest{Name: deviceName, Proof: pairingProof(code, fp)})
-	transport := &http.Transport{Proxy: nil, TLSClientConfig: pinned(fp)}
+	key, err := pairingKey(code, fp)
+	if err != nil {
+		return ClientStatus{}, err
+	}
+	nonce := randomHex(16)
+	body, _ := json.Marshal(pairRequest{Name: deviceName, Nonce: nonce, Proof: pairingProof(key, "client", nonce)})
+	transport := &http.Transport{Proxy: nil, DialContext: dialRaw, TLSClientConfig: pinned(fp)}
 	defer transport.CloseIdleConnections()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+net.JoinHostPort(address, strconv.Itoa(port))+"/remote/pair", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -226,16 +299,24 @@ func (c *Client) Connect(ctx context.Context, address string, port int, code, de
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&paired); err != nil || paired.Token == "" {
 		return ClientStatus{}, errors.New("the host sent an invalid pairing reply")
 	}
+	// Only a host that knows the code can answer this; anything else is a
+	// device pretending to be the host.
+	if !hmac.Equal([]byte(paired.HostProof), []byte(pairingProof(key, "host", nonce))) {
+		return ClientStatus{}, errors.New("this is not the Switcher you meant to pair with; check the code and address")
+	}
 	cfg.HostName, cfg.DeviceID, cfg.Token, cfg.PairedAt = paired.HostName, paired.DeviceID, paired.Token, time.Now().UTC()
 	for _, a := range paired.Addresses {
 		if a != address {
 			cfg.Addresses = append(cfg.Addresses, a)
 		}
 	}
+	// Saved under the lock, so an address refresh for an older pairing
+	// cannot overwrite it.
+	c.mu.Lock()
 	if err := writeJSON(c.path(), cfg); err != nil {
+		c.mu.Unlock()
 		return ClientStatus{}, err
 	}
-	c.mu.Lock()
 	c.setLocked(cfg)
 	c.lastGood, c.reachable, c.lastErr, c.checkedAt = address, true, "", time.Now()
 	onChange := c.onChange
@@ -248,10 +329,11 @@ func (c *Client) Connect(ctx context.Context, address string, port int, code, de
 
 // Disconnect forgets the host; this Switcher uses its own accounts again.
 func (c *Client) Disconnect() error {
+	c.mu.Lock()
 	if err := os.Remove(c.path()); err != nil && !os.IsNotExist(err) {
+		c.mu.Unlock()
 		return err
 	}
-	c.mu.Lock()
 	if c.transport != nil {
 		c.transport.CloseIdleConnections()
 	}
@@ -306,12 +388,20 @@ func (c *Client) Inference(ctx context.Context, account string, r *http.Request,
 	}
 	req.URL.RawQuery = r.URL.RawQuery
 	req.Header = r.Header.Clone()
-	for _, key := range []string{"Proxy-Authorization", "Proxy-Connection", "Connection", "Keep-Alive", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
+	// The host sends its own account's credential; this Mac's login stays here.
+	for _, key := range []string{"Authorization", "X-Api-Key", "Cookie", "Proxy-Authorization", "Proxy-Connection", "Connection", "Keep-Alive", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
 		req.Header.Del(key)
 	}
 	req.Header.Set(AccountHeader, account)
 	resp, err := c.do(req)
-	return resp, true, err
+	if err != nil {
+		return nil, true, errors.New("Switcher could not reach the Switcher host this Mac is connected to")
+	}
+	if resp.Header.Get(rejectedHeader) != "" {
+		resp.Body.Close()
+		return nil, true, errors.New("the Switcher host no longer accepts this Mac; pair again in Switcher")
+	}
+	return resp, true, nil
 }
 
 // forwardedPaths go to the host while connected; everything else, including
@@ -346,6 +436,8 @@ func (c *Client) Middleware(local LocalState, next http.Handler) http.Handler {
 		switch {
 		case r.URL.Path == "/api/state" && r.Method == http.MethodGet:
 			c.serveState(w, r, local)
+		case strings.HasPrefix(r.URL.Path, "/api/login") || r.URL.Path == "/api/accounts" && r.Method == http.MethodPost:
+			writeError(w, http.StatusConflict, "accounts are added and signed in on "+c.Status().HostName)
 		case forwarded(r.URL.Path):
 			if strings.HasPrefix(r.URL.Path, "/v0/management/") && !c.localManagementKey(r) {
 				writeError(w, http.StatusUnauthorized, "management key required")
@@ -416,6 +508,20 @@ func (c *Client) serveState(w http.ResponseWriter, r *http.Request, local LocalS
 			c.note(err)
 		}
 	}
+	if err == nil {
+		// The host's own Claude Code login does not apply here: this Mac uses
+		// the host's selected account, like any other provider. Strip it once,
+		// before the state is shared with other requests.
+		if accounts, ok := state["accounts"].([]any); ok {
+			for _, a := range accounts {
+				if account, ok := a.(map[string]any); ok {
+					delete(account, "native_switch_available")
+					delete(account, "native_active")
+				}
+			}
+		}
+		delete(state, "claude_code")
+	}
 	c.mu.Lock()
 	if err == nil {
 		c.hostState = state
@@ -423,6 +529,9 @@ func (c *Client) serveState(w http.ResponseWriter, r *http.Request, local LocalS
 		state = c.hostState
 	}
 	c.mu.Unlock()
+	if err == nil {
+		go c.refreshAddresses()
+	}
 	if state == nil {
 		state = map[string]any{"accounts": []any{}, "active": map[string]any{}}
 	}
@@ -430,6 +539,7 @@ func (c *Client) serveState(w http.ResponseWriter, r *http.Request, local LocalS
 	for k, v := range state {
 		merged[k] = v
 	}
+
 	mine := local(r)
 	for _, k := range localStateKeys {
 		if v, ok := mine[k]; ok {
@@ -441,6 +551,71 @@ func (c *Client) serveState(w http.ResponseWriter, r *http.Request, local LocalS
 	status := c.Status()
 	merged["remote"] = map[string]any{"role": "client", "host": status.HostName, "address": status.Address, "connected": err == nil, "error": status.Error}
 	writeJSONResponse(w, http.StatusOK, merged)
+}
+
+// HostAccount reports the provider of one of the host's accounts, from the
+// last host state this Mac saw.
+func (c *Client) HostAccount(id string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	accounts, _ := c.hostState["accounts"].([]any)
+	for _, a := range accounts {
+		if account, ok := a.(map[string]any); ok && account["id"] == id {
+			provider, _ := account["provider"].(string)
+			return provider, true
+		}
+	}
+	return "", false
+}
+
+// refreshAddresses learns the host's current addresses, at most every two
+// minutes, so a host that later joins Tailscale or changes its LAN address
+// stays reachable without pairing again.
+func (c *Client) refreshAddresses() {
+	c.mu.Lock()
+	if c.cfg == nil || time.Since(c.refreshedAt) < 2*time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.refreshedAt = time.Now()
+	pairing := c.cfg
+	c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://switcher-host/remote/hello", nil)
+	resp, err := c.do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var h hello
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&h) != nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg != pairing {
+		return // disconnected or paired elsewhere meanwhile
+	}
+	var merged []string
+	seen := map[string]bool{}
+	for _, a := range append(h.Addresses, c.cfg.Addresses...) {
+		if a != "" && !seen[a] && len(merged) < 12 {
+			seen[a] = true
+			merged = append(merged, a)
+		}
+	}
+	updated := *c.cfg
+	updated.Addresses = merged
+	if h.Name != "" {
+		updated.HostName = h.Name
+	}
+	if strings.Join(updated.Addresses, ",") == strings.Join(c.cfg.Addresses, ",") && updated.HostName == c.cfg.HostName {
+		return
+	}
+	if writeJSON(c.path(), &updated) == nil {
+		c.cfg = &updated
+	}
 }
 
 func isNotExist(err error) bool { return os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) }

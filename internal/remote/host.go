@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -89,14 +90,18 @@ type Host struct {
 	mu            sync.Mutex
 	state         hostFile
 	code          string
+	codeKey       []byte
 	codeExpires   time.Time
 	attempts      int
+	failures      map[string]failure
 	srv           *http.Server
 	listening     bool
 	listenErr     string
 	advertising   func()
 	// Quiet skips the Bonjour advertisement (tests).
 	Quiet bool
+	// addresses reports how devices can reach this Mac; tests replace it.
+	addresses func() (lan, tailscale []string)
 }
 
 // NewHost loads the host state from dir. next serves the routes paired devices
@@ -106,7 +111,7 @@ func NewHost(dir string, port int, next http.Handler) (*Host, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := &Host{dir: dir, port: port, cert: cert, fp: fp, next: next, name: MachineName()}
+	h := &Host{dir: dir, port: port, cert: cert, fp: fp, next: next, name: MachineName(), addresses: Addresses}
 	if err := readJSON(h.path(), &h.state); err != nil && !errors.Is(err, io.EOF) && !isNotExist(err) {
 		return nil, err
 	}
@@ -114,6 +119,23 @@ func NewHost(dir string, port int, next http.Handler) (*Host, error) {
 }
 
 func (h *Host) path() string { return filepath.Join(h.dir, "host.json") }
+
+// AlsoReachableAt adds addresses, such as the Tailscale add-on's name, to the
+// ones paired devices learn.
+func (h *Host) AlsoReachableAt(extra func() []string) {
+	base := h.addresses
+	h.addresses = func() ([]string, []string) {
+		lan, tailscale := base()
+		return lan, append(tailscale, extra()...)
+	}
+}
+
+// Listening reports whether the host listener is serving.
+func (h *Host) Listening() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.listening
+}
 
 // Fingerprint identifies the host certificate.
 func (h *Host) Fingerprint() string { return h.fp }
@@ -138,7 +160,8 @@ func (h *Host) listenLocked() {
 	}
 	h.listenErr = ""
 	h.port = ln.Addr().(*net.TCPAddr).Port
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 15 * time.Second, ErrorLog: log.New(io.Discard, "", 0),
+	ln = privateOnly{ln}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 15 * time.Second, ReadTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute, ErrorLog: log.New(io.Discard, "", 0),
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{h.cert}, MinVersion: tls.VersionTLS12}}
 	h.srv, h.listening = srv, true
 	go func() {
@@ -205,7 +228,11 @@ func (h *Host) NewPairingCode() (PairingView, error) {
 	for i := range b {
 		b[i] = codeAlphabet[int(b[i])%len(codeAlphabet)]
 	}
-	h.code, h.codeExpires, h.attempts = string(b), time.Now().Add(codeTTL), 0
+	key, err := pairingKey(string(b), h.fp)
+	if err != nil {
+		return PairingView{}, err
+	}
+	h.code, h.codeKey, h.codeExpires, h.attempts = string(b), key, time.Now().Add(codeTTL), 0
 	return PairingView{Code: formatCode(h.code), ExpiresAt: h.codeExpires}, nil
 }
 
@@ -229,7 +256,7 @@ func (h *Host) Revoke(id string) error {
 
 // Status reports hosting, addresses, paired devices and an active code.
 func (h *Host) Status() HostStatus {
-	lan, tailscale := Addresses()
+	lan, tailscale := h.addresses()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := HostStatus{Enabled: h.state.Enabled, Listening: h.listening, Name: h.name, Port: h.port, LAN: lan, Tailscale: tailscale,
@@ -281,8 +308,13 @@ func (h *Host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Header.Del(DeviceHeader)
+	// A paired device is never this Mac, even when it arrives through the
+	// Tailscale add-on's loopback connection: local-only actions and the
+	// management key stay out of reach.
+	r.RemoteAddr, r.Host = "192.0.2.1:1", "switcher-host"
 	if r.URL.Path == "/remote/hello" {
-		writeJSONResponse(w, http.StatusOK, map[string]string{"name": h.name})
+		lan, tailscale := h.addresses()
+		writeJSONResponse(w, http.StatusOK, hello{Name: h.name, Addresses: append(lan, tailscale...)})
 		return
 	}
 	h.next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), deviceKey{}, d.Name)))
@@ -311,8 +343,44 @@ func (h *Host) authenticate(token string) (device, bool) {
 	return device{}, false
 }
 
+// hello tells a paired device the host's current name and addresses.
+type hello struct {
+	Name      string   `json:"name"`
+	Addresses []string `json:"addresses"`
+}
+
+// privateOnly drops connections from the internet before any TLS or HTTP:
+// the host serves only this Mac, the local network and Tailscale, even if a
+// router forwards the port or IPv6 makes this Mac directly reachable.
+type privateOnly struct{ net.Listener }
+
+func (l privateOnly) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok && privateSource(addr.IP) {
+			return conn, nil
+		}
+		conn.Close()
+	}
+}
+
+var tailnet6 = &net.IPNet{IP: net.ParseIP("fd7a:115c:a1e0::"), Mask: net.CIDRMask(48, 128)}
+
+// privateSource accepts loopback, private and link-local addresses, and
+// Tailscale's address ranges.
+func privateSource(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || tailnet.Contains(ip) || tailnet6.Contains(ip)
+}
+
 type pairRequest struct {
 	Name  string `json:"name"`
+	Nonce string `json:"nonce"`
 	Proof string `json:"proof"`
 }
 
@@ -321,29 +389,59 @@ type pairResponse struct {
 	Token     string   `json:"token"`
 	HostName  string   `json:"host_name"`
 	Addresses []string `json:"addresses"`
+	// HostProof shows the host knows the code too, so a device pretending to
+	// be the host cannot complete a pairing.
+	HostProof string `json:"host_proof"`
 }
+
+type failure struct {
+	count int
+	since time.Time
+}
+
+const pairFailed = "pairing failed: check the code shown on the other Mac"
 
 func (h *Host) pair(w http.ResponseWriter, r *http.Request) {
 	var req pairRequest
-	if json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req) != nil {
+	if json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req) != nil || len(req.Nonce) < 16 || len(req.Nonce) > 128 {
 		writeError(w, http.StatusBadRequest, "invalid pairing request")
 		return
 	}
+	// Tailnet connections all arrive from the add-on on loopback; those rely
+	// on the code's own attempt limit instead of a per-source block.
+	source, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip := net.ParseIP(source); ip != nil && ip.IsLoopback() {
+		source = ""
+	}
 	h.mu.Lock()
-	if !h.state.Enabled || h.code == "" || time.Now().After(h.codeExpires) {
+	if h.failures == nil {
+		h.failures = map[string]failure{}
+	}
+	f := h.failures[source]
+	if time.Since(f.since) > codeTTL {
+		f = failure{since: time.Now()}
+	}
+	// Both "no code" and "wrong code" give the same answer, so nobody can
+	// probe for a live code; a source that keeps failing is refused.
+	if f.count >= 10 || !h.state.Enabled || h.code == "" || time.Now().After(h.codeExpires) {
 		h.mu.Unlock()
-		writeError(w, http.StatusForbidden, "no pairing code is active on the host; show a new one in its Settings")
+		writeError(w, http.StatusForbidden, pairFailed)
 		return
 	}
 	h.attempts++
-	if !hmac.Equal([]byte(req.Proof), []byte(pairingProof(h.code, h.fp))) {
+	if !hmac.Equal([]byte(req.Proof), []byte(pairingProof(h.codeKey, "client", req.Nonce))) {
+		if source != "" {
+			f.count++
+			h.failures[source] = f
+		}
 		if h.attempts >= codeAttempts {
 			h.code = ""
 		}
 		h.mu.Unlock()
-		writeError(w, http.StatusForbidden, "wrong pairing code")
+		writeError(w, http.StatusForbidden, pairFailed)
 		return
 	}
+	hostProof := pairingProof(h.codeKey, "host", req.Nonce)
 	token, id := randomHex(32), randomHex(8)
 	sum := sha256.Sum256([]byte(token))
 	name := strings.TrimSpace(req.Name)
@@ -357,17 +455,24 @@ func (h *Host) pair(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not save the pairing")
 		return
 	}
-	h.code = ""
+	h.code, h.codeKey = "", nil
 	h.mu.Unlock()
-	lan, tailscale := Addresses()
-	writeJSONResponse(w, http.StatusOK, pairResponse{DeviceID: id, Token: token, HostName: h.name, Addresses: append(lan, tailscale...)})
+	lan, tailscale := h.addresses()
+	writeJSONResponse(w, http.StatusOK, pairResponse{DeviceID: id, Token: token, HostName: h.name, Addresses: append(lan, tailscale...), HostProof: hostProof})
 }
 
-// pairingProof binds the code to the host certificate the client saw, so a
-// device in the middle cannot complete a pairing with its own certificate.
-func pairingProof(code, fp string) string {
-	mac := hmac.New(sha256.New, []byte(normalizeCode(code)))
-	mac.Write([]byte("switcher-pair-v1|" + fp))
+// pairingKey stretches the code with the host certificate the client saw.
+// The slow derivation makes guessing a code from a captured proof infeasible
+// within its ten minutes, and binding the certificate stops a device in the
+// middle from reusing a code with its own certificate.
+func pairingKey(code, fp string) ([]byte, error) {
+	return pbkdf2.Key(sha256.New, normalizeCode(code), []byte("switcher-pair-v1|"+fp), 600_000, 32)
+}
+
+// pairingProof shows knowledge of the code for one side of one pairing.
+func pairingProof(key []byte, role, nonce string) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(role + "|" + nonce))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
