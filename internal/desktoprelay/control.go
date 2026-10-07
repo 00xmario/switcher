@@ -13,8 +13,12 @@ func (m *Manager) Bind(ctx context.Context, scopeID, sessionID, accountID string
 	if accountID == "" {
 		return Session{}, ErrUnavailable
 	}
-	if _, err := m.prepare(ctx, accountID); err != nil {
-		return Session{}, credentialFailure(err)
+	// With a Switcher host connected the account lives there and is checked
+	// when a request uses it.
+	if m.remoteInference() == nil {
+		if _, err := m.prepare(ctx, accountID); err != nil {
+			return Session{}, credentialFailure(err)
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

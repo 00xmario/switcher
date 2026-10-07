@@ -17,15 +17,18 @@ import (
 )
 
 type Manager struct {
-	cfg         Config
-	lifecycle   sync.Mutex
-	mu          sync.Mutex
-	store       *privateStore
-	state       diskState
-	run         *runtime
-	condition   string
-	threads     map[string]string
-	savePending bool
+	cfg           Config
+	lifecycle     sync.Mutex
+	mu            sync.Mutex
+	store         *privateStore
+	state         diskState
+	run           *runtime
+	condition     string
+	threads       map[string]string
+	remote        atomic.Pointer[RemoteInference]
+	hostOnce      sync.Once
+	hostTransport http.RoundTripper
+	savePending   bool
 	// saveMu orders state.json writes; saveSeq numbers marshalled snapshots
 	// so a slower background write never replaces a newer one.
 	saveMu      sync.Mutex
@@ -133,6 +136,23 @@ func (m *Manager) initializeLocked(create bool) error {
 			m.store = nil
 			return err
 		}
+	}
+	return nil
+}
+
+// SetRemote sends Claude inference to a connected Switcher host; nil restores
+// local accounts.
+func (m *Manager) SetRemote(fn RemoteInference) {
+	if fn == nil {
+		m.remote.Store(nil)
+		return
+	}
+	m.remote.Store(&fn)
+}
+
+func (m *Manager) remoteInference() RemoteInference {
+	if fn := m.remote.Load(); fn != nil {
+		return *fn
 	}
 	return nil
 }

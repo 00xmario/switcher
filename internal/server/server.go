@@ -23,6 +23,7 @@ import (
 	"switcher/internal/login"
 	"switcher/internal/provider"
 	"switcher/internal/proxy"
+	"switcher/internal/remote"
 	"switcher/internal/sessionmeta"
 	"switcher/internal/settings"
 	"switcher/internal/store"
@@ -61,9 +62,13 @@ type API struct {
 	Usage                 *usage.Service
 	Settings              *settings.Store
 	Port                  int
-	CodexConfigPath       string // optional test override
-	probeCodexForTest     func(context.Context) proxy.ProbeCodexResult
-	syncClaudeForTest     func(context.Context, map[string]string) (claudesync.Result, error)
+	// RemoteHost shares this Switcher's accounts with paired devices;
+	// RemoteClient uses another Switcher's. Either may be nil.
+	RemoteHost        *remote.Host
+	RemoteClient      *remote.Client
+	CodexConfigPath   string // optional test override
+	probeCodexForTest func(context.Context) proxy.ProbeCodexResult
+	syncClaudeForTest func(context.Context, map[string]string) (claudesync.Result, error)
 
 	creditsMu     sync.Mutex
 	creditsCache  map[string]creditsEntry
@@ -88,6 +93,7 @@ func (a *API) Register(mux *http.ServeMux) {
 		a.creditsCache = map[string]creditsEntry{}
 	}
 	mux.HandleFunc("GET /api/state", a.handleState)
+	a.registerRemoteRoutes(mux)
 	mux.HandleFunc("POST /api/claude/sync", a.handleClaudeSync)
 	mux.HandleFunc("GET /api/cli-setup", a.handleCLISetup)
 	mux.HandleFunc("POST /api/cli-setup/codex/install", a.handleCLISetupInstall)
@@ -576,14 +582,26 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 	if hidden == nil {
 		hidden = []string{}
 	}
-	// Only local browsers receive the independent management key. Devices
-	// and LAN sessions receive public state without another control authority.
-	revealHubKey := AuthKind(r) != AuthDevice && desktopRelayLocalRequest(r)
 	state := map[string]any{
-		"active":              a.Proxy.ActiveAll(),
-		"accounts":            views,
-		"order":               order,
-		"hidden":              hidden,
+		"active":   a.Proxy.ActiveAll(),
+		"accounts": views,
+		"order":    order,
+		"hidden":   hidden,
+	}
+	if native, ok := a.Providers["claude"].(provider.NativeLoginProvider); ok {
+		state["claude_code"] = native.NativeStatus()
+	}
+	for k, v := range a.LocalStateFields(r) {
+		state[k] = v
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+// LocalStateFields are the parts of /api/state that belong to this Mac even
+// while it uses another Switcher's accounts.
+func (a *API) LocalStateFields(r *http.Request) map[string]any {
+	preferences := a.preferenceSnapshot()
+	fields := map[string]any{
 		"hub_url":             "http://127.0.0.1:8787",
 		"version":             a.Version,
 		"update":              a.UpdateState(),
@@ -593,13 +611,12 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 		"merge_accounts":      preferences.MergeAccounts,
 		"desktop_relay":       a.desktopRelayStatus(),
 	}
-	if native, ok := a.Providers["claude"].(provider.NativeLoginProvider); ok {
-		state["claude_code"] = native.NativeStatus()
+	// Only local browsers receive the independent management key. Devices
+	// and LAN sessions receive public state without another control authority.
+	if AuthKind(r) != AuthDevice && desktopRelayLocalRequest(r) {
+		fields["hub_management_key"] = a.ManagementKey
 	}
-	if revealHubKey {
-		state["hub_management_key"] = a.ManagementKey
-	}
-	writeJSON(w, http.StatusOK, state)
+	return fields
 }
 
 // importer is the optional provider capability of reusing credentials the

@@ -69,8 +69,12 @@ func (m *Manager) BindConversation(ctx context.Context, scopeID, conversationID,
 	if accountID == "" || !validUUID(conversationID) {
 		return ConversationBinding{}, ErrNotFound
 	}
-	if _, err := m.prepare(ctx, accountID); err != nil {
-		return ConversationBinding{}, credentialFailure(err)
+	// With a Switcher host connected the account lives there and is checked
+	// when a request uses it.
+	if m.remoteInference() == nil {
+		if _, err := m.prepare(ctx, accountID); err != nil {
+			return ConversationBinding{}, credentialFailure(err)
+		}
 	}
 	m.AssociateConversations(ctx)
 	return m.setConversation(scopeID, conversationID, accountID)

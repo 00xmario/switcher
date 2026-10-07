@@ -229,7 +229,7 @@ const renderContext = vm.createContext({
     querySelector: selector => selector === 'footer.footnote' ? { hidden: false } : null,
     querySelectorAll: () => [],
   },
-  closeAccountMenu: () => {}, updateBannerHTML: () => '',
+  closeAccountMenu: () => {}, updateBannerHTML: () => '', remoteBannerHTML: () => '',
   escapeHTML: hover.escapeHTML,
   LOGOS: { codex: '<svg></svg>' }, PROVIDER_NAMES: { codex: 'Codex' },
   accountHTML: account => `expanded-${account.id}`,

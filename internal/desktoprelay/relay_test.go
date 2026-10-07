@@ -417,3 +417,56 @@ func TestPlainHTTPProxyRequestsAreForwarded(t *testing.T) {
 		}
 	}
 }
+
+// A connected Switcher host gets the Claude inference with the selected
+// account; other traffic keeps going to Anthropic directly.
+func TestConnectedHostReceivesClaudeInference(t *testing.T) {
+	cfg := fixtureConfig(t)
+	cfg.Source = fixtureSource()
+	cfg.Transport = transportFunc(echoAuth)
+	m, s := startFixture(t, cfg)
+	var gotAccount, gotBody string
+	m.SetRemote(func(ctx context.Context, account string, r *http.Request, body []byte) (*http.Response, bool, error) {
+		gotAccount, gotBody = account, string(body)
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("from host"))}, true, nil
+	})
+	c, br := tunnel(t, s)
+	if got := drain(t, send(t, c, br, "/v1/messages", `{"n":1}`, sessionA, nil)); got != "from host" || gotAccount != "" || gotBody != `{"n":1}` {
+		t.Fatalf("default: %q account %q body %q", got, gotAccount, gotBody)
+	}
+	if _, err := m.Bind(context.Background(), s.ID, sessionA, "host-account", observed(t, m, s.ID, sessionA).Revision); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, send(t, c, br, "/v1/messages", `{}`, sessionA, nil))
+	if gotAccount != "host-account" {
+		t.Fatalf("selected account sent to host: %q", gotAccount)
+	}
+	if got := drain(t, send(t, c, br, "/api/oauth/profile", ``, sessionA, nil)); got != "Bearer caller-token" {
+		t.Fatalf("control traffic: %q", got)
+	}
+	m.SetRemote(nil)
+	if got := drain(t, send(t, c, br, "/v1/messages", `{}`, sessionB, nil)); got != "Bearer caller-token" {
+		t.Fatalf("after disconnect: %q", got)
+	}
+}
+
+func TestServeAccountSendsTheHostAccountsCredential(t *testing.T) {
+	cfg := fixtureConfig(t)
+	cfg.Source = fixtureSource()
+	var seen string
+	cfg.Transport = transportFunc(func(r *http.Request) (*http.Response, error) {
+		seen = r.URL.String() + " " + r.Header.Get("Anthropic-Beta")
+		return echoAuth(r)
+	})
+	m, err := desktoprelay.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("POST", "/remote/anthropic/v1/messages?beta=true", strings.NewReader(`{}`))
+	r.Header.Set("Authorization", "Bearer client-token")
+	w := httptest.NewRecorder()
+	m.ServeAccount(w, r, "/v1/messages", "A")
+	if w.Body.String() != "Bearer token-A" || seen != "https://api.anthropic.com/v1/messages?beta=true oauth-2025-04-20" {
+		t.Fatalf("host relay: %q %q", w.Body.String(), seen)
+	}
+}

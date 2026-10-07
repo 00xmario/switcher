@@ -48,6 +48,7 @@ import (
 	"switcher/internal/provider/grok"
 	"switcher/internal/provider/opencode"
 	"switcher/internal/proxy"
+	"switcher/internal/remote"
 	"switcher/internal/server"
 	"switcher/internal/sessionmeta"
 	"switcher/internal/settings"
@@ -294,12 +295,19 @@ func run(port, desktopRelayPort int) {
 
 	// Background usage sync: the server owns freshness, so the web UI and
 	// the menu bar always agree without waiting for a client to poll.
+	// A Mac that uses another Switcher's accounts leaves token refreshes and
+	// usage polling to that host, so the same account is never refreshed twice.
+	remoteClient := remote.NewClient(filepath.Join(config.Dir(), "remote"), managementKey)
 	go func() {
-		proxyManager.RefreshUsageAll(context.Background())
+		if !remoteClient.Connected() {
+			proxyManager.RefreshUsageAll(context.Background())
+		}
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			proxyManager.RefreshUsageAll(context.Background())
+			if !remoteClient.Connected() {
+				proxyManager.RefreshUsageAll(context.Background())
+			}
 		}
 	}()
 	usageService := usage.NewService(config.Dir(), nil)
@@ -321,7 +329,7 @@ func run(port, desktopRelayPort int) {
 		DesktopRelay: desktopRelay, DesktopSettingsPath: desktopSettingsPath(),
 		DesktopSessionMetadata: metadataIndex,
 		ManagementKey:          managementKey, Version: version, Updater: updater, Usage: usageService,
-		Settings: settingsStore, Port: port,
+		Settings: settingsStore, Port: port, RemoteClient: remoteClient,
 	}
 
 	// Each provider with a browser redirect has its own callback listener;
@@ -366,10 +374,48 @@ func run(port, desktopRelayPort int) {
 	}
 	registerWebRoutes(mux, static, settingsStore)
 
+	// Sharing: paired devices reach account views, provider proxies, the hub
+	// (with this Switcher's management key) and Claude inference here.
+	shared := http.NewServeMux()
+	shared.HandleFunc("/remote/anthropic/", func(w http.ResponseWriter, r *http.Request) {
+		account := r.Header.Get(remote.AccountHeader)
+		r.Header.Del(remote.AccountHeader)
+		if account == "" {
+			account = proxyManager.ActiveID("claude")
+		}
+		if desktopRelay == nil || account == "" {
+			http.Error(w, `{"type":"error","error":{"type":"api_error","message":"The Switcher host has no Claude account selected"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		desktopRelay.ServeAccount(w, r, strings.TrimPrefix(r.URL.Path, "/remote/anthropic"), account)
+	})
+	shared.Handle("/v0/management/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+managementKey)
+		mux.ServeHTTP(w, r)
+	}))
+	shared.Handle("/", mux)
+	remoteHost, err := remote.NewHost(filepath.Join(config.Dir(), "remote"), remote.DefaultPort, shared)
+	if err != nil {
+		log.Printf("sharing unavailable: %v", err)
+	} else {
+		api.RemoteHost = remoteHost
+		remoteHost.Start()
+		defer remoteHost.Close()
+	}
+	if desktopRelay != nil {
+		remoteClient.OnChange(func(connected bool) {
+			if connected {
+				desktopRelay.SetRemote(remoteClient.Inference)
+			} else {
+				desktopRelay.SetRemote(nil)
+			}
+		})
+	}
+
 	// Hardening headers on every response from the main listeners. The UI
 	// has no inline scripts (the theme init lives in app.js), so the CSP
 	// stays strict; styles need unsafe-inline for the SVG chart styling.
-	hardened := hardenedHeaders(mux)
+	hardened := hardenedHeaders(remoteClient.Middleware(api.LocalStateFields, mux))
 
 	log.Printf("Switcher v%s running: http://127.0.0.1:%d (codex proxy on the same port under /v1)", version, port)
 

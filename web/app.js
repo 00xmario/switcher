@@ -2,6 +2,7 @@ import { createClaudeSync } from './claude-sync.js';
 import { patchProviderList, createResetFeedback, mergeAccountMutation } from './account-updates.js';
 import { createAppearance } from './themes.js';
 import { createDesktopRelay, desktopRelayLoopback } from './desktop-relay.js';
+import { createRemote } from './remote.js';
 
 const providersEl = document.getElementById('providers');
 const resetFeedback = createResetFeedback({ getCard: id => [...providersEl.querySelectorAll('.account')].find(card => card.dataset.id === id) });
@@ -701,6 +702,20 @@ function accountMenuHTML(account) {
     <button type="button" role="menuitem" data-act="delete" data-account-id="${escapeHTML(account.id)}">Remove</button>`;
 }
 
+// Shown while this Mac uses another Mac's Switcher.
+function remoteBannerHTML() {
+  const remote = data.remote;
+  if (remote?.role !== 'client') return '';
+  return `
+    <div class="remote-banner ${remote.connected ? '' : 'offline'}">
+      <span class="remote-banner-dot" aria-hidden="true"></span>
+      <span>${remote.connected
+        ? `Using the accounts on <strong>${escapeHTML(remote.host)}</strong>`
+        : `Can't reach <strong>${escapeHTML(remote.host)}</strong>. Showing its last known accounts; requests fail until it is back.`}</span>
+      <button type="button" data-open-settings>Settings</button>
+    </div>`;
+}
+
 // Update banner: shown above the provider sections when a release is
 // newer than the running build.
 function updateBannerHTML() {
@@ -733,7 +748,8 @@ function render() {
   }
   const order = (data.order || Object.keys(PROVIDER_NAMES))
     .filter(id => !(data.hidden || []).includes(id));
-  document.getElementById('update-slot').innerHTML = updateBannerHTML();
+  document.getElementById('update-slot').innerHTML = updateBannerHTML() + remoteBannerHTML();
+  const usingHost = data.remote?.role === 'client';
   const versionBadge = document.querySelector('.brand-version');
   if (versionBadge && data.version) versionBadge.textContent = `(v${data.version})`;
   let html = '';
@@ -749,7 +765,7 @@ function render() {
           <h2>${escapeHTML(PROVIDER_NAMES[providerID] || providerID)}</h2>
           ${providerID === 'claude' ? claudeSessionSync.html() : ''}
           <span class="count">${accounts.length}</span>
-          <button class="add-provider" data-add="${providerID}">Add account</button>
+          ${usingHost ? '' : `<button class="add-provider" data-add="${providerID}">Add account</button>`}
           <span class="provider-tools">
             <button data-menu="${providerID}" title="Provider options">⋯</button>
           </span>
@@ -938,6 +954,7 @@ function renderAddProviderMenu() {
 document.getElementById('update-slot').addEventListener('click', (event) => {
   const updateBtn = event.target.closest('button[data-act="install-update"]');
   if (updateBtn && !updateBtn.disabled) runUpdateFlow(updateBtn);
+  if (event.target.closest('[data-open-settings]')) setPage('settings');
 });
 
 providersEl.addEventListener('click', async (event) => {
@@ -2001,6 +2018,15 @@ settingsPage.desktopRelay = createDesktopRelay({
   }),
 });
 
+const remoteSettings = createRemote({
+  api,
+  confirm: options => confirmDialog({ initialFocus: 'cancel', ...options }),
+  onConnectionChange: async connected => {
+    toast(connected ? 'Now using the other Mac\'s accounts' : 'Back to this Mac\'s own accounts');
+    await refreshState();
+  },
+});
+
 const settingsTab = document.createElement('button');
 settingsTab.id = 'tab-settings';
 settingsTab.className = 'page-tab';
@@ -2137,6 +2163,7 @@ async function renderSettings() {
   settingsPage.innerHTML = `
     <div class="settings-grid">
       <section class="settings-card appearance-card" id="appearance-settings" aria-label="Appearance"></section>
+      <section class="settings-card remote-card" id="remote-settings" aria-label="Share between Macs"></section>
       <section class="settings-card desktop-relay-card" id="desktop-relay-settings" aria-label="Claude Desktop account switching"></section>
       <details class="settings-card cli-setup-card" id="cli-setup-card">
         <summary class="cli-setup-summary">
@@ -2227,6 +2254,7 @@ async function renderSettings() {
 
   appearance.mount(settingsPage.querySelector('#appearance-settings'));
   settingsPage.desktopRelay.mountSettings(settingsPage.querySelector('#desktop-relay-settings'));
+  remoteSettings.mount(settingsPage.querySelector('#remote-settings'));
   const setupList = settingsPage.querySelector('#cli-setup-list');
   const setupAnnouncer = settingsPage.querySelector('#cli-setup-announcer');
   const setupStatus = settingsPage.querySelector('#cli-setup-status');

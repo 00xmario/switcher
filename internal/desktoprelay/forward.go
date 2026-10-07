@@ -48,30 +48,76 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 	}
 	ctx := r.Context()
 	message := r.Method == http.MethodPost && r.URL.Path == "/v1/messages"
-	var task Session
-	var credential Credential
-	if message || r.Method == http.MethodPost && r.URL.Path == "/v1/messages/count_tokens" {
-		view := identity(r, body)
-		task = m.route(ctx, scope, view)
-		defer m.finish(task)
-		// A thread continued right after a switch lives on the previous
-		// account. Claude Code answers this code by resending the full
-		// conversation without a thread.
-		if !m.threadOnAccount(task, view.Thread) {
-			relayError(w, http.StatusBadRequest, "invalid_request_error", "This message thread was started on another account; resend the full conversation.", "thread_unsupported_request")
-			return
-		}
-		if task.AccountID != "" {
-			if credential, err = m.prepare(ctx, task.AccountID); err != nil {
-				replyCredentialFailure(w, err)
-				return
-			}
-			if message && credential.AccountUUID != "" && !strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
-				body = withAccountUUID(body, credential.AccountUUID)
-			}
+	if !message && !(r.Method == http.MethodPost && r.URL.Path == "/v1/messages/count_tokens") {
+		m.send(w, r, r.URL.Path, body, "", run.transport, nil)
+		return
+	}
+	view := identity(r, body)
+	task := m.route(ctx, scope, view)
+	defer m.finish(task)
+	// A thread continued right after a switch lives on the previous account.
+	// Claude Code answers this code by resending the full conversation
+	// without a thread.
+	if !m.threadOnAccount(task, view.Thread) {
+		relayError(w, http.StatusBadRequest, "invalid_request_error", "This message thread was started on another account; resend the full conversation.", "thread_unsupported_request")
+		return
+	}
+	record := func(credential Credential, status int) {
+		if message {
+			m.recordResponse(task, credential, status)
 		}
 	}
-	u := &url.URL{Scheme: "https", Host: originHost, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery}
+	// Connected to another Switcher: that host applies its own account.
+	if remote := m.remoteInference(); remote != nil {
+		if resp, ok, err := remote(ctx, task.AccountID, r, body); ok {
+			if err != nil {
+				if ctx.Err() == nil {
+					relayError(w, http.StatusBadGateway, "api_error", "Switcher could not reach the Switcher host this Mac is connected to", "")
+				}
+				return
+			}
+			record(Credential{AccountID: task.AccountID}, resp.StatusCode)
+			stream(w, resp)
+			return
+		}
+	}
+	m.send(w, r, r.URL.Path, body, task.AccountID, run.transport, record)
+}
+
+// ServeAccount relays one Anthropic API request for a paired Switcher with
+// the given account's credential. path is the Anthropic path, such as
+// /v1/messages.
+func (m *Manager) ServeAccount(w http.ResponseWriter, r *http.Request, path, account string) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	m.hostOnce.Do(func() { m.hostTransport = m.transport() })
+	m.send(w, r, path, body, account, m.hostTransport, nil)
+}
+
+// send forwards one request to api.anthropic.com, with account's credential or,
+// for an empty account, the caller's own.
+func (m *Manager) send(w http.ResponseWriter, r *http.Request, path string, body []byte, account string, transport http.RoundTripper, record func(Credential, int)) {
+	ctx := r.Context()
+	if record == nil {
+		record = func(Credential, int) {}
+	}
+	var credential Credential
+	if account != "" {
+		var err error
+		if credential, err = m.prepare(ctx, account); err != nil {
+			replyCredentialFailure(w, err)
+			return
+		}
+		if r.Method == http.MethodPost && path == "/v1/messages" && credential.AccountUUID != "" && !strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+			body = withAccountUUID(body, credential.AccountUUID)
+		}
+	}
+	u := &url.URL{Scheme: "https", Host: originHost, Path: path, RawQuery: r.URL.RawQuery}
+	if path == r.URL.Path {
+		u.RawPath = r.URL.RawPath
+	}
 	out, err := http.NewRequestWithContext(ctx, r.Method, u.String(), bytes.NewReader(body))
 	if err != nil {
 		relayError(w, http.StatusBadRequest, "invalid_request_error", "Switcher could not forward this request", "")
@@ -79,12 +125,12 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 	}
 	out.Header = r.Header.Clone()
 	stripHop(out.Header)
-	if task.AccountID != "" {
+	if account != "" {
 		out.Header.Set("Authorization", "Bearer "+credential.AccessToken)
 		out.Header.Del("X-Api-Key")
 		ensureOAuthBeta(out.Header)
 	}
-	resp, err := run.transport.RoundTrip(out)
+	resp, err := transport.RoundTrip(out)
 	if err != nil {
 		if ctx.Err() == nil {
 			relayError(w, http.StatusBadGateway, "api_error", "Switcher could not reach api.anthropic.com", "")
@@ -94,23 +140,21 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 	// A rejected selected token gets one refresh and one retry, like the CLI.
 	// If that fails the selected account needs attention in Switcher; passing
 	// the 401 on would make Claude Code doubt its own login instead.
-	if task.AccountID != "" && resp.StatusCode == http.StatusUnauthorized {
+	if account != "" && resp.StatusCode == http.StatusUnauthorized {
 		resp.Body.Close()
-		fresh, err := m.cfg.Source.RefreshRejected(ctx, task.AccountID, credential.AccessToken)
-		if err == nil && (!usable(fresh, task.AccountID) || fresh.AccessToken == credential.AccessToken) {
+		fresh, err := m.cfg.Source.RefreshRejected(ctx, account, credential.AccessToken)
+		if err == nil && (!usable(fresh, account) || fresh.AccessToken == credential.AccessToken) {
 			err = ErrUnavailable
 		}
 		if err != nil {
-			if message {
-				m.recordResponse(task, credential, http.StatusUnauthorized)
-			}
+			record(credential, http.StatusUnauthorized)
 			replyCredentialFailure(w, err)
 			return
 		}
 		retry := out.Clone(ctx)
 		retry.Body = io.NopCloser(bytes.NewReader(body))
 		retry.Header.Set("Authorization", "Bearer "+fresh.AccessToken)
-		if resp, err = run.transport.RoundTrip(retry); err != nil {
+		if resp, err = transport.RoundTrip(retry); err != nil {
 			if ctx.Err() == nil {
 				relayError(w, http.StatusBadGateway, "api_error", "Switcher could not reach api.anthropic.com", "")
 			}
@@ -118,10 +162,13 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 		}
 		credential = fresh
 	}
+	record(credential, resp.StatusCode)
+	stream(w, resp)
+}
+
+// stream copies a response as it arrives, flushing every chunk.
+func stream(w http.ResponseWriter, resp *http.Response) {
 	defer resp.Body.Close()
-	if message {
-		m.recordResponse(task, credential, resp.StatusCode)
-	}
 	stripHop(resp.Header)
 	for k, v := range resp.Header {
 		w.Header()[k] = v

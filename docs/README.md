@@ -44,6 +44,7 @@ request on the caller's own credential rather than failing it.
 
 ## Guides
 
+- [Share between Macs](sharing.md)
 - [Setup, usage, and live validation](desktop-relay-usage.md)
 - [Relay module and wire contract](desktop-relay-module.md)
 - [Initial implementation plan and subsequent setup changes](desktop-relay-plan.md)

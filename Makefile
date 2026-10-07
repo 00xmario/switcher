@@ -38,6 +38,8 @@ verify:
 	node web/themes_test.mjs
 	node --check web/desktop-relay.js
 	node web/desktop-relay_test.mjs
+	node --check web/remote.js
+	node web/remote_test.mjs
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \
 			build/macos/menubar_layout_test.swift -o "$$tmp/switcher-layout-test"; \
