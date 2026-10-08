@@ -18,6 +18,9 @@ type Account struct {
 	ClaudeCode bool     `json:"claude_code,omitempty"`
 	Health     string   `json:"health,omitempty"`
 	Usage      []Window `json:"usage"`
+	// BankedResets counts the account's unused usage-limit resets (Codex).
+	BankedResets int `json:"banked_resets,omitempty"`
+	nextReset    string
 }
 
 // Window is one usage window, such as a five-hour session or a week.
@@ -47,6 +50,10 @@ type serverState struct {
 		Health *struct {
 			Condition string `json:"condition"`
 		} `json:"health"`
+		ResetCredits *struct {
+			Count  int    `json:"count"`
+			NextID string `json:"next_id"`
+		} `json:"reset_credits"`
 	} `json:"accounts"`
 	DesktopRelay map[string]any `json:"desktop_relay"`
 }
@@ -64,6 +71,9 @@ func (c *ctx) state() (serverState, []Account, error) {
 		}
 		if a.Health != nil {
 			account.Health = a.Health.Condition
+		}
+		if a.ResetCredits != nil {
+			account.BankedResets, account.nextReset = a.ResetCredits.Count, a.ResetCredits.NextID
 		}
 		accounts = append(accounts, account)
 	}
@@ -267,6 +277,81 @@ func runRemove(c *ctx, args []string) error {
 		return err
 	}
 	c.result(map[string]any{"removed": account}, fmt.Sprintf("Removed %s account %s.", providerName(account.Provider), account.Email))
+	return nil
+}
+
+const resetHelp = `Spends one banked usage-limit reset (Codex) on an account, so it can be used
+again right away. Name the account, or a provider for its active account:
+
+  switcher reset codex --yes
+  switcher reset me@example.com --yes
+
+Banked resets cannot be given back, so the command asks for --yes.
+`
+
+func runReset(c *ctx, args []string) error {
+	fs := c.flags("reset")
+	yes := fs.Bool("yes", false, "")
+	pos, err := c.parse(fs, args, 1, 1)
+	if err != nil {
+		return err
+	}
+	_, accounts, err := c.state()
+	if err != nil {
+		return err
+	}
+	var account Account
+	if _, provider := providerNames[pos[0]]; provider {
+		found := false
+		for _, a := range accounts {
+			if a.Provider == pos[0] && a.Active {
+				account, found = a, true
+			}
+		}
+		if !found {
+			return fmt.Errorf("no %s account is in use", providerName(pos[0]))
+		}
+	} else if account, err = resolve(pos[0], accounts); err != nil {
+		return err
+	}
+	if account.nextReset == "" {
+		return fmt.Errorf("%s has no banked reset", account.Email)
+	}
+	if !*yes {
+		plural := "s"
+		if account.BankedResets == 1 {
+			plural = ""
+		}
+		return usagef("this spends one of the %d banked reset%s of %s; add --yes to confirm", account.BankedResets, plural, account.Email)
+	}
+	var answer struct {
+		Outcome string `json:"outcome"`
+		Usage   *struct {
+			Windows []Window `json:"windows"`
+		} `json:"usage"`
+		Account *struct {
+			ResetCredits *struct {
+				Count int `json:"count"`
+			} `json:"reset_credits"`
+		} `json:"account"`
+	}
+	if err := c.cl.call(http.MethodPost, "/api/accounts/"+url.PathEscape(account.ID)+"/use-reset", map[string]string{"credit_id": account.nextReset}, &answer); err != nil {
+		return err
+	}
+	left := 0
+	if answer.Account != nil && answer.Account.ResetCredits != nil {
+		left = answer.Account.ResetCredits.Count
+	}
+	human := map[string]string{
+		"reset":            fmt.Sprintf("Used a banked reset on %s.", account.Email),
+		"already_redeemed": fmt.Sprintf("That reset was already used on %s.", account.Email),
+		"nothing_to_reset": fmt.Sprintf("%s has nothing to reset right now; the reset was kept.", account.Email),
+	}[answer.Outcome]
+	if human == "" {
+		human = fmt.Sprintf("The provider answered %q for %s.", answer.Outcome, account.Email)
+	}
+	human += fmt.Sprintf(" %d banked reset%s left.", left, map[bool]string{true: "", false: "s"}[left == 1])
+	c.result(map[string]any{"account": account.ID, "outcome": answer.Outcome, "banked_resets_left": left}, human)
 	return nil
 }
 

@@ -46,7 +46,9 @@ required; OpenCode Go uses its own API key.
 - **Automatic failover on exhaustion**: when the active account reports it
   is out of usage (HTTP 429 `usage_limit_reached`), Switcher marks it with
   the upstream reset time and, if another account is usable, retries your
-  in-flight request on it transparently. Grok's session service has no
+  in-flight request on it transparently. Paid accounts come first. A Free
+  account comes last, after a banked reset when auto-use is on, because
+  Free tiers lack the paid models. Grok's session service has no
   verified account-exhaustion error yet, so its 429s pass through without
   switching accounts.
 - **No switch when there is nowhere to go**: if every account is out of
@@ -155,8 +157,9 @@ required; OpenCode Go uses its own API key.
   organization is added separately rather than overwriting an unknown one.
 - **Banked resets**: Codex usage-limit resets can be spent from the UI. A
   compact count appears beside the account plan in the web UI and menu bar.
-  **Auto-use** can spend one automatically when an account runs out, as a
-  last resort after failover finds no other usable account. It is off by
+  **Auto-use** can spend one automatically when an account runs out and
+  failover finds no other paid account: before moving to a Free account,
+  or when no account is left at all. It is off by
   default: enable it under Settings → Switching, or override it per
   account from the account's ⋯ menu (Global / On / Off). At most one credit
   is spent per request, and an account is not auto-reset again for five
@@ -291,6 +294,12 @@ environment; a terminal-only override needs the CLI command. The first
   on the LAN, so only enable this on networks you trust.
   Disabling authentication or invalidating LAN prerequisites denies dashboard
   access immediately, including while a restart is pending or fails.
+- **Phone access, opt-in and tailnet-only.** The Tailscale add-on serves a
+  small phone page over HTTPS with Tailscale's certificate. It admits only
+  your own Tailscale devices, and Switcher admits only phones approved on
+  this Mac by the code they show. Sessions are bound to the phone's
+  Tailscale device. The page reads usage, refreshes, switches proxy accounts
+  and spends banked resets, nothing else. See [phone](phone.md).
 - Hardened headers everywhere: CSP (no inline script, form-action self),
   nosniff, no-referrer. State-changing requests from a non-loopback socket
   are refused for credential routes.

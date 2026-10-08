@@ -3,7 +3,9 @@
 // verbatim. The active account changes only in two cases: the user picks a
 // different one, or the active account reports an exhausted usage limit,
 // then Switcher moves to another usable account and transparently retries
-// the in-flight request once.
+// the in-flight request once. Paid accounts come first; when only Free ones
+// are left, an allowed banked reset on the exhausted account comes before
+// them.
 package proxy
 
 import (
@@ -913,10 +915,14 @@ func (m *Manager) pickLocked(providerID string) (store.Account, error) {
 		return *active, nil
 	}
 	// No usable active account: fall back to the first usable one of this
-	// provider. This is the only automatic selection Switcher ever performs.
-	for i := range accounts {
-		a := accounts[i]
-		if a.Provider == providerID && hasCredentials(a) && !m.exhaustedNow(a.ID) {
+	// provider, paid before Free. This is the only automatic selection
+	// Switcher ever performs.
+	next, _, err := m.failoverLocked("", providerID)
+	if err != nil {
+		return store.Account{}, fmt.Errorf("list accounts: %w", err)
+	}
+	for _, a := range accounts {
+		if a.ID == next {
 			if err := m.mutateStateLocked(func() {
 				m.active[providerID] = a.ID
 				m.selectionRevision[providerID]++
@@ -1042,19 +1048,30 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				copyResponseStatus(w, resp.StatusCode, body429, resp.Header)
 				return
 			}
-			retry, stateErr := m.handleExhaustion(providerID, account.ID, until, epoch)
+			// Never spend a credit unless this request has room to retry it.
+			mayReset := !usedAutoReset && attempt+1 < maxAttempts && r.Context().Err() == nil
+			retry, held, stateErr := m.handleExhaustion(providerID, account.ID, until, epoch, mayReset && m.autoResetAllowed(prov, account))
 			if stateErr != nil {
 				log.Printf("proxy: save routing state: %v", stateErr)
 			}
 			if retry {
 				continue
 			}
-			// Never spend a credit unless this request has room to retry it.
-			if !usedAutoReset && attempt+1 < maxAttempts && r.Context().Err() == nil {
+			if mayReset {
 				retry, spent, resetErr := m.autoUseBankedResetForRequest(r.Context(), prov, account, &epoch)
 				usedAutoReset = spent
 				if resetErr != nil {
 					log.Printf("proxy: save reset routing state: %v", resetErr)
+				}
+				if retry {
+					continue
+				}
+			}
+			if held {
+				// No banked reset went through: a Free account beats the limit.
+				retry, _, stateErr = m.handleExhaustion(providerID, account.ID, until, epoch, false)
+				if stateErr != nil {
+					log.Printf("proxy: save routing state: %v", stateErr)
 				}
 				if retry {
 					continue
@@ -1178,20 +1195,8 @@ func (m *Manager) nextAvailable(exclude, providerID string) (string, error) {
 
 // nextAvailableLocked requires m.mu.
 func (m *Manager) nextAvailableLocked(exclude, providerID string) (string, error) {
-	accounts, err := m.store.List()
-	if err != nil {
-		return "", err
-	}
-	for _, a := range accounts {
-		if a.Provider != providerID {
-			continue
-		}
-		if a.ID == exclude || !hasCredentials(a) || m.exhaustedNow(a.ID) {
-			continue
-		}
-		return a.ID, nil
-	}
-	return "", nil
+	next, _, err := m.failoverLocked(exclude, providerID)
+	return next, err
 }
 
 func (m *Manager) setActive(providerID, id string) error {
@@ -1237,10 +1242,20 @@ func (m *Manager) SetAutoUseResetPolicy(resolver func(store.Account) bool) {
 	m.autoUseReset = resolver
 }
 
+// autoResetAllowed reports whether Switcher may spend a banked reset on the
+// account by itself. It does not ask the provider whether one is left.
+func (m *Manager) autoResetAllowed(prov provider.Provider, account store.Account) bool {
+	m.mu.Lock()
+	resolver := m.autoUseReset
+	m.mu.Unlock()
+	_, ok := prov.(provider.ResetCreditProvider)
+	return ok && resolver != nil && resolver(account)
+}
+
 // autoUseBankedReset redeems one banked reset for an exhausted account and
-// lifts its local park so the request can retry on the same account. It is
-// a last resort: callers only reach it after failover found no other usable
-// account. Returns true when the account is ready to serve again. At most
+// lifts its local park so the request can retry on the same account. It
+// comes after failover to another paid account and before a Free one.
+// Returns true when the account is ready to serve again. At most
 // one credit is spent per resolution, and a provider without banked resets
 // (or a user who left the feature off) is never touched.
 func (m *Manager) autoUseBankedReset(ctx context.Context, prov provider.Provider, account store.Account) bool {
@@ -1315,12 +1330,14 @@ func (m *Manager) autoUseBankedResetForRequest(ctx context.Context, prov provide
 		m.mu.Unlock()
 		return true, false, nil
 	}
-	next, lookupErr := m.nextAvailableLocked(account.ID, account.Provider)
+	// A paid account that became usable meanwhile keeps the credit; a Free
+	// one does not.
+	next, downgrade, lookupErr := m.failoverLocked(account.ID, account.Provider)
 	if lookupErr != nil {
 		m.mu.Unlock()
 		return false, false, lookupErr
 	}
-	if next != "" {
+	if next != "" && !downgrade {
 		err := m.mutateStateLocked(func() {
 			m.active[account.Provider] = next
 			m.selectionRevision[account.Provider]++

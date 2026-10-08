@@ -30,7 +30,8 @@ const fakeState = `{"version":"0.7.0","order":["claude","codex"],"hub_management
    "usage":{"windows":[{"label":"Session","used_percent":34},{"label":"Weekly","used_percent":61}]},"health":{"condition":"usage_current"}},
   {"id":"c2","provider":"claude","email":"home@example.com","plan":"claude_max_5x","active":false,
    "usage":{"windows":[{"label":"Session","used_percent":88}]},"health":{"condition":"needs_relogin"}},
-  {"id":"x1","provider":"codex","email":"work@example.com","plan":"prolite","active":true,"usage":{"windows":[]}}]}`
+  {"id":"x1","provider":"codex","email":"work@example.com","plan":"prolite","active":true,"usage":{"windows":[]},
+   "reset_credits":{"count":2,"next_id":"credit_a"}}]}`
 
 func (f *fakeSwitcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
@@ -52,6 +53,29 @@ func (f *fakeSwitcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"status":{"listening":true,"in_flight":1},"setup":{"configured":true,"condition":"configured"}}`)
 	case "POST /api/accounts/c2/activate":
 		io.WriteString(w, `{"status":"ok","active":"c2","native":{"changed":true}}`)
+	case "POST /api/accounts/x1/use-reset":
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["credit_id"] != "credit_a" {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":"wrong credit"}`)
+			return
+		}
+		io.WriteString(w, `{"status":"ok","outcome":"reset","account":{"reset_credits":{"count":1}}}`)
+	case "GET /api/phone":
+		io.WriteString(w, `{"enabled":true,"ready":true,"url":"https://switcher-studio.tail1.ts.net",
+			"waiting":[{"id":"w1","name":"marios-iphone"}],"devices":[{"id":"p1","name":"old-phone","last_seen":"2026-10-01T10:00:00Z"}]}`)
+	case "POST /api/phone/approve":
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["code"] != "482913" {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"error":"no phone is waiting with that code"}`)
+			return
+		}
+		io.WriteString(w, `{"status":"ok","approved":{"name":"marios-iphone"}}`)
+	case "DELETE /api/phone/devices/p1":
+		io.WriteString(w, `{"status":"ok"}`)
 	case "POST /api/cli-setup/codex/test":
 		io.WriteString(w, `{"outcome":"quota_or_rate_limit"}`)
 	case "POST /api/login":
@@ -359,5 +383,43 @@ func TestInstallCLIKeepsAnotherSwitcherCommand(t *testing.T) {
 	os.Symlink("/Applications/Old.app/Contents/MacOS/SwitcherServer", filepath.Join(bin, "switcher"))
 	if code := Run([]string{"install-cli", "--dir", bin}, Options{Executable: exe, Stdout: &out, Stderr: &errOut, Getenv: func(string) string { return "" }}); code != 0 {
 		t.Fatalf("own link: %d %s", code, errOut.String())
+	}
+}
+
+func TestResetSpendsTheNextBankedResetOnlyWithYes(t *testing.T) {
+	f, url := fake(t)
+	code, _, errOut := run(t, url, "", "reset", "codex")
+	if code != exitUsage || !strings.Contains(errOut, "2 banked resets of work@example.com; add --yes") {
+		t.Fatalf("without --yes: exit %d %s", code, errOut)
+	}
+	if f.called("POST /api/accounts/x1/use-reset") {
+		t.Fatal("spent a reset without --yes")
+	}
+	code, out, errOut := run(t, url, "", "reset", "codex", "--yes")
+	if code != 0 || !strings.Contains(out, "Used a banked reset on work@example.com. 1 banked reset left.") {
+		t.Fatalf("exit %d out %q err %q", code, out, errOut)
+	}
+	if code, _, errOut := run(t, url, "", "reset", "c2", "--yes"); code != exitFail || !strings.Contains(errOut, "has no banked reset") {
+		t.Fatalf("account without resets: exit %d %s", code, errOut)
+	}
+}
+
+func TestPhoneApprovesByCodeAndRevokesWithYes(t *testing.T) {
+	f, url := fake(t)
+	code, out, errOut := run(t, url, "", "phone")
+	if code != 0 || !strings.Contains(out, "Phone access: on at https://switcher-studio.tail1.ts.net") || !strings.Contains(out, "marios-iphone (w1) waiting for its code") {
+		t.Fatalf("status: exit %d out %q err %q", code, out, errOut)
+	}
+	if code, _, errOut := run(t, url, "", "phone", "approve", "000000"); code != exitFail || !strings.Contains(errOut, "no phone is waiting with that code") {
+		t.Fatalf("wrong code: exit %d %s", code, errOut)
+	}
+	if code, out, _ := run(t, url, "", "phone", "approve", "482913"); code != 0 || !strings.Contains(out, "Approved marios-iphone.") {
+		t.Fatalf("approve: exit %d %s", code, out)
+	}
+	if code, _, _ := run(t, url, "", "phone", "revoke", "old-phone"); code != exitUsage || f.called("DELETE /api/phone/devices/p1") {
+		t.Fatalf("revoke without --yes: exit %d", code)
+	}
+	if code, _, errOut := run(t, url, "", "phone", "revoke", "old-phone", "--yes"); code != 0 || !f.called("DELETE /api/phone/devices/p1") {
+		t.Fatalf("revoke: exit %d %s", code, errOut)
 	}
 }

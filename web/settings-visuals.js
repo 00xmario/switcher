@@ -7,6 +7,7 @@ const icon = body => `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="fal
 export const ICONS = {
   sliders: icon('<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2.2"/><circle cx="10" cy="17" r="2.2"/>'),
   desktop: icon('<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/><path d="M12 7.2v5.6M9.6 8.6l4.8 2.8M14.4 8.6l-4.8 2.8"/>'),
+  phone: icon('<rect x="6.5" y="2.5" width="11" height="19" rx="2.6"/><path d="M10.5 18.5h3"/>'),
   macs: icon('<rect x="2.5" y="5" width="9" height="7" rx="1.4"/><path d="M1.5 15h11"/><rect x="12.5" y="9" width="9" height="7" rx="1.4"/><path d="M11.5 19h11"/>'),
   terminal: icon('<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 10l3 2.5L7 15M12.5 15H17"/>'),
   lock: icon('<rect x="5" y="10.5" width="14" height="10" rx="2.2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/><path d="M12 14.5v2.5"/>'),
@@ -25,6 +26,7 @@ export const SECTIONS = [
   { id: 'switching', title: 'Switching', sub: 'Claude Code’s login, and what happens when an account runs out.', tile: 'brand', icon: 'mark' },
   { id: 'desktop', title: 'Claude Desktop', sub: 'Pick an account per Desktop conversation.', tile: 'clay', icon: 'desktop' },
   { id: 'sharing', title: 'Share between Macs', sub: 'Use one Mac’s accounts on your other Macs, at home or anywhere.', tile: 'blue', icon: 'macs' },
+  { id: 'phone', title: 'Phone', sub: 'Usage, switching and banked resets on your phone, over Tailscale.', tile: 'teal', icon: 'phone' },
   { id: 'tools', title: 'Command line & tools', sub: 'The switcher command, CLI setup and the T3 Code hub.', tile: 'graphite', icon: 'terminal' },
   { id: 'security', title: 'Privacy & security', sub: 'Who can reach this Switcher, and with what.', tile: 'indigo', icon: 'lock' },
   { id: 'about', title: 'About', sub: 'Version, updates and links.', tile: 'app', icon: 'app' },
@@ -91,9 +93,9 @@ export function menuPreviewHTML(bars) {
 export function ladderHTML(autoReset) {
   const steps = [
     { icon: ICONS.empty, title: 'An account runs out', sub: 'The provider reports it is out of usage.' },
-    { icon: switcherMark({ size: 19 }), title: 'Switcher moves on', sub: 'The request is retried on another account.', key: 'move' },
-    { icon: ICONS.bolt, title: 'A banked reset', sub: 'Only when no account is left.', key: 'reset', off: !autoReset },
-    { icon: ICONS.pass, title: 'The limit reaches you', sub: 'As the provider’s own message.' },
+    { icon: switcherMark({ size: 19 }), title: 'Switcher moves on', sub: 'Another paid account takes the request.', key: 'move' },
+    { icon: ICONS.bolt, title: 'A banked reset', sub: 'When no paid account is left, before a Free one.', key: 'reset', off: !autoReset },
+    { icon: ICONS.pass, title: 'Free, then the limit', sub: 'A Free account if you have one, then the provider’s own message.' },
   ];
   return `<ol class="ladder">${steps.map((s, i) => `<li class="ladder-step ${s.key ? `is-${s.key}` : ''} ${s.off ? 'is-off' : ''}" ${s.key === 'reset' ? 'data-ladder-reset' : ''}>
     <span class="ladder-icon">${s.icon}</span><span class="ladder-n">${i + 1}</span>

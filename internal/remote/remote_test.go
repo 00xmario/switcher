@@ -208,3 +208,11 @@ func TestClientLearnsTheHostsNewAddresses(t *testing.T) {
 	}
 	client.refreshAddresses() // rate limited: no second request within two minutes
 }
+
+func TestPairedMacsCannotManagePhoneAccess(t *testing.T) {
+	for _, path := range []string{"/api/phone", "/api/phone/approve", "/api/phone/access", "/api/phone/devices/x"} {
+		if allowedRemotePath(path) {
+			t.Errorf("%s is open to paired devices", path)
+		}
+	}
+}

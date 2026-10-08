@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0b0f0d">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Switcher">
+  <meta name="referrer" content="no-referrer">
+  <title>Switcher</title>
+  <link rel="icon" href="/favicon.png">
+  <link rel="apple-touch-icon" href="/favicon.png">
+  <link rel="stylesheet" href="/phone.css">
+</head>
+<body>
+  <header class="top">
+    <span class="top-mark" id="top-mark"></span>
+    <div class="top-title"><strong>Switcher</strong><span id="top-mac"></span></div>
+    <button type="button" class="icon-button" id="refresh" aria-label="Refresh usage" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </header>
+  <main id="view" aria-live="polite"></main>
+  <div class="sheet-backdrop" id="sheet" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <h2 id="sheet-title"></h2>
+      <p id="sheet-text"></p>
+      <div class="sheet-actions">
+        <button type="button" class="button ghost" id="sheet-cancel">Cancel</button>
+        <button type="button" class="button primary" id="sheet-confirm"></button>
+      </div>
+    </div>
+  </div>
+  <div class="toast" id="toast" role="status" hidden></div>
+  <script type="module" src="/phone.js"></script>
+</body>
+</html>

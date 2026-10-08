@@ -35,7 +35,9 @@ anywhere, turn on **Away from home** in the same card on both Macs:
 
 The add-on joins your tailnet as its own device (`switcher-<mac name>`); it
 installs no VPN and needs no admin password, and only Switcher's traffic uses
-it. It accepts tailnet connections only while this Mac shares its Switcher.
+it. It accepts tailnet connections only while this Mac shares its Switcher,
+and, with phone access on, serves the phone page to your own devices (see
+[phone](phone.md)).
 Tailscale's coordination service sees which devices are connected, not the
 traffic, which is end-to-end encrypted. Switcher checks the add-on against the
 checksum built into the app before every start and restarts it if it stops.

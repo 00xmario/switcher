@@ -21,6 +21,7 @@ import (
 	"switcher/internal/config"
 	"switcher/internal/desktoprelay"
 	"switcher/internal/login"
+	"switcher/internal/phone"
 	"switcher/internal/provider"
 	"switcher/internal/proxy"
 	"switcher/internal/remote"
@@ -67,6 +68,7 @@ type API struct {
 	RemoteHost        *remote.Host
 	RemoteClient      *remote.Client
 	Tailnet           *remote.Tailnet // optional "Away from home" add-on
+	Phone             *phone.Access   // optional phone dashboard over the add-on
 	CodexConfigPath   string          // optional test override
 	probeCodexForTest func(context.Context) proxy.ProbeCodexResult
 	syncClaudeForTest func(context.Context, map[string]string) (claudesync.Result, error)
@@ -95,6 +97,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("GET /api/state", a.handleState)
 	a.registerRemoteRoutes(mux)
+	a.registerPhoneRoutes(mux)
 	mux.HandleFunc("POST /api/claude/sync", a.handleClaudeSync)
 	mux.HandleFunc("GET /api/cli-setup", a.handleCLISetup)
 	mux.HandleFunc("POST /api/cli-setup/codex/install", a.handleCLISetupInstall)

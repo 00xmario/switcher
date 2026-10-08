@@ -47,6 +47,7 @@ request on the caller's own credential rather than failing it.
 - [Switcher in detail](details.md): every feature, providers, switching rules, security
 - [Command line](cli.md): commands, JSON output for agents, signing in over SSH
 - [Share between Macs](sharing.md)
+- [Switcher on your phone](phone.md): over Tailscale, approved phones only
 - [Setup, usage, and live validation](desktop-relay-usage.md)
 - [Relay module and wire contract](desktop-relay-module.md)
 - [Initial implementation plan and subsequent setup changes](desktop-relay-plan.md)

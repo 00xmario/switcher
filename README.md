@@ -41,14 +41,17 @@ provider's own.
   30 seconds. Codex, the T3 Code hub and, if you want, Claude Desktop use the
   account you pick.
 - **Never stuck at a limit.** When the active account reports it is out of
-  usage, Switcher retries your request on another account. Banked Codex
-  resets can be spent as a last resort.
+  usage, Switcher retries your request on another paid account. A banked
+  Codex reset comes before a Free account, so you keep the paid models.
 - **Every quota at a glance.** Session, weekly and monthly windows with reset
   countdowns, in the dashboard and the menu bar, side by side per account if
   you merge them. Optional alerts when a window resets.
 - **Share between Macs.** Pair your laptop with your desktop once. Accounts
   and tokens stay on one Mac and the others use them, at home or anywhere
   with the optional Tailscale add-on.
+- **On your phone.** Check usage, switch Codex accounts and spend a banked
+  reset from your phone, over Tailscale. Only phones you approve on the Mac
+  get in.
 - **A command line for you and your agents.** Switch, sign in, share between
   Macs and set up Claude Desktop from a terminal or over SSH, with JSON output
   and stable exit codes.
@@ -163,6 +166,7 @@ The full matrix, including what is verified per native CLI, is in
 - [Switcher in detail](docs/details.md): every feature, the switching rules, security
 - [Command line](docs/cli.md): commands, JSON for agents, signing in over SSH
 - [Share between Macs](docs/sharing.md): pairing, Away from home, what follows the host
+- [Switcher on your phone](docs/phone.md): setup and who can get in
 - [Claude Desktop](docs/desktop-relay-usage.md): per-conversation accounts
 - [All documentation](docs/README.md), including development notes
 

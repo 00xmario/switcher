@@ -41,6 +41,7 @@ import (
 	"switcher/internal/desktoprelay"
 	"switcher/internal/login"
 	"switcher/internal/mgmtapi"
+	"switcher/internal/phone"
 	"switcher/internal/provider"
 	"switcher/internal/provider/antigravity"
 	"switcher/internal/provider/claude"
@@ -436,6 +437,21 @@ func run(port, desktopRelayPort int) {
 		// The optional Tailscale add-on is downloaded only when turned on.
 		tailnet := remote.NewTailnet(filepath.Join(config.Dir(), "remote"), version, remote.DefaultPort)
 		api.Tailnet = tailnet
+		// The phone dashboard: the add-on passes requests from the owner's
+		// devices to this loopback listener with their identity and its key.
+		// Its handler talks to the API without the local browser's trust.
+		phoneAccess := phone.New(filepath.Join(config.Dir(), "remote", "phone.json"))
+		if phoneListener, err := net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			log.Printf("phone access unavailable: %v", err)
+		} else {
+			api.Phone = phoneAccess
+			machine := remote.MachineName()
+			phoneServer := &http.Server{Handler: &phone.Handler{Access: phoneAccess, Key: tailnet.PhoneKey,
+				Inner: remoteClient.Middleware(api.LocalStateFields, mux), Static: static, Mac: func() string { return machine }},
+				ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
+			go phoneServer.Serve(phoneListener)
+			tailnet.ServePhone(phoneListener.Addr().String(), phoneAccess.Enabled)
+		}
 		remoteHost.AlsoReachableAt(tailnet.Addresses)
 		remoteClient.UseTailnet(tailnet.Dial)
 		remoteHost.Start()

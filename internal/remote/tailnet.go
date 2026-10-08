@@ -44,6 +44,12 @@ type TailnetStatus struct {
 	IP          string        `json:"ip,omitempty"`
 	Peers       []TailnetPeer `json:"peers"`
 	Error       string        `json:"error,omitempty"`
+	// HTTPS reports that the tailnet issues certificates (MagicDNS and HTTPS
+	// on), which the phone dashboard needs. Phone reports that the add-on
+	// serves the dashboard; PhoneError why it cannot.
+	HTTPS      bool   `json:"https"`
+	Phone      bool   `json:"phone"`
+	PhoneError string `json:"phone_error,omitempty"`
 }
 
 // TailnetPeer is another Switcher in the user's tailnet.
@@ -60,25 +66,31 @@ type tailnetFile struct {
 
 // Tailnet manages the add-on process.
 type Tailnet struct {
-	dir, version string
-	hostPort     int
-	mu           sync.Mutex
-	enabled      bool
-	cmd          *exec.Cmd
-	stdin        io.Closer
-	control      string
-	token        string
-	downloading  bool
-	lastErr      string
-	cached       TailnetStatus
-	cachedAt     time.Time
-	client       *http.Client
-	forwarding   func() bool
-	sentForward  string
-	starting     bool
-	retrying     bool
-	restarts     int
-	retryDelay   time.Duration
+	dir, version    string
+	hostPort        int
+	mu              sync.Mutex
+	enabled         bool
+	cmd             *exec.Cmd
+	stdin           io.Closer
+	control         string
+	token           string
+	downloading     bool
+	lastErr         string
+	cached          TailnetStatus
+	cachedAt        time.Time
+	client          *http.Client
+	forwarding      func() bool
+	sentForward     string
+	phoneAddr       string      // Switcher's phone listener
+	phoneOn         func() bool // phone access is on
+	sentPhone       string
+	phoneKey        string     // the running add-on's phone key
+	pendingPhoneKey string     // the key of the add-on being started
+	phoneSync       sync.Mutex // keeps on/off messages in order
+	starting        bool
+	retrying        bool
+	restarts        int
+	retryDelay      time.Duration
 	// download fetches the add-on; tests replace it.
 	download func(ctx context.Context, dest string) error
 }
@@ -137,6 +149,60 @@ func (t *Tailnet) SyncForwarding() {
 			t.mu.Unlock()
 		}
 	}
+}
+
+// ServePhone hands the add-on Switcher's phone listener and asks it to serve
+// the phone dashboard while on reports true. Call it before Start.
+func (t *Tailnet) ServePhone(addr string, on func() bool) {
+	t.mu.Lock()
+	t.phoneAddr, t.phoneOn = addr, on
+	t.mu.Unlock()
+	t.SyncPhone()
+}
+
+// SyncPhone passes the current phone access choice to a running add-on.
+func (t *Tailnet) SyncPhone() {
+	t.phoneSync.Lock()
+	defer t.phoneSync.Unlock()
+	t.mu.Lock()
+	control, token, on := t.control, t.token, t.phoneOn
+	t.mu.Unlock()
+	if control == "" || on == nil {
+		return
+	}
+	value := "0"
+	if on() {
+		value = "1"
+	}
+	t.mu.Lock()
+	if t.sentPhone == control+value {
+		t.mu.Unlock()
+		return
+	}
+	t.mu.Unlock()
+	req, _ := http.NewRequest(http.MethodPost, "http://"+control+"/phone?on="+value, nil)
+	req.Header.Set("X-Switcher-Tailnet", token)
+	if resp, err := t.client.Do(req); err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNoContent {
+			t.mu.Lock()
+			t.sentPhone = control + value
+			t.cachedAt = time.Time{}
+			t.mu.Unlock()
+		}
+	}
+}
+
+// PhoneKey is the secret the running add-on adds to every phone request it
+// passes on; the phone listener accepts nothing else. Empty while the add-on
+// is not running.
+func (t *Tailnet) PhoneKey() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.control == "" {
+		return ""
+	}
+	return t.phoneKey
 }
 
 // verify checks the add-on against the digest it was installed with and, in
@@ -214,8 +280,10 @@ func (t *Tailnet) start(ctx context.Context) error {
 		go cmd.Wait()
 		return nil
 	}
-	t.cmd, t.stdin, t.control, t.token, t.lastErr, t.sentForward = cmd, stdin, control, token, "", ""
+	t.cmd, t.stdin, t.control, t.token, t.lastErr, t.sentForward, t.sentPhone = cmd, stdin, control, token, "", "", ""
+	t.phoneKey = t.pendingPhoneKey
 	go t.SyncForwarding()
+	go t.SyncPhone()
 	go t.watch(cmd)
 	return nil
 }
@@ -241,9 +309,19 @@ func (t *Tailnet) launch(ctx context.Context) (*exec.Cmd, io.WriteCloser, string
 		}
 	}
 	token := randomHex(24)
-	cmd := exec.Command(t.binary(), "-dir", filepath.Join(t.dir, "state"), "-hostname", TailnetHostname(MachineName()),
-		"-forward", fmt.Sprintf("127.0.0.1:%d", t.hostPort), "-port", fmt.Sprint(t.hostPort))
+	args := []string{"-dir", filepath.Join(t.dir, "state"), "-hostname", TailnetHostname(MachineName()),
+		"-forward", fmt.Sprintf("127.0.0.1:%d", t.hostPort), "-port", fmt.Sprint(t.hostPort)}
+	cmd := exec.Command(t.binary(), args...)
 	cmd.Env = append(os.Environ(), "SWITCHER_TAILNET_TOKEN="+token)
+	// The phone dashboard gets its own key, as older add-ons ignore unknown
+	// variables but stop on unknown flags.
+	phoneKey := randomHex(24)
+	t.mu.Lock()
+	if t.phoneAddr != "" {
+		cmd.Env = append(cmd.Env, "SWITCHER_TAILNET_PHONE="+t.phoneAddr, "SWITCHER_TAILNET_PHONE_KEY="+phoneKey)
+	}
+	t.pendingPhoneKey = phoneKey
+	t.mu.Unlock()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, "", "", err
@@ -359,6 +437,7 @@ func (t *Tailnet) Close() {
 // Status reports the add-on and its tailnet, refreshed at most every two seconds.
 func (t *Tailnet) Status() TailnetStatus {
 	go t.SyncForwarding()
+	go t.SyncPhone()
 	t.mu.Lock()
 	_, err := os.Stat(t.binary())
 	s := TailnetStatus{Installed: err == nil, Enabled: t.enabled, Running: t.cmd != nil, Downloading: t.downloading, Error: t.lastErr, Peers: []TailnetPeer{}}
@@ -381,18 +460,22 @@ func (t *Tailnet) Status() TailnetStatus {
 	}
 	defer resp.Body.Close()
 	var live struct {
-		State   string        `json:"state"`
-		AuthURL string        `json:"auth_url"`
-		Tailnet string        `json:"tailnet"`
-		Name    string        `json:"name"`
-		DNSName string        `json:"dns_name"`
-		IP      string        `json:"ip"`
-		Peers   []TailnetPeer `json:"peers"`
+		State      string        `json:"state"`
+		AuthURL    string        `json:"auth_url"`
+		Tailnet    string        `json:"tailnet"`
+		Name       string        `json:"name"`
+		DNSName    string        `json:"dns_name"`
+		IP         string        `json:"ip"`
+		Peers      []TailnetPeer `json:"peers"`
+		HTTPS      bool          `json:"https"`
+		Phone      bool          `json:"phone"`
+		PhoneError string        `json:"phone_error"`
 	}
 	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&live) != nil {
 		return s
 	}
 	s.State, s.AuthURL, s.Tailnet, s.Name, s.DNSName, s.IP = live.State, live.AuthURL, live.Tailnet, live.Name, live.DNSName, live.IP
+	s.HTTPS, s.Phone, s.PhoneError = live.HTTPS, live.Phone, live.PhoneError
 	if live.Peers != nil {
 		s.Peers = live.Peers
 	}

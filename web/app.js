@@ -3,6 +3,7 @@ import { patchProviderList, createResetFeedback, mergeAccountMutation } from './
 import { createAppearance } from './themes.js';
 import { createDesktopRelay, desktopRelayLoopback } from './desktop-relay.js';
 import { createRemote } from './remote.js';
+import { createPhoneSettings } from './phone-settings.js';
 import { switcherMark, playMark } from './brand.js';
 import { SECTIONS, navHTML, sectionHeadHTML, accountLayout, LAYOUTS, layoutChooserHTML, menuPreviewHTML, ladderHTML, securityHeroHTML } from './settings-visuals.js';
 
@@ -2035,6 +2036,13 @@ const remoteSettings = createRemote({
   },
 });
 
+const phoneSettings = createPhoneSettings({
+  api,
+  toast,
+  confirm: options => confirmDialog({ initialFocus: 'cancel', ...options }),
+  openSection: id => showSettingsSection(id),
+});
+
 const CLAUDE_CODE_STATES = { ready: 'Logged in', logged_out: 'Logged out', unmanaged: 'Not in Switcher', unavailable: 'Unavailable', not_configured: 'Not set up' };
 let settingsSection = (location.hash.match(/^#settings\/([a-z]+)$/) || [])[1] || sessionStorage.getItem('switcher-settings-section') || 'general';
 
@@ -2227,7 +2235,7 @@ async function renderSettings() {
         <div class="set-card-head"><h3>When an account runs out</h3><p class="settings-sub">Switcher never switches while the account you picked works. For tools that use Switcher’s proxy, such as Codex, this is what happens when it reports it is out of usage. Claude Code’s own login and Desktop conversations keep the account you picked.</p></div>
         ${ladderHTML(status.auto_use_reset)}
         <div class="settings-row">
-          <div><strong>Use banked resets automatically</strong><span class="dim"> · Codex, only when no other account is left</span></div>
+          <div><strong>Use banked resets automatically</strong><span class="dim"> · Codex, when no other paid account is left, before a Free one</span></div>
           <label class="switch-wrap"><input type="checkbox" id="auto-use-reset" aria-label="Use a banked reset automatically when an account is out of usage" ${status.auto_use_reset ? 'checked' : ''}><span class="switch-visual"></span></label>
         </div>
         <p class="settings-sub">Each account can override this in its ⋯ menu.</p>
@@ -2244,6 +2252,7 @@ async function renderSettings() {
       </div>` : ''}`,
     desktop: `<div class="set-module desktop-relay-card" id="desktop-relay-settings" aria-label="Claude Desktop account switching"></div>`,
     sharing: `<div class="set-module remote-card" id="remote-settings" aria-label="Share between Macs"></div>`,
+    phone: `<div class="set-module" id="phone-settings" aria-label="Phone access"></div>`,
     tools: `
       <div class="settings-card">
         <div class="set-card-head"><h3>Command line</h3><p class="settings-sub">Switch accounts, sign in, share between Macs and set up Claude Desktop from a terminal, over SSH or for an agent, with <code>--json</code> output.</p></div>
@@ -2369,6 +2378,7 @@ async function renderSettings() {
   appearance.mount(settingsPage.querySelector('#appearance-settings'));
   settingsPage.desktopRelay.mountSettings(settingsPage.querySelector('#desktop-relay-settings'));
   remoteSettings.mount(settingsPage.querySelector('#remote-settings'));
+  phoneSettings.mount(settingsPage.querySelector('#phone-settings'));
   const setupList = settingsPage.querySelector('#cli-setup-list');
   const setupAnnouncer = settingsPage.querySelector('#cli-setup-announcer');
   const setupStatus = settingsPage.querySelector('#cli-setup-status');

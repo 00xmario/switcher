@@ -32,11 +32,13 @@ does this for you, and a source build (`make install`) is the same binary.
 | `switcher add-key <provider> [--key K]` | Add an API-key account; pipe the key on stdin to keep it out of shell history |
 | `switcher remove <account> --yes` | Remove an account from Switcher |
 | `switcher refresh [account]` | Refresh usage for one or all accounts |
+| `switcher reset <account\|provider> --yes` | Spend a banked reset (Codex) on an account, or on a provider's active account |
 | `switcher share [on\|off\|code\|devices\|revoke <id> --yes]` | Share this Mac's accounts with your other Macs |
 | `switcher connect <address> --code CODE` | Use the accounts of a Mac that shares them |
 | `switcher disconnect --yes` | Use this Mac's own accounts again |
 | `switcher discover` | Find sharing Switchers on your network and tailnet |
 | `switcher away [on\|off\|remove --yes]` | The Tailscale add-on for use away from home |
+| `switcher phone [on\|off\|approve <code>\|deny <id>\|revoke <id> --yes]` | Use Switcher from your phone over Tailscale; see [phone](phone.md) |
 | `switcher desktop [connect\|disconnect\|restart --yes]` | Route Claude Desktop through Switcher |
 | `switcher setup [codex [--undo\|--test]]` | CLI setup status; point Codex at Switcher, undo it, or send one test request through Switcher's Codex route |
 | `switcher settings [set key=value ...]` | Display and banked-reset settings |

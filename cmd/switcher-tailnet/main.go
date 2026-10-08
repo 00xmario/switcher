@@ -2,9 +2,11 @@
 // it only when "Away from home" is turned on, so the app itself carries no
 // Tailscale code. It joins the user's tailnet as its own node (no system VPN),
 // forwards the tailnet's port 8788 to this Mac's Switcher host listener, and
-// gives Switcher a loopback CONNECT proxy to reach other Switchers.
+// gives Switcher a loopback CONNECT proxy to reach other Switchers. With phone
+// access on, it also serves the phone dashboard over HTTPS (see phone.go).
 //
-// Switcher starts it with SWITCHER_TAILNET_TOKEN set and reads one JSON line
+// Switcher starts it with SWITCHER_TAILNET_TOKEN set (and, for the phone
+// dashboard, SWITCHER_TAILNET_PHONE and SWITCHER_TAILNET_PHONE_KEY) and reads one JSON line
 // with the control address from stdout. It exits when stdin closes, so it
 // never outlives Switcher.
 package main
@@ -23,6 +25,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,6 +58,32 @@ func main() {
 	lc, err := srv.LocalClient()
 	if err != nil {
 		log.Fatalf("local client: %v", err)
+	}
+
+	var selfMu sync.Mutex
+	var selfCached selfInfo
+	var selfAt time.Time
+	self := func(ctx context.Context) (selfInfo, error) {
+		selfMu.Lock()
+		defer selfMu.Unlock()
+		if time.Since(selfAt) < 10*time.Second {
+			return selfCached, nil
+		}
+		st, err := lc.StatusWithoutPeers(ctx)
+		if err != nil || st.Self == nil || st.BackendState != "Running" {
+			return selfInfo{}, fmt.Errorf("not signed in")
+		}
+		selfCached = selfInfo{user: st.Self.UserID, tagged: st.Self.Tags != nil && st.Self.Tags.Len() > 0,
+			dnsName: strings.TrimSuffix(st.Self.DNSName, ".")}
+		selfAt = time.Now()
+		return selfCached, nil
+	}
+	// The phone dashboard is configured through the environment so that a
+	// Switcher never passes a flag an older add-on would reject. Its key is
+	// separate from the control token: it travels with every phone request.
+	var phone *phoneGate
+	if forward, key := os.Getenv("SWITCHER_TAILNET_PHONE"), os.Getenv("SWITCHER_TAILNET_PHONE_KEY"); forward != "" && len(key) >= 32 {
+		phone = newPhoneGate(forward, key, lc.WhoIs, self)
 	}
 
 	// Tailnet peers reach this Mac's Switcher host through the node.
@@ -134,6 +163,10 @@ func main() {
 			out := status{State: st.BackendState, AuthURL: st.AuthURL, Peers: []peer{}}
 			if st.CurrentTailnet != nil {
 				out.Tailnet = st.CurrentTailnet.Name
+				out.HTTPS = st.CurrentTailnet.MagicDNSEnabled && len(st.CertDomains) > 0
+			}
+			if phone != nil {
+				out.Phone, out.PhoneError = phone.state()
 			}
 			if st.Self != nil {
 				out.Name = st.Self.HostName
@@ -159,6 +192,13 @@ func main() {
 			sort.Slice(out.Peers, func(i, j int) bool { return out.Peers[i].Name < out.Peers[j].Name })
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(out)
+		case r.URL.Path == "/phone" && r.Method == http.MethodPost:
+			if phone == nil {
+				http.NotFound(w, r)
+				return
+			}
+			phone.set(r.URL.Query().Get("on") == "1", srv)
+			w.WriteHeader(http.StatusNoContent)
 		case r.URL.Path == "/forwarding" && r.Method == http.MethodPost:
 			forwarding.Store(r.URL.Query().Get("on") == "1")
 			w.WriteHeader(http.StatusNoContent)
@@ -193,6 +233,11 @@ type status struct {
 	DNSName string `json:"dns_name,omitempty"`
 	IP      string `json:"ip,omitempty"`
 	Peers   []peer `json:"peers"`
+	// HTTPS reports that the tailnet issues certificates, which the phone
+	// dashboard needs; Phone that the dashboard is being served.
+	HTTPS      bool   `json:"https"`
+	Phone      bool   `json:"phone"`
+	PhoneError string `json:"phone_error,omitempty"`
 }
 
 type peer struct {

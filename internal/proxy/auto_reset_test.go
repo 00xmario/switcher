@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -352,5 +353,92 @@ func TestAutoUseResetCooldownStopsCreditDrain(t *testing.T) {
 	}
 	if got := prov.spends(); got != 1 {
 		t.Fatalf("spent %d banked reset(s) across repeated 429s, want 1 while the cooldown is active", got)
+	}
+}
+
+// planned returns an account on a plan, as usage polling records it.
+func planned(id, plan string) store.Account {
+	a := account(id)
+	a.Plan = plan
+	return a
+}
+
+// TestBankedResetComesBeforeAFreeAccount covers where a request goes when
+// the active paid account runs out: another paid account first, then a
+// banked reset on the account that ran out, and only then a Free account.
+func TestBankedResetComesBeforeAFreeAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		accounts   []store.Account
+		autoReset  bool
+		credit     bool
+		wantServed []string
+		wantSpends int
+		wantActive string
+	}{
+		{"a banked reset beats a Free account", []store.Account{planned("a", "plus"), planned("b", "free")}, true, true, []string{"a", "a"}, 1, "a"},
+		{"a Free account when no reset is left", []store.Account{planned("a", "plus"), planned("b", "free")}, true, false, []string{"a", "b"}, 0, "b"},
+		{"a Free account when auto-use is off", []store.Account{planned("a", "plus"), planned("b", "free")}, false, true, []string{"a", "b"}, 0, "b"},
+		{"another paid account beats a Free one", []store.Account{planned("a", "plus"), planned("b", "free"), planned("c", "pro")}, true, true, []string{"a", "c"}, 0, "c"},
+		{"an unknown plan counts as paid", []store.Account{planned("a", "plus"), planned("b", "free"), account("c")}, true, true, []string{"a", "c"}, 0, "c"},
+		{"a Free account moves to another Free one", []store.Account{planned("a", "free"), planned("b", "free")}, true, true, []string{"a", "b"}, 0, "b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var served []string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				id := r.Header.Get("X-Fake-Account")
+				mu.Lock()
+				served = append(served, id)
+				first := len(served) == 1
+				mu.Unlock()
+				if id == "a" && first {
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(limitUntil(time.Now().Add(time.Hour))))
+					return
+				}
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer upstream.Close()
+
+			m, prov := newCreditManager(t, upstream, func(store.Account) bool { return tc.autoReset }, tc.accounts...)
+			if err := m.Activate("a"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.credit {
+				prov.grant("a")
+			}
+			rec := doRequest(t, m, "/v1/responses")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())
+			}
+			mu.Lock()
+			got := append([]string(nil), served...)
+			mu.Unlock()
+			if strings.Join(got, ",") != strings.Join(tc.wantServed, ",") {
+				t.Fatalf("served %v, want %v", got, tc.wantServed)
+			}
+			if spends := prov.spends(); spends != tc.wantSpends {
+				t.Fatalf("spent %d banked reset(s), want %d", spends, tc.wantSpends)
+			}
+			if active := m.ActiveID("fake"); active != tc.wantActive {
+				t.Fatalf("active %q, want %q", active, tc.wantActive)
+			}
+		})
+	}
+}
+
+func TestFirstPickPrefersAPaidAccount(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	m, _ := newCreditManager(t, upstream, nil, planned("a", "free"), planned("b", "plus"))
+	if rec := doRequest(t, m, "/v1/responses"); rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if active := m.ActiveID("fake"); active != "b" {
+		t.Fatalf("active %q, want the paid account", active)
 	}
 }
