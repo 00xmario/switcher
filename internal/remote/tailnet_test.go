@@ -273,10 +273,17 @@ func TestPhoneKeyFollowsTheRunningAddon(t *testing.T) {
 			t.Fatalf("phone settings passed as a flag, which older add-ons reject: %v", args)
 		}
 	}
+	// A sync already under way takes the change along, so it arrives soon
+	// rather than before SyncPhone returns.
 	on.Store(true)
 	tn.SyncPhone()
-	if _, _, _, got := phoneEnv(t, tn); !got {
-		t.Fatal("phone access was not passed on")
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if _, _, _, got := phoneEnv(t, tn); got {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("phone access was not passed on")
+		}
 	}
 
 	// A restarted add-on gets a new key, and Switcher follows it.
