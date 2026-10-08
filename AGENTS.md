@@ -8,6 +8,11 @@ testing, local installs, and work sessions keep the current release version.
 Do not invent a new preview version for each session. Mark unreleased work in
 the task summary or Git state instead.
 
+Release numbers after v1.1.0 raise the middle number by one, with the last
+number at 0: v1.1.0, then v1.11.0, v1.12.0, v1.13.0 and so on. Do not use
+v1.2.0 or patch releases such as v1.1.1. Confirm the number with the user
+right before tagging.
+
 ## Runtime and reference material
 
 Keep active Claude Desktop and CLI sessions intact during development. Use
