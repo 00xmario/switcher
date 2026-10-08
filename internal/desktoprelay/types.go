@@ -46,8 +46,12 @@ type Failover interface {
 	// Takeover names the account with the most usage left other than
 	// exclude, or "" when automatic switching is off or none has room.
 	Takeover(ctx context.Context, exclude string) string
-	// TookOver reports a move; from is empty for Desktop's own login.
+	// TookOver reports a move; from is empty for Desktop's own login when
+	// it is not a Switcher account.
 	TookOver(from, to string)
+	// AccountByUUID names the Switcher account with this Anthropic account
+	// UUID, so Desktop's own login is recognized when it is one; "" if none.
+	AccountByUUID(uuid string) string
 }
 
 // ConversationResolver maps request session UUIDs to Desktop conversation

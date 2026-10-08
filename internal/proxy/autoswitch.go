@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -18,8 +19,21 @@ import (
 
 // autoSwitchCooldown keeps an account from being switched away from twice in
 // quick succession, so a provider whose usage lags cannot make Switcher flip
-// back and forth.
-const autoSwitchCooldown = 10 * time.Minute
+// back and forth. A switch that did not go through, for instance because
+// Claude Code held its lock, is tried again after autoSwitchRetry.
+const (
+	autoSwitchCooldown = 10 * time.Minute
+	autoSwitchRetry    = time.Minute
+	// takeoverFreshness is how recent an account's last successful usage
+	// poll must be for it to take over: an account Switcher has not heard
+	// from lately may need a new sign-in or have run out meanwhile.
+	takeoverFreshness = 15 * time.Minute
+	// manualHold keeps an account the user picked while it was at its limit,
+	// for example one with extra usage, from being switched away from.
+	manualHold = time.Hour
+)
+
+var errSwitchOvertaken = errors.New("the switch was overtaken")
 
 // AutoSwitch is the latest automatic switch, for the dashboard.
 type AutoSwitch struct {
@@ -89,7 +103,7 @@ func (m *Manager) headroomLocked(a store.Account) int {
 	if !hasCredentials(a) || m.exhaustedNow(a.ID) {
 		return -1
 	}
-	if h := m.health[a.ID]; h != nil && h.relogin {
+	if h := m.health[a.ID]; h == nil || h.relogin || h.lastSuccess.IsZero() || time.Since(h.lastSuccess) > takeoverFreshness {
 		return -1
 	}
 	u, ok := m.cachedUsageLocked(a.ID)
@@ -141,9 +155,18 @@ func (m *Manager) ClaudeRoute(account string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.outOfUsageLocked(account) {
+		delete(m.claudeReroute, account)
 		return account
 	}
+	// Keep the same stand-in while it has room, so a conversation does not
+	// hop between accounts and lose its cache.
+	if to := m.claudeReroute[account]; to != "" {
+		if a, err := m.store.Get(to); err == nil && m.headroomLocked(a) > 0 {
+			return to
+		}
+	}
 	if next, err := m.takeoverLocked("claude", account, false); err == nil && next != "" {
+		m.claudeReroute[account] = next
 		return next
 	}
 	return account
@@ -170,27 +193,45 @@ func (m *Manager) AutoSwitchNative() {
 			continue
 		}
 		from := status.ActiveID
+		due := func() bool {
+			now := time.Now()
+			return m.outOfUsageLocked(from) && now.After(m.autoSwitchAt[from]) && now.After(m.manualHold[from])
+		}
 		m.mu.Lock()
-		if !m.outOfUsageLocked(from) || time.Now().Before(m.autoSwitchAt[from]) {
+		if !due() {
 			m.mu.Unlock()
 			continue
 		}
 		to, err := m.takeoverLocked(providerID, from, true)
 		if err == nil && to != "" {
-			m.autoSwitchAt[from] = time.Now().Add(autoSwitchCooldown)
+			m.autoSwitchAt[from] = time.Now().Add(autoSwitchRetry)
 		}
 		m.mu.Unlock()
 		if err != nil || to == "" {
 			continue
 		}
+		// Right before switching, under the switch lock, make sure nobody
+		// switched meanwhile and the account is still out.
+		still := func() bool {
+			if native.NativeStatus().ActiveID != from {
+				return false
+			}
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			return m.outOfUsageLocked(from) && time.Now().After(m.manualHold[from])
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		_, err = m.ActivateForClient(ctx, to)
+		_, err = m.activateNative(ctx, to, still)
 		cancel()
+		if errors.Is(err, errSwitchOvertaken) {
+			continue
+		}
 		if err != nil {
-			log.Printf("proxy: Claude Code's account ran out of usage, but switching its login did not go through; trying again later")
+			log.Printf("proxy: Claude Code's account ran out of usage, but switching its login did not go through; trying again in a minute")
 			continue
 		}
 		m.mu.Lock()
+		m.autoSwitchAt[from] = time.Now().Add(autoSwitchCooldown)
 		m.recordAutoSwitchLocked(providerID, "claude_code", from, to)
 		m.mu.Unlock()
 		log.Printf("proxy: Claude Code's account ran out of usage; switched its login to the account with the most usage left")

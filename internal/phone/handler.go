@@ -192,6 +192,7 @@ func (h *Handler) authenticated(w http.ResponseWriter, r *http.Request, id Ident
 		account := parts[0]
 		switch parts[1] {
 		case "use":
+			log.Printf("phone: %s switched an account", device.Name)
 			h.forward(w, r, http.MethodPost, "/api/accounts/"+account+"/activate", nil)
 		case "refresh":
 			h.forward(w, r, http.MethodPost, "/api/accounts/"+account+"/refresh", nil)

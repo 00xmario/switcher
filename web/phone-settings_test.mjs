@@ -18,6 +18,8 @@ test('setup starts by turning on Tailscale, and nothing else can be done yet', (
 test('each step checks itself off as Switcher sees it happen', () => {
   assert.match(phoneHTML({ tailnet: { enabled: true, running: true, state: 'NeedsLogin', auth_url: 'https://login.tailscale.com/a/x' } }),
     /href="https:\/\/login\.tailscale\.com\/a\/x"[^>]*>Sign in with Tailscale/);
+  assert.doesNotMatch(phoneHTML({ tailnet: { enabled: true, running: true, state: 'NeedsLogin', auth_url: 'javascript:alert(1)' } }), /javascript:/,
+    'only an https sign-in link is shown');
   const https = phoneHTML({ tailnet: running });
   assert.equal(current(https), 'A secure address');
   assert.match(https, /href="https:\/\/login\.tailscale\.com\/admin\/dns"/);

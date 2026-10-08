@@ -13,6 +13,7 @@
 <p align="center">
   <a href="https://github.com/00xmario/switcher/releases/latest"><strong>Download for macOS</strong></a>
   &nbsp;·&nbsp; <a href="#command-line">Command line</a>
+  &nbsp;·&nbsp; <a href="docs/phone.md">On your phone</a>
   &nbsp;·&nbsp; <a href="docs/sharing.md">Share between Macs</a>
   &nbsp;·&nbsp; <a href="docs/details.md">Details</a>
 </p>
@@ -31,8 +32,8 @@ your own Mac and answers two questions: **which account am I using**, and
 
 It does not pool accounts, rotate requests between them or invent its own
 rate limits. Each provider uses the account you picked until you pick another,
-or until that account reports it is out of usage. Errors and limits are the
-provider's own.
+or until that account runs out of usage; then Switcher moves on to the account
+with the most usage left. Errors and limits are the provider's own.
 
 ## Highlights
 
@@ -40,18 +41,21 @@ provider's own.
   login and Switcher's proxy together; running sessions follow within about
   30 seconds. Codex, the T3 Code hub and, if you want, Claude Desktop use the
   account you pick.
-- **Never stuck at a limit.** When the active account reports it is out of
-  usage, Switcher retries your request on another paid account. A banked
-  Codex reset comes before a Free account, so you keep the paid models.
+- **Never stuck at a limit.** When an account runs out, Switcher moves on by
+  itself. Codex retries the request on another paid account, with a banked
+  reset before any Free account. Claude Code's login switches to the Claude
+  account with the most usage left, and a Claude Desktop conversation moves
+  over before Desktop even sees the refusal.
 - **Every quota at a glance.** Session, weekly and monthly windows with reset
   countdowns, in the dashboard and the menu bar, side by side per account if
   you merge them. Optional alerts when a window resets.
 - **Share between Macs.** Pair your laptop with your desktop once. Accounts
   and tokens stay on one Mac and the others use them, at home or anywhere
   with the optional Tailscale add-on.
-- **On your phone.** Check usage, switch Codex accounts and spend a banked
-  reset from your phone, over Tailscale. Only phones you approve on the Mac
-  get in.
+- **Switcher in your pocket.** Check usage, switch accounts (Claude Code's
+  login included) and spend a banked reset from your phone, wherever you are,
+  over Tailscale. Setup is a QR code and a six-digit code; only phones you
+  approve on the Mac get in.
 - **A command line for you and your agents.** Switch, sign in, share between
   Macs and set up Claude Desktop from a terminal or over SSH, with JSON output
   and stable exit codes.
@@ -62,18 +66,26 @@ provider's own.
 - **Private by default.** Local only, no telemetry, prompts never inspected,
   and account emails blurred until you hover.
 
+<p align="center">
+  <img src="docs/screenshots/phone.png" alt="Switcher on three phones: pairing with a code, accounts with usage, and a banked reset">
+  <br><sub><b>On your phone.</b> Usage, switching and banked resets, over Tailscale, for phones you approve.</sub>
+</p>
+
 <table>
   <tr>
     <td width="50%"><img src="docs/screenshots/merged.png" alt="Merged accounts: every Claude account side by side per quota window"><br><sub><b>Merged accounts.</b> Every account side by side per quota window.</sub></td>
     <td width="50%"><img src="docs/screenshots/usage.png" alt="Usage tab with daily cost per provider"><br><sub><b>Costs and tokens.</b> From your CLIs' own session logs.</sub></td>
   </tr>
   <tr>
+    <td><img src="docs/screenshots/settings-switching.png" alt="Switching settings: the order when an account runs out, and Switch Claude automatically"><br><sub><b>When an account runs out.</b> Switcher moves on, Claude included.</sub></td>
+    <td><img src="docs/screenshots/settings-phone.png" alt="Phone settings with a QR code and a six-digit code entry"><br><sub><b>Phone setup.</b> Scan, tap Pair, type the code. Done.</sub></td>
+  </tr>
+  <tr>
     <td><img src="docs/screenshots/settings-desktop.png" alt="Claude Desktop settings with the request flow and per-conversation accounts"><br><sub><b>Claude Desktop.</b> An account per conversation, one click each.</sub></td>
     <td><img src="docs/screenshots/settings-sharing.png" alt="Share between Macs settings with a pairing code"><br><sub><b>Share between Macs.</b> Pair once with a code.</sub></td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/menu.png" alt="The menu bar dropdown in light mode"><br><sub><b>Menu bar.</b> Usage and switching without opening anything.</sub></td>
-    <td><img src="docs/screenshots/settings-general.png" alt="General settings with themes and account layouts"><br><sub><b>Settings.</b> Themes, layouts and every option, explained.</sub></td>
+    <td colspan="2" align="center"><img src="docs/screenshots/menu.png" width="50%" alt="The menu bar dropdown in light mode"><br><sub><b>Menu bar.</b> Usage and switching without opening anything.</sub></td>
   </tr>
 </table>
 
@@ -126,6 +138,8 @@ switcher login claude                      # sign in, also over SSH
 switcher share on && switcher share code   # let your other Macs use this one
 switcher connect studio.local --code K7QF-M2XP
 switcher desktop connect                   # route Claude Desktop through Switcher
+switcher reset codex --yes                 # spend a banked reset
+switcher phone on                          # use Switcher from your phone
 switcher status --json                     # for agents and scripts
 ```
 
@@ -139,7 +153,7 @@ in the [command line guide](docs/cli.md).
 
 | Provider | Sign in | What Switcher does |
 |---|---|---|
-| **Claude** | Browser, or import Claude Code's login | Switches Claude Code's own login and the Claude proxy; optional Claude Desktop routing |
+| **Claude** | Browser, or import Claude Code's login | Switches Claude Code's own login and the Claude proxy, by itself when an account runs out; optional Claude Desktop routing |
 | **Codex** | ChatGPT in the browser | Proxy for the Codex CLI, one-command setup, banked resets |
 | **Grok Build** | Device code | Proxy for the session service |
 | **OpenCode Go** | API key | Proxy |
@@ -158,6 +172,9 @@ The full matrix, including what is verified per native CLI, is in
 - Sharing between Macs uses a pinned certificate, a pairing code proved in
   both directions and a revocable token per Mac, and only accepts your own
   network and Tailscale.
+- The phone page is reachable only inside your tailnet, only from your own
+  Tailscale devices, and only for phones you approve on the Mac; sessions
+  are bound to the phone. See [phone](docs/phone.md).
 - An optional dashboard password and an opt-in TLS LAN listener are in
   Settings. The full model is in [details](docs/details.md#security-model).
 

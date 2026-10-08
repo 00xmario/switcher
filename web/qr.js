@@ -225,6 +225,8 @@ export function qrMatrix(text, { version: forced = 0, mask: forcedMask = -1 } = 
 
 // qrSVG draws the code as one path with a four-module quiet zone. The finder
 // patterns get rounded corners; everything else stays square for scanners.
+const escapeAttr = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 export function qrSVG(text, { label = 'QR code' } = {}) {
   const m = qrMatrix(text);
   const size = m.length, q = 4, n = size + q * 2;
@@ -233,7 +235,7 @@ export function qrSVG(text, { label = 'QR code' } = {}) {
   for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (m[y][x] && !finder(x, y)) path += `M${x + q} ${y + q}h1v1h-1z`;
   const eye = (x, y) => `<rect x="${x + q + .5}" y="${y + q + .5}" width="6" height="6" rx="1.6" fill="none" stroke="currentColor" stroke-width="1"/>`
     + `<rect x="${x + q + 2}" y="${y + q + 2}" width="3" height="3" rx=".8" fill="currentColor"/>`;
-  return `<svg class="qr" viewBox="0 0 ${n} ${n}" role="img" aria-label="${label}" shape-rendering="crispEdges">
+  return `<svg class="qr" viewBox="0 0 ${n} ${n}" role="img" aria-label="${escapeAttr(label)}" shape-rendering="crispEdges">
     <rect width="${n}" height="${n}" rx="3" fill="#fff"/>
     <path d="${path}" fill="currentColor"/>
     <g shape-rendering="geometricPrecision">${eye(0, 0)}${eye(size - 7, 0)}${eye(0, size - 7)}</g>

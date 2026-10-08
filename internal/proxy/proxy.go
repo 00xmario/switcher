@@ -98,6 +98,8 @@ type Manager struct {
 	claudeAuto         func() bool
 	autoSwitching      atomic.Bool
 	autoSwitchAt       map[string]time.Time
+	manualHold         map[string]time.Time
+	claudeReroute      map[string]string
 	autoSwitchSerial   uint64
 	lastAutoSwitch     AutoSwitch
 	probeClient        *http.Client // optional internal test seam; production uses a fresh direct client
@@ -179,6 +181,8 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		accountRevision:    map[string]uint64{},
 		autoResetAt:        map[string]time.Time{},
 		autoSwitchAt:       map[string]time.Time{},
+		manualHold:         map[string]time.Time{},
+		claudeReroute:      map[string]string{},
 		planChecked:        map[string]time.Time{},
 		resetEvents:        map[string]ResetEvent{},
 		quotaRevision:      map[string]uint64{},

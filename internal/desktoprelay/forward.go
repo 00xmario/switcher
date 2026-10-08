@@ -85,7 +85,7 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 	}
 	var limit limitFunc
 	if message {
-		limit = m.takeover(ctx, task, view.Thread)
+		limit = m.takeover(ctx, task, view)
 	}
 	m.send(w, r, r.URL.Path, body, task.AccountID, run.transport, record, limit)
 }
@@ -101,31 +101,51 @@ type limitFunc func(account string, resp *http.Response, body []byte) (next stri
 // a refusal that means the account is out counts: Anthropic's limit headers
 // say so for any login, and for a Switcher account its usage is checked too.
 // Other rate limits pass through as Anthropic sent them.
-func (m *Manager) takeover(ctx context.Context, task Session, thread string) limitFunc {
+func (m *Manager) takeover(ctx context.Context, task Session, view identityView) limitFunc {
 	failover, ok := m.cfg.Source.(Failover)
 	if !ok || task.SessionID == "" {
 		return nil
 	}
 	return func(account string, resp *http.Response, body []byte) (string, bool) {
-		until, rejected := usageRejected(resp.Header, time.Now())
-		out := rejected
-		if account != "" {
-			out = failover.OutOfUsage(ctx, account, resp.StatusCode, body, until)
+		from := account
+		// Desktop's own login may be one of the Switcher accounts; then it
+		// is checked, parked and passed over like a picked one.
+		if from == "" && view.AccountUUID != "" {
+			from = failover.AccountByUUID(view.AccountUUID)
 		}
-		if !out {
+		next, ok := m.handOver(ctx, failover, from, resp, body)
+		if !ok || m.moveTo(task, next, view.Thread) != nil {
 			return "", false
 		}
-		next := failover.Takeover(ctx, account)
-		if next == "" || next == account || m.moveTo(task, next, thread) != nil {
-			return "", false
-		}
-		failover.TookOver(account, next)
+		failover.TookOver(from, next)
 		log.Printf("desktop relay: a conversation's account ran out of usage; it moved to the account with the most usage left")
-		if thread == "continue" {
+		if view.Thread == "continue" {
 			return "", true
 		}
 		return next, true
 	}
+}
+
+// handOver decides whether a 429 means from ran out of usage, and which
+// account takes over. The new account must be ready to use: a conversation
+// never moves to an account whose credential cannot be prepared.
+func (m *Manager) handOver(ctx context.Context, failover Failover, from string, resp *http.Response, body []byte) (string, bool) {
+	until, rejected := usageRejected(resp.Header, time.Now())
+	out := rejected
+	if from != "" {
+		out = failover.OutOfUsage(ctx, from, resp.StatusCode, body, until)
+	}
+	if !out {
+		return "", false
+	}
+	next := failover.Takeover(ctx, from)
+	if next == "" || next == from {
+		return "", false
+	}
+	if _, err := m.prepare(ctx, next); err != nil {
+		return "", false
+	}
+	return next, true
 }
 
 // usageRejected reads Anthropic's unified limit headers: a five-hour or
@@ -159,32 +179,62 @@ func (m *Manager) ServeAccount(w http.ResponseWriter, r *http.Request, path, acc
 	if err != nil {
 		panic(http.ErrAbortHandler)
 	}
+	m.serveAccount(w, r, path, body, account, nil)
+}
+
+// ServeAccountRouted is ServeAccount with route choosing the account this
+// host really uses, such as a stand-in for an account that ran out. A thread
+// continued on the account it asked for cannot move, so the paired Mac is
+// asked to resend the full conversation instead.
+func (m *Manager) ServeAccountRouted(w http.ResponseWriter, r *http.Request, path, account string, route func(string) string) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	m.serveAccount(w, r, path, body, account, route)
+}
+
+func (m *Manager) serveAccount(w http.ResponseWriter, r *http.Request, path string, body []byte, account string, route func(string) string) {
 	m.hostOnce.Do(func() { m.hostTransport = m.transport() })
+	message := path == "/v1/messages"
+	thread := ""
+	if message {
+		thread = identity(r, body).Thread
+	}
+	if route != nil {
+		if next := route(account); next != "" && next != account {
+			if thread == "continue" {
+				relayError(w, http.StatusBadRequest, "invalid_request_error", "This conversation moved to another account; resend the full conversation.", "thread_unsupported_request")
+				return
+			}
+			account = next
+		}
+	}
 	var limit limitFunc
-	if path == "/v1/messages" && identity(r, body).Thread != "continue" {
-		limit = m.hostTakeover(r.Context())
+	if message && account != "" {
+		limit = m.hostTakeover(r.Context(), thread)
 	}
 	m.send(w, r, path, body, account, m.hostTransport, nil, limit)
 }
 
 // hostTakeover sends a paired Mac's request again on the account with the most
-// usage left when its account ran out. The paired Mac keeps its own
-// conversation picks; ClaudeRoute steers its next requests on this host.
-func (m *Manager) hostTakeover(ctx context.Context) limitFunc {
+// usage left when its account ran out, or asks for the full conversation when
+// it continued a thread there. The paired Mac keeps its own conversation
+// picks; the route steers its next requests on this host.
+func (m *Manager) hostTakeover(ctx context.Context, thread string) limitFunc {
 	failover, ok := m.cfg.Source.(Failover)
 	if !ok {
 		return nil
 	}
 	return func(account string, resp *http.Response, body []byte) (string, bool) {
-		until, rejected := usageRejected(resp.Header, time.Now())
-		if account == "" || !failover.OutOfUsage(ctx, account, resp.StatusCode, body, until) && !rejected {
-			return "", false
-		}
-		next := failover.Takeover(ctx, account)
-		if next == "" || next == account {
+		next, ok := m.handOver(ctx, failover, account, resp, body)
+		if !ok {
 			return "", false
 		}
 		failover.TookOver(account, next)
+		if thread == "continue" {
+			return "", true
+		}
 		return next, true
 	}
 }

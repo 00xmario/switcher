@@ -419,16 +419,15 @@ func run(port, desktopRelayPort int) {
 		if account == "" {
 			account = proxyManager.ActiveID("claude")
 		}
-		// An account that ran out of usage hands over to the one with the
-		// most usage left, as it does for this Mac's own Desktop.
-		account = proxyManager.ClaudeRoute(account)
 		if desktopRelay == nil || account == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"The Switcher host has no Claude account selected"}}`)
 			return
 		}
-		desktopRelay.ServeAccount(w, r, path, account)
+		// An account that ran out of usage hands over to the one with the
+		// most usage left, as it does for this Mac's own Desktop.
+		desktopRelay.ServeAccountRouted(w, r, path, account, proxyManager.ClaudeRoute)
 	})
 	shared.Handle("/v0/management/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Header.Set("Authorization", "Bearer "+managementKey)

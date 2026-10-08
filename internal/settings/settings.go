@@ -117,6 +117,10 @@ func cloneSettings(st Settings) Settings {
 		value := *st.MenuUsageBars
 		st.MenuUsageBars = &value
 	}
+	if st.AutoSwitchClaude != nil {
+		value := *st.AutoSwitchClaude
+		st.AutoSwitchClaude = &value
+	}
 	return st
 }
 

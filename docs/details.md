@@ -51,7 +51,10 @@ required; OpenCode Go uses its own API key.
   moves when Anthropic refuses one of its requests for that reason. Usage is
   polled every few minutes, so Claude Code may meet the limit once before the
   switch; running sessions pick up the new login within about 30 seconds.
-  Each account is switched away from at most once per ten minutes.
+  Only accounts with a successful usage poll in the last fifteen minutes and
+  no pending sign-in take over. Each account is switched away from at most
+  once per ten minutes, and an account you pick yourself while it is at its
+  limit stays picked for an hour.
 - **Automatic failover on exhaustion**: when the active account reports it
   is out of usage (HTTP 429 `usage_limit_reached`), Switcher marks it with
   the upstream reset time and, if another account is usable, retries your
@@ -310,8 +313,9 @@ environment; a terminal-only override needs the CLI command. The first
   small phone page over HTTPS with Tailscale's certificate. It admits only
   your own Tailscale devices, and Switcher admits only phones approved on
   this Mac by the code they show. Sessions are bound to the phone's
-  Tailscale device. The page reads usage, refreshes, switches proxy accounts
-  and spends banked resets, nothing else. See [phone](phone.md).
+  Tailscale device. The page reads usage, refreshes, switches accounts
+  (Claude Code's login included) and spends banked resets, nothing else. See
+  [phone](phone.md).
 - Hardened headers everywhere: CSP (no inline script, form-action self),
   nosniff, no-referrer. State-changing requests from a non-loopback socket
   are refused for credential routes.

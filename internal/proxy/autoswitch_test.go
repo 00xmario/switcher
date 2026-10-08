@@ -20,12 +20,20 @@ type autoNative struct {
 	status   claudecode.Status
 	switched []string
 	fail     error
+	// later, when set, is the login after the first status read: someone
+	// else switched in between.
+	later string
+	reads int
 }
 
 func (p *autoNative) NativeEnabled() bool { return true }
 func (p *autoNative) NativeStatus() claudecode.Status {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.reads++
+	if p.later != "" && p.reads > 1 {
+		p.status.ActiveID = p.later
+	}
 	return p.status
 }
 func (p *autoNative) SwitchNative(_ context.Context, id string, commit func(string) error) (claudecode.SwitchResult, error) {
@@ -71,10 +79,13 @@ func autoManager(t *testing.T, on bool, accounts ...store.Account) (*Manager, *a
 	return m, native
 }
 
+// setUsage records usage as a successful poll just now would.
 func (m *Manager) setUsage(id string, u provider.Usage) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastUsage[id] = u
+	h := m.healthLocked(id)
+	h.lastChecked, h.lastSuccess = time.Now(), time.Now()
 }
 
 func TestClaudeCodeMovesToTheAccountWithTheMostUsageLeft(t *testing.T) {
@@ -197,5 +208,81 @@ func TestAPairedMacsRequestAvoidsAnAccountThatRanOut(t *testing.T) {
 	m.SetClaudeAutoSwitch(func() bool { return false })
 	if got := m.ClaudeRoute("a"); got != "a" {
 		t.Fatalf("route %q with switching off", got)
+	}
+}
+
+func TestOnlyAccountsHeardFromLatelyTakeOver(t *testing.T) {
+	m, native := autoManager(t, true, claudeAccount("a"), claudeAccount("b"), claudeAccount("c"), claudeAccount("d"))
+	m.setUsage("a", windows(100, 0))
+	m.setUsage("b", windows(0, 0))
+	m.setUsage("c", windows(0, 0))
+	m.setUsage("d", windows(40, 40))
+	m.mu.Lock()
+	m.healthLocked("b").lastSuccess = time.Now().Add(-time.Hour) // stale
+	m.healthLocked("c").relogin = true                           // needs a new sign-in
+	m.mu.Unlock()
+	m.AutoSwitchNative()
+	if len(native.switched) != 1 || native.switched[0] != "d" {
+		t.Fatalf("switched %v, want d", native.switched)
+	}
+}
+
+func TestAnAutomaticSwitchNeverOvertakesTheUsers(t *testing.T) {
+	m, native := autoManager(t, true, claudeAccount("a"), claudeAccount("b"), claudeAccount("c"))
+	m.setUsage("a", windows(100, 0))
+	m.setUsage("b", windows(0, 0))
+	native.later = "c" // the user switched to c meanwhile
+	m.AutoSwitchNative()
+	if len(native.switched) != 0 {
+		t.Fatalf("switched %v over the user's choice", native.switched)
+	}
+}
+
+func TestAnAccountPickedAtItsLimitStaysPicked(t *testing.T) {
+	m, native := autoManager(t, true, claudeAccount("a"), claudeAccount("b"))
+	native.status.ActiveID = "b"
+	m.setUsage("a", windows(100, 0))
+	m.setUsage("b", windows(0, 0))
+	if _, err := m.ActivateForClient(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	m.setUsage("a", windows(100, 0))
+	m.setUsage("b", windows(0, 0))
+	m.AutoSwitchNative()
+	if len(native.switched) != 1 || native.status.ActiveID != "a" {
+		t.Fatalf("switched %v; the user's pick did not hold", native.switched)
+	}
+}
+
+func TestAFailedSwitchIsRetriedAfterAMinute(t *testing.T) {
+	m, native := autoManager(t, true, claudeAccount("a"), claudeAccount("b"))
+	native.fail = errors.New("busy")
+	m.setUsage("a", windows(100, 0))
+	m.setUsage("b", windows(0, 0))
+	m.AutoSwitchNative()
+	m.mu.Lock()
+	wait := time.Until(m.autoSwitchAt["a"])
+	m.mu.Unlock()
+	if wait <= 0 || wait > autoSwitchRetry+time.Second {
+		t.Fatalf("next try in %v, want about a minute", wait)
+	}
+}
+
+func TestAStandInStaysWhileItHasRoom(t *testing.T) {
+	m, _ := autoManager(t, true, claudeAccount("a"), claudeAccount("b"), claudeAccount("c"))
+	m.setUsage("a", windows(100, 0))
+	m.setUsage("b", windows(50, 50))
+	m.setUsage("c", windows(10, 10))
+	if got := m.ClaudeRoute("a"); got != "c" {
+		t.Fatalf("route %q, want c", got)
+	}
+	m.setUsage("b", windows(0, 0))
+	m.setUsage("c", windows(60, 60))
+	if got := m.ClaudeRoute("a"); got != "c" {
+		t.Fatalf("route moved to %q while c still had room", got)
+	}
+	m.setUsage("c", windows(100, 0))
+	if got := m.ClaudeRoute("a"); got != "b" {
+		t.Fatalf("route %q, want b once c ran out", got)
 	}
 }

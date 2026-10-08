@@ -50,7 +50,7 @@ export function steps(status) {
   else if (t.downloading) tailscale = spinner('Downloading the add-on…');
   else if (t.error) tailscale = `<span class="phone-error">${escape(t.error)}</span>`;
   else if (!t.running) tailscale = spinner('Starting…');
-  else if (t.state === 'NeedsLogin' && t.auth_url) tailscale = `<a class="button primary" href="${escape(t.auth_url)}" target="_blank" rel="noopener noreferrer">Sign in with Tailscale ${ARROW}</a><span class="phone-hint">Use the account you will sign in with on your phone.</span>`;
+  else if (t.state === 'NeedsLogin' && /^https:\/\//.test(t.auth_url || '')) tailscale = `<a class="button primary" href="${escape(t.auth_url)}" target="_blank" rel="noopener noreferrer">Sign in with Tailscale ${ARROW}</a><span class="phone-hint">Use the account you will sign in with on your phone.</span>`;
   else tailscale = spinner('Connecting to Tailscale…');
   return [
     { key: 'tailscale', done: signedIn, title: 'Tailscale on this Mac', doneText: t.tailnet ? `On ${escape(t.tailnet)}` : 'Connected', action: tailscale },
@@ -166,12 +166,17 @@ export function phoneHTML(status, { busy = '', error = '', now = Date.now(), cel
 }
 
 export function createPhoneSettings({ api, confirm = async () => true, toast = () => {}, openSection = () => {}, now = () => Date.now() }) {
-  let view = null, status = null, busy = '', error = '', timer = null, shown = '', celebrate = false, approvedBefore = -1;
+  let view = null, status = null, busy = '', error = '', timer = null, shown = '', celebrate = false, approvedBefore = -1, loads = 0, applied = 0;
   const post = (path, body) => api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
 
   async function load() {
+    const ticket = ++loads;
     try {
-      status = await api('/api/phone');
+      const next = await api('/api/phone');
+      // An older answer never replaces a newer one.
+      if (ticket < applied) return;
+      applied = ticket;
+      status = next;
       const count = (status.devices || []).length;
       if (approvedBefore >= 0 && count > approvedBefore) {
         celebrate = true;
@@ -264,12 +269,23 @@ export function createPhoneSettings({ api, confirm = async () => true, toast = (
       const on = event.target.checked;
       act('toggle', () => post('/api/phone/access', { on }));
     });
+    const typed = (input, digits) => {
+      input.value = digits;
+      input.form?.classList.remove('is-wrong');
+      cells();
+      if (digits.length === 6) approve(input.form);
+    };
     root.addEventListener('input', event => {
       if (!event.target.matches('[data-phone-form] input')) return;
-      const digits = event.target.value.replace(/\D/g, '').slice(0, 6);
-      event.target.value = digits;
-      cells();
-      if (digits.length === 6) approve(event.target.form);
+      typed(event.target, event.target.value.replace(/\D/g, '').slice(0, 6));
+    });
+    // A pasted code replaces what was typed, so "482 913" never mixes with it.
+    root.addEventListener('paste', event => {
+      if (!event.target.matches('[data-phone-form] input')) return;
+      const digits = (event.clipboardData?.getData('text') || '').replace(/\D/g, '');
+      if (!digits) return;
+      event.preventDefault();
+      typed(event.target, digits.slice(0, 6));
     });
     root.addEventListener('focusin', cells);
     root.addEventListener('focusout', () => setTimeout(cells));
@@ -286,7 +302,6 @@ export function createPhoneSettings({ api, confirm = async () => true, toast = (
       if (!button || button.disabled) return;
       const id = button.dataset.phoneId;
       switch (button.dataset.phoneAction) {
-        case 'open-sharing': return openSection('sharing');
         case 'tailnet-on': return act('tailnet', () => post('/api/remote/tailnet', { enabled: true }));
         case 'access-on': return act('toggle', () => post('/api/phone/access', { on: true }));
         case 'deny': return act('deny', () => post('/api/phone/deny', { id }));
@@ -306,6 +321,10 @@ export function createPhoneSettings({ api, confirm = async () => true, toast = (
     view = root;
     shown = '';
     error = '';
+    // Entrance animations play once when the section opens, not on every
+    // refresh of its content.
+    root.classList.add('is-fresh');
+    setTimeout(() => root.classList.remove('is-fresh'), 1500);
     bind(root);
     render();
     load();

@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"switcher/internal/claudecode"
@@ -69,6 +70,23 @@ func (s *DesktopCredentialSource) Takeover(ctx context.Context, exclude string) 
 		return ""
 	}
 	return next
+}
+
+// AccountByUUID names the Claude account whose Anthropic account UUID is uuid.
+func (s *DesktopCredentialSource) AccountByUUID(uuid string) string {
+	if s == nil || s.manager == nil || s.manager.store == nil || uuid == "" {
+		return ""
+	}
+	accounts, err := s.manager.store.List()
+	if err != nil {
+		return ""
+	}
+	for _, a := range accounts {
+		if a.Provider == "claude" && strings.EqualFold(a.Token.AccountID, uuid) {
+			return a.ID
+		}
+	}
+	return ""
 }
 
 // TookOver records a Desktop conversation's move for the dashboard.

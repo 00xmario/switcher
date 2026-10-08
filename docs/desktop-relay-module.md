@@ -81,7 +81,9 @@ left. `send` handles it before any byte reaches Desktop:
    also checks its usage the way the proxy does (`ParseRateLimit`) and parks
    it until its reset. Burst limits and other 429s pass through as before.
 3. `Takeover` names the Claude account with the most session and weekly usage
-   left. With none, or with the setting off, the refusal passes through.
+   left, among accounts with a successful usage poll in the last fifteen
+   minutes that need no new sign-in. Its credential must prepare. With none,
+   or with the setting off, the refusal passes through.
 4. The conversation is bound to that account (`setConversation`), or the
    session alone when its conversation is unknown, so later requests and
    subagents follow and the Settings list shows the new account.
@@ -91,9 +93,17 @@ left. `send` handles it before any byte reaches Desktop:
    full conversation, which then goes to the new account.
 
 This applies to Desktop's own login too, when Anthropic's headers say it is
-out, and it never changes Desktop's own sign-in, another conversation, Claude
-Code's native login or the proxy's selection. Requests forwarded to a
-connected Switcher host keep the host's handling.
+out. When that login is one of the Switcher accounts (matched by the
+`account_uuid` in `metadata.user_id`), it is checked, parked and passed over
+like a picked one. The relay never changes Desktop's own sign-in or another
+conversation. An account it parks is out of usage for every route, though,
+so Claude Code's automatic switch may move off it too.
+
+On a host, `ServeAccountRouted` serves paired Macs: an account that ran out
+gets a stand-in (`proxy.ClaudeRoute`), the same one while it has room, and a
+request refused for that reason is sent again on it. A thread continued on the
+account that ran out cannot move, so the paired Mac gets 400
+`thread_unsupported_request` and resends the full conversation.
 
 ## Credentials
 

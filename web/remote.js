@@ -137,7 +137,7 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
     if (t.downloading) detail = '<p class="settings-sub">Downloading the Tailscale add-on…</p>';
     else if (t.enabled && t.error) detail = `<p class="remote-error">${escape(t.error)}</p>`;
     else if (t.enabled && !t.running) detail = '<p class="settings-sub">Starting…</p>';
-    else if (t.enabled && t.state === 'NeedsLogin' && t.auth_url) detail = `<div class="remote-tailnet-login">
+    else if (t.enabled && t.state === 'NeedsLogin' && /^https:\/\//.test(t.auth_url || '')) detail = `<div class="remote-tailnet-login">
         <p class="settings-sub">Sign in once to add this Mac to your Tailscale network. Use the same Tailscale account on your other Macs.</p>
         <a class="button primary" href="${escape(t.auth_url)}" target="_blank" rel="noopener noreferrer">Sign in with Tailscale</a>
       </div>`;

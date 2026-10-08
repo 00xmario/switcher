@@ -424,7 +424,7 @@ type LocalState func(r *http.Request) map[string]any
 
 // localStateKeys stay this Mac's own in the merged /api/state.
 var localStateKeys = []string{"version", "update", "desktop_relay", "hub_url", "hub_management_key",
-	"menu_usage_bars", "reset_notifications", "compact_accounts", "merge_accounts"}
+	"menu_usage_bars", "reset_notifications", "compact_accounts", "merge_accounts", "auto_switch"}
 
 // Middleware sends account and provider traffic to the host while connected.
 func (c *Client) Middleware(local LocalState, next http.Handler) http.Handler {

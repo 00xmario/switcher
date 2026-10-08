@@ -16,8 +16,24 @@ import (
 // account runs out of usage (AutoSwitchNative) both come here; proxy failover
 // on a refused request still selects only its route.
 func (m *Manager) ActivateForClient(ctx context.Context, id string) (*claudecode.SwitchResult, error) {
+	// The user is in charge: an account they pick while it is at its limit
+	// stays picked for a while.
+	m.mu.Lock()
+	if m.outOfUsageLocked(id) {
+		m.manualHold[id] = time.Now().Add(manualHold)
+	}
+	m.mu.Unlock()
+	return m.activateNative(ctx, id, nil)
+}
+
+// activateNative switches under the native activation lock. still, when
+// given, runs under that lock first; false abandons the switch.
+func (m *Manager) activateNative(ctx context.Context, id string, still func() bool) (*claudecode.SwitchResult, error) {
 	m.nativeActivation.Lock()
 	defer m.nativeActivation.Unlock()
+	if still != nil && !still() {
+		return nil, errSwitchOvertaken
+	}
 	account, err := m.store.Get(id)
 	if err != nil {
 		return nil, err

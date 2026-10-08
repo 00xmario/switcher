@@ -2086,11 +2086,19 @@ function moveSettingsGlider() {
   const item = nav?.querySelector('.set-nav-item[aria-current="page"]');
   const glider = nav?.querySelector('.set-nav-glider');
   if (!item || !glider) return;
+  const first = !glider.classList.contains('is-ready');
+  if (first) glider.style.transition = 'none';
   glider.style.setProperty('--x', `${item.offsetLeft}px`);
   glider.style.setProperty('--y', `${item.offsetTop}px`);
   glider.style.setProperty('--w', `${item.offsetWidth}px`);
   glider.style.setProperty('--h', `${item.offsetHeight}px`);
   glider.classList.add('is-ready');
+  // On a narrow window the nav is a scrolling strip; keep the current item in it.
+  if (nav.scrollWidth > nav.clientWidth) nav.scrollTo({ left: Math.max(0, item.offsetLeft - 16), behavior: first ? 'auto' : 'smooth' });
+  if (first) {
+    void glider.offsetWidth;
+    glider.style.transition = '';
+  }
 }
 globalThis.addEventListener?.('resize', () => { if (!settingsPage.hidden) moveSettingsGlider(); });
 
@@ -2547,6 +2555,7 @@ async function renderSettings() {
       await refreshState();
       const step = settingsPage.querySelector('[data-ladder-reset]');
       step?.classList.toggle('is-off', !enabled);
+      step?.closest('.ladder')?.classList.toggle('skips-reset', !enabled);
       if (step?.querySelector('.ladder-state')) step.querySelector('.ladder-state').textContent = enabled ? 'On' : 'Off';
       toast(enabled ? 'Banked resets will be used when an account is out' : 'Banked resets stay manual');
     } catch (err) {

@@ -15,6 +15,9 @@ type identityView struct {
 	AgentID   string
 	Model     string
 	Thread    string // "create", "continue", or "" without a message thread
+	// AccountUUID is the Anthropic account the caller's own login says it
+	// is, from metadata.user_id.
+	AccountUUID string
 }
 
 // identity reads the routing fields Claude Code sends. It never rejects a
@@ -49,6 +52,7 @@ func identity(r *http.Request, body []byte) identityView {
 		SessionID       string `json:"session_id"`
 		ParentSessionID string `json:"parent_session_id"`
 		AgentID         string `json:"agent_id"`
+		AccountUUID     string `json:"account_uuid"`
 	}
 	json.Unmarshal([]byte(top.Metadata.UserID), &user)
 	v.SessionID = strings.ToLower(r.Header.Get("X-Claude-Code-Session-Id"))
@@ -62,5 +66,8 @@ func identity(r *http.Request, body []byte) identityView {
 		v.ParentID = parent
 	}
 	v.AgentID = user.AgentID
+	if validUUID(strings.ToLower(user.AccountUUID)) {
+		v.AccountUUID = strings.ToLower(user.AccountUUID)
+	}
 	return v
 }
