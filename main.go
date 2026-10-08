@@ -272,6 +272,9 @@ func run(port, desktopRelayPort int) {
 	proxyManager.SetAutoUseResetPolicy(func(a store.Account) bool {
 		return a.AutoUseResetEnabled(settingsStore.Load().AutoUseReset)
 	})
+	// Claude Code's login and Claude Desktop conversations move off an
+	// account that runs out of usage, unless the user turned that off.
+	proxyManager.SetClaudeAutoSwitch(settingsStore.AutoSwitchClaude)
 	// The device token exists for the menu bar app as soon as auth is on.
 	if settingsStore.Enabled() {
 		_, _ = settingsStore.EnsureDeviceToken()
@@ -416,6 +419,9 @@ func run(port, desktopRelayPort int) {
 		if account == "" {
 			account = proxyManager.ActiveID("claude")
 		}
+		// An account that ran out of usage hands over to the one with the
+		// most usage left, as it does for this Mac's own Desktop.
+		account = proxyManager.ClaudeRoute(account)
 		if desktopRelay == nil || account == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)

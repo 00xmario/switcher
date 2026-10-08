@@ -45,7 +45,7 @@ export function accountHTML(a, now = Date.now() / 1000) {
   const out = a.exhausted_until > now;
   const plan = PLANS[a.plan] || '';
   const actions = [];
-  if (!a.active && !a.native_switch_available) {
+  if (!a.active) {
     actions.push(`<button type="button" class="button" data-use="${esc(a.id)}">Use</button>`);
   }
   if (credits > 0 && a.reset_credits?.next_id) {
@@ -60,7 +60,7 @@ export function accountHTML(a, now = Date.now() / 1000) {
     </div>
     ${out ? `<p class="out">Out of usage · back in ${duration(a.exhausted_until - now)}</p>` : ''}
     ${windows.length ? `<div class="windows">${windows.map(w => windowHTML(w, now)).join('')}</div>` : '<p class="muted">No usage reported yet</p>'}
-    ${a.native_switch_available && !a.active ? '<p class="muted small">Switch this Claude account on your Mac.</p>' : ''}
+    ${a.native_switch_available && !a.active ? '<p class="muted small">Use also switches Claude Code on your Mac.</p>' : ''}
     ${actions.length ? `<div class="actions">${actions.join('')}</div>` : ''}
   </article>`;
 }
@@ -300,9 +300,10 @@ if (typeof document !== 'undefined') {
     } else if (target.dataset.use) {
       const a = account(target.dataset.use);
       act(target, async () => {
-        await api(`/api/accounts/${encodeURIComponent(target.dataset.use)}/use`, { method: 'POST' });
+        const answer = await api(`/api/accounts/${encodeURIComponent(target.dataset.use)}/use`, { method: 'POST' });
         playMark($('top-mark'));
-        toast(`${PROVIDERS[a?.provider] || 'Switcher'} now uses ${a?.email || 'that account'}`);
+        toast(answer.claude_code_switched ? `Claude and Claude Code now use ${a?.email || 'that account'}`
+          : `${PROVIDERS[a?.provider] || 'Switcher'} now uses ${a?.email || 'that account'}`);
       });
     } else if (target.dataset.reset) {
       const a = account(target.dataset.reset);

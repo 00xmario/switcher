@@ -388,11 +388,28 @@ async function refreshState() {
       data = next;
       render();
       resetFeedback.observe(previous, next.accounts || []);
+      announceAutoSwitch(next);
       renderAddProviderMenu();
     }
   } catch (err) {
     if (!authState.locked) toast('Could not reach Switcher: ' + err.message);
   }
+}
+
+// announceAutoSwitch says once, in this browser, when Switcher moved Claude
+// off an account that ran out of usage.
+function announceAutoSwitch(state) {
+  const event = state?.auto_switch;
+  if (!event?.id || event.at * 1000 < Date.now() - 10 * 60 * 1000) return;
+  try {
+    if (sessionStorage.getItem('switcher-auto-switch') === event.id) return;
+    sessionStorage.setItem('switcher-auto-switch', event.id);
+  } catch { /* still announce */ }
+  const to = (state.accounts || []).find(a => a.id === event.to);
+  const name = to?.email ? to.email : 'another account';
+  toast(event.where === 'desktop'
+    ? `A Claude Desktop conversation ran out of usage and moved to ${name}`
+    : `Claude Code ran out of usage and now uses ${name}`);
 }
 
 function statusOf(account) {
@@ -2058,9 +2075,24 @@ function showSettingsSection(id) {
     else b.removeAttribute('aria-current');
   });
   settingsPage.querySelectorAll('.set-section').forEach(node => { node.hidden = node.dataset.section !== id; });
+  moveSettingsGlider();
   settingsPage.querySelector('.set-content')?.scrollIntoView({ block: 'nearest' });
   if (id === 'about') playMark(settingsPage.querySelector('.set-about-mark'));
 }
+
+// moveSettingsGlider slides the nav highlight to the current section.
+function moveSettingsGlider() {
+  const nav = settingsPage.querySelector('.set-nav');
+  const item = nav?.querySelector('.set-nav-item[aria-current="page"]');
+  const glider = nav?.querySelector('.set-nav-glider');
+  if (!item || !glider) return;
+  glider.style.setProperty('--x', `${item.offsetLeft}px`);
+  glider.style.setProperty('--y', `${item.offsetTop}px`);
+  glider.style.setProperty('--w', `${item.offsetWidth}px`);
+  glider.style.setProperty('--h', `${item.offsetHeight}px`);
+  glider.classList.add('is-ready');
+}
+globalThis.addEventListener?.('resize', () => { if (!settingsPage.hidden) moveSettingsGlider(); });
 
 const settingsTab = document.createElement('button');
 settingsTab.id = 'tab-settings';
@@ -2176,7 +2208,7 @@ function cliSetupRowHTML(client) {
     }
   }
   return `<div class="settings-row cli-setup-row" data-cli-target="${escapeHTML(client.id)}">
-    <div><strong>${escapeHTML(client.name)}</strong><span class="dim"> · ${escapeHTML(summary)}</span>
+    <div><strong>${escapeHTML(client.name)}</strong><span class="dim">${escapeHTML(summary)}</span>
       <details class="cli-setup-details"><summary>${escapeHTML(count)}</summary>
         <p class="cli-setup-evidence">${escapeHTML(detail)}</p>
         ${!codex && !claudeNative ? `<p class="cli-setup-reason">${escapeHTML(readiness)}</p>` : ''}
@@ -2220,35 +2252,39 @@ async function renderSettings() {
           ${menuPreviewHTML(status.menu_usage_bars !== false)}
           <div class="set-rows">
             <div class="settings-row">
-              <div><strong>Usage bars</strong><span class="dim"> · remaining quota at a glance</span></div>
+              <div><strong>Usage bars</strong><span class="dim">Remaining quota at a glance</span></div>
               <label class="switch-wrap"><input type="checkbox" id="menu-usage-bars" aria-label="Show usage bars in the menu bar" ${status.menu_usage_bars !== false ? 'checked' : ''}><span class="switch-visual"></span></label>
             </div>
             <div class="settings-row">
-              <div><strong>Reset alerts</strong><span class="dim"> · when a usage window resets</span></div>
+              <div><strong>Reset alerts</strong><span class="dim">When a usage window resets</span></div>
               <label class="switch-wrap"><input type="checkbox" id="reset-notifications" aria-label="Notify when a usage window is due to reset" ${status.reset_notifications ? 'checked' : ''}><span class="switch-visual"></span></label>
             </div>
           </div>
         </div>
       </div>`,
     switching: `
-      <div class="settings-card">
-        <div class="set-card-head"><h3>When an account runs out</h3><p class="settings-sub">Switcher never switches while the account you picked works. For tools that use Switcher’s proxy, such as Codex, this is what happens when it reports it is out of usage. Claude Code’s own login and Desktop conversations keep the account you picked.</p></div>
+      <div class="settings-card set-ladder-card">
+        <div class="set-card-head"><h3>When an account runs out</h3><p class="settings-sub">Switcher never switches while the account you picked works. When it runs out, this is the order.</p></div>
         ${ladderHTML(status.auto_use_reset)}
+        <div class="settings-row set-row-icon">
+          <span class="set-icon">${LOGOS.claude || ''}</span>
+          <div><strong>Switch Claude automatically</strong><span class="dim">Claude Code’s login and Claude Desktop conversations move to the Claude account with the most usage left.</span></div>
+          <label class="switch-wrap"><input type="checkbox" id="auto-switch-claude" aria-label="Switch Claude automatically when an account runs out of usage" ${status.auto_switch_claude !== false ? 'checked' : ''}><span class="switch-visual"></span></label>
+        </div>
         <div class="settings-row">
-          <div><strong>Use banked resets automatically</strong><span class="dim"> · Codex, when no other paid account is left, before a Free one</span></div>
+          <div><strong>Use banked resets automatically</strong><span class="dim">Codex. Each account can override this in its ⋯ menu.</span></div>
           <label class="switch-wrap"><input type="checkbox" id="auto-use-reset" aria-label="Use a banked reset automatically when an account is out of usage" ${status.auto_use_reset ? 'checked' : ''}><span class="switch-visual"></span></label>
         </div>
-        <p class="settings-sub">Each account can override this in its ⋯ menu.</p>
       </div>
       ${code ? `<div class="settings-card">
         <div class="set-card-head"><h3>Claude Code login</h3><p class="settings-sub">${code.available ? '“Use in Claude Code” switches Claude Code’s own login. Running sessions pick it up within about 30 seconds.' : 'Switching the Claude Code login is unavailable here.'}</p></div>
         <div class="cc-login ${code.condition === 'ready' ? 'is-ok' : ''}">
           <span class="cc-logo">${LOGOS.claude || ''}</span>
-          <div><strong>Claude Code</strong><span>${code.email ? escapeHTML(code.email) : 'No account'}</span></div>
+          <div><strong>Claude Code</strong>${code.email ? `<span class="set-email" tabindex="0" title="Hover to show">${escapeHTML(code.email)}</span>` : '<span>No account</span>'}</div>
           <em class="dr-status ${code.condition === 'ready' ? 'ok' : 'warn'}">${escapeHTML(codeState)}</em>
         </div>
         ${code.message ? `<p class="settings-sub">${escapeHTML(code.message)}</p>` : ''}
-        <p class="settings-sub">Switcher keeps Claude Code’s tokens in sync and backs up its config in ~/.switcher/claude-native/. To recover a revoked login, run /login in Claude Code and import it. Avoid /logout when switching; it can revoke the old token. Claude Desktop’s sign-in is separate.</p>
+        <p class="set-foot">Switcher keeps Claude Code’s tokens in sync and backs up its config in <code>~/.switcher/claude-native/</code>. To recover a revoked login, run /login in Claude Code and import it. Avoid /logout when switching; it can revoke the old token.</p>
       </div>` : ''}`,
     desktop: `<div class="set-module desktop-relay-card" id="desktop-relay-settings" aria-label="Claude Desktop account switching"></div>`,
     sharing: `<div class="set-module remote-card" id="remote-settings" aria-label="Share between Macs"></div>`,
@@ -2256,11 +2292,10 @@ async function renderSettings() {
     tools: `
       <div class="settings-card">
         <div class="set-card-head"><h3>Command line</h3><p class="settings-sub">Switch accounts, sign in, share between Macs and set up Claude Desktop from a terminal, over SSH or for an agent, with <code>--json</code> output.</p></div>
-        <div class="set-terminal" aria-hidden="true"><div class="set-terminal-bar"><i></i><i></i><i></i></div>
-          <pre><b>$</b> switcher status
-<b>$</b> switcher use work@example.com
-<b>$</b> switcher login claude   <span># also over SSH</span></pre></div>
-        <div class="set-card-head"><p class="settings-sub">Run this once to add the <code>switcher</code> command:</p></div>
+        <div class="set-terminal" aria-hidden="true"><div class="set-terminal-bar"><i></i><i></i><i></i><span>switcher</span></div>
+          <pre>${[['switcher status', ''], ['switcher use work@example.com', ''], ['switcher reset codex --yes', ''], ['switcher login claude', '# also over SSH']]
+            .map(([cmd, note], i) => `<span class="t-line" style="--i:${i};--n:${cmd.length}"><b>$</b> <span class="t-type">${cmd}</span>${note ? ` <span class="t-note">${note}</span>` : ''}</span>`).join('')}<span class="t-line t-cursor-line" style="--i:4"><b>$</b> <i class="t-cursor"></i></span></pre></div>
+        <label class="field-label">Run once to add the <code>switcher</code> command</label>
         <div class="copy-row"><input readonly aria-label="Command that installs the switcher command" value="${CLI_INSTALL}"><button type="button" class="copy-btn" data-copy="${CLI_INSTALL}">Copy</button></div>
       </div>
       <details class="settings-card cli-setup-card" id="cli-setup-card">
@@ -2292,14 +2327,14 @@ async function renderSettings() {
         <div class="set-card-head"><h3>Password</h3><p class="settings-sub">Without a password Switcher only accepts connections from this Mac. Set one before using it from other devices.</p></div>
         ${status.auth_enabled ? `
           <div class="settings-row">
-            <div><strong>Password</strong><span class="dim"> · set</span></div>
+            <div><strong>Password</strong><span class="dim">Set</span></div>
             <button id="change-password-btn" type="button">Change</button>
           </div>
-          <div class="settings-row"><div><strong>Active sessions</strong><span class="dim"> · ${status.sessions}</span></div>
+          <div class="settings-row"><div><strong>Active sessions</strong><span class="dim">${status.sessions}</span></div>
             <button id="logout-all" type="button">Log out everywhere</button></div>
-          <div class="settings-row"><div><strong>Log out this browser</strong><span class="dim"> · ends this session only</span></div>
+          <div class="settings-row"><div><strong>Log out this browser</strong><span class="dim">Ends this session only</span></div>
             <button id="logout-here" type="button">Log out</button></div>
-          <div class="settings-row"><div><strong>Disable authentication</strong><span class="dim"> · turns everything off</span></div>
+          <div class="settings-row"><div><strong>Disable authentication</strong><span class="dim">Turns everything off</span></div>
             <button id="disable-auth" type="button" class="danger">Disable</button></div>
         ` : `
           <form id="set-password-form">
@@ -2311,10 +2346,10 @@ async function renderSettings() {
       <div class="settings-card">
         <div class="set-card-head"><h3>Network</h3><p class="settings-sub">The LAN listener uses TLS with a self-signed certificate. Devices on your network can use your subscriptions through it, so only enable it on networks you trust.</p></div>
         <div class="settings-row">
-          <div><strong>Bind LAN</strong><span class="dim"> · ${lanStateText(status)}</span></div>
+          <div><strong>Bind LAN</strong><span class="dim">${lanStateText(status)}</span></div>
           <label class="switch-wrap"><input type="checkbox" id="bind-lan" ${status.bind_lan ? 'checked' : ''} ${status.auth_enabled && status.password_set ? '' : 'disabled'}><span class="switch-visual"></span></label>
         </div>
-        <div class="settings-row"><div><strong>Device token</strong><span class="dim"> · menu bar app authenticates with it</span></div>
+        <div class="settings-row"><div><strong>Device token</strong><span class="dim">The menu bar app signs in with it</span></div>
           <button id="rotate-token" type="button">Rotate</button></div>
       </div>`,
     about: `
@@ -2326,7 +2361,8 @@ async function renderSettings() {
           ? `<div class="update-banner set-update"><span>Version ${escapeHTML(update.latest || '')} is available.</span>
               <button type="button" class="update-install primary" data-act="install-update" ${updateRunning ? 'disabled' : ''}>${updateRunning ? 'Installing…' : 'Install &amp; restart'}</button></div>`
           : `<button type="button" id="check-updates">Check for updates</button>`}
-        <p class="settings-sub">One harness, all your AI accounts. Unofficial; not affiliated with Anthropic, OpenAI, xAI, Google or GitHub.</p>
+        <p class="set-about-tag">One harness, all your AI accounts.</p>
+        <p class="set-foot">Unofficial; not affiliated with Anthropic, OpenAI, xAI, Google or GitHub.</p>
         <div class="set-links">
           <a href="https://github.com/00xmario/switcher" target="_blank" rel="noopener noreferrer">GitHub</a>
           <a href="https://github.com/00xmario/switcher/releases" target="_blank" rel="noopener noreferrer">Release notes</a>
@@ -2338,13 +2374,14 @@ async function renderSettings() {
     <div class="set-layout">
       ${navHTML(section)}
       <div class="set-content">
-        ${SECTIONS.map(s => `<section class="set-section" data-section="${s.id}" aria-labelledby="set-title-${s.id}" ${s.id === section ? '' : 'hidden'}>
+        ${SECTIONS.map(s => `<section class="set-section" data-section="${s.id}" aria-labelledby="set-title-${s.id}" style="--tone:${s.tone}" ${s.id === section ? '' : 'hidden'}>
           ${sectionHeadHTML(s)}
           <div class="set-body">${bodies[s.id]}</div>
         </section>`).join('')}
       </div>
     </div>`;
 
+  requestAnimationFrame(moveSettingsGlider);
   settingsPage.querySelector('.set-nav').addEventListener('click', event => {
     const item = event.target.closest('[data-section]');
     if (item) showSettingsSection(item.dataset.section);
@@ -2373,7 +2410,11 @@ async function renderSettings() {
   settingsPage.querySelectorAll('.copy-btn').forEach(b => b.addEventListener('click', () => {
     const text = 'copyHubKey' in b.dataset ? data.hub_management_key : b.dataset.copy;
     if (!text) { toast('Nothing to copy here'); return; }
-    navigator.clipboard?.writeText(text).then(() => toast('Copied'), () => toast('Could not copy'));
+    navigator.clipboard?.writeText(text).then(() => {
+      b.classList.add('is-copied');
+      b.textContent = 'Copied';
+      setTimeout(() => { b.classList.remove('is-copied'); b.textContent = 'Copy'; }, 1400);
+    }, () => toast('Could not copy'));
   }));
   appearance.mount(settingsPage.querySelector('#appearance-settings'));
   settingsPage.desktopRelay.mountSettings(settingsPage.querySelector('#desktop-relay-settings'));
@@ -2513,6 +2554,24 @@ async function renderSettings() {
       toast(err.message);
     } finally {
       autoUseReset.disabled = false;
+    }
+  });
+
+  const autoSwitchClaude = settingsPage.querySelector('#auto-switch-claude');
+  autoSwitchClaude?.addEventListener('change', async () => {
+    const enabled = autoSwitchClaude.checked;
+    autoSwitchClaude.disabled = true;
+    try {
+      await api('/api/settings', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_switch_claude: enabled }),
+      });
+      toast(enabled ? 'Claude switches by itself when an account runs out' : 'Claude stays on the account you picked');
+    } catch (err) {
+      autoSwitchClaude.checked = !enabled;
+      toast(err.message);
+    } finally {
+      autoSwitchClaude.disabled = false;
     }
   });
 

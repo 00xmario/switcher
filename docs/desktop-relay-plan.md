@@ -83,7 +83,10 @@ eligible for selected credentials. Preserve raw query and body bytes, model,
 unknown fields, thinking signatures, deferred tools, tool references, images,
 and end-to-end header values. Strip hop-by-hop and proxy credentials. Selected
 OAuth reaches only the fixed verified HTTPS Anthropic origin, without redirects
-or implicit fallback to another account, model, or API key.
+or implicit fallback to another account, model, or API key. (Later, v1.11:
+with "Switch Claude automatically" on, a request refused because its account
+ran out of usage moves its conversation to another Switcher account; see the
+module's "Out of usage".)
 
 Resolve session identity from `X-Claude-Code-Session-Id` and the JSON string in
 `metadata.user_id`. Require matching, nonzero UUIDs when both are present.

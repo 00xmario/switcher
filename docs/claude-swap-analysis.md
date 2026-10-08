@@ -211,6 +211,9 @@ not proof that an HTTP proxy transparently switches every native client.
 - Parallel-session launching, directory mappings, account export/import,
   upstream TUI/theme/launchd machinery, and proactive threshold autoswitch are
   explained above but are not folded into this default-login switch path.
+  Switcher later added a narrower automatic switch (v1.11): only once usage
+  shows the account at its session or weekly limit, through this same verified
+  switch path, with a ten-minute cooldown per account.
 
 ## Integration verification
 

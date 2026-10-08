@@ -39,7 +39,9 @@ have not been conclusively verified together.
 For a picked conversation the relay sends the request as Claude Code logged in
 to that account would (token, OAuth beta, `account_uuid`). It does not enforce
 local concurrency limits, request policies or metadata checks on the request
-path; errors and rate limits come from Anthropic. Metadata lookup failures leave a
+path; errors and rate limits come from Anthropic, except that a conversation
+whose account runs out of usage moves to the Switcher account with the most usage
+left (see the module's "Out of usage"). Metadata lookup failures leave a
 request on the caller's own credential rather than failing it.
 
 ## Guides

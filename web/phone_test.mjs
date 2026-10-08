@@ -12,7 +12,7 @@ test('a window shows what is left and when it resets', () => {
   assert.equal(duration(30), '1m');
 });
 
-test('an account offers a banked reset and switching only where the phone may', () => {
+test('an account offers a banked reset, and switching unless it is in use', () => {
   const codex = { id: 'codex-a', provider: 'codex', email: 'a@example.com', plan: 'prolite', active: true,
     exhausted_until: now + 3600, usage: { windows: [{ label: 'Weekly', used_percent: 100 }] },
     reset_credits: { count: 2, next_id: 'credit_1' } };
@@ -22,8 +22,9 @@ test('an account offers a banked reset and switching only where the phone may', 
   assert.match(html, /Out of usage · back in 1h 0m/);
   assert.doesNotMatch(html, /data-use=/);
   const claude = { id: 'claude-b', provider: 'claude', email: 'b@example.com', active: false, native_switch_available: true };
-  assert.doesNotMatch(accountHTML(claude, now), /data-use=/);
-  assert.match(accountHTML({ ...claude, native_switch_available: false }, now), /data-use="claude-b"/);
+  assert.match(accountHTML(claude, now), /data-use="claude-b"/);
+  assert.match(accountHTML(claude, now), /also switches Claude Code/);
+  assert.doesNotMatch(accountHTML({ ...claude, active: true }, now), /data-use=/);
 });
 
 test('account text is escaped', () => {

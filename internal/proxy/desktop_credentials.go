@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"time"
 
 	"switcher/internal/claudecode"
 	"switcher/internal/desktoprelay"
@@ -23,6 +24,62 @@ func NewDesktopCredentialSource(manager *Manager) *DesktopCredentialSource {
 }
 
 var _ desktoprelay.CredentialSource = (*DesktopCredentialSource)(nil)
+var _ desktoprelay.Failover = (*DesktopCredentialSource)(nil)
+
+// OutOfUsage reports whether Anthropic refused a request because the selected
+// account ran out of usage, as the proxy decides it for its own requests, and
+// parks the account until its reset. rejectedUntil is the reset Anthropic's
+// own headers gave, if they said the account is out.
+func (s *DesktopCredentialSource) OutOfUsage(ctx context.Context, id string, status int, body []byte, rejectedUntil time.Time) bool {
+	if s == nil || s.manager == nil || s.manager.store == nil {
+		return false
+	}
+	a, err := s.manager.store.Get(id)
+	if err != nil || a.Provider != "claude" {
+		return false
+	}
+	prov, ok := s.manager.providers["claude"]
+	if !ok {
+		return false
+	}
+	until, out := prov.ParseRateLimit(ctx, a, status, body)
+	if rejectedUntil.After(until) {
+		until, out = rejectedUntil, true
+	}
+	if !out {
+		return false
+	}
+	if err := s.manager.markExhausted(id, until); err != nil {
+		return false
+	}
+	return true
+}
+
+// Takeover names the Claude account with the most usage left, other than
+// exclude, while "Switch Claude automatically" is on. It changes nothing: the
+// relay moves only the conversation that ran out.
+func (s *DesktopCredentialSource) Takeover(ctx context.Context, exclude string) string {
+	if s == nil || s.manager == nil || !s.manager.claudeAutoOn() {
+		return ""
+	}
+	s.manager.mu.Lock()
+	defer s.manager.mu.Unlock()
+	next, err := s.manager.takeoverLocked("claude", exclude, false)
+	if err != nil {
+		return ""
+	}
+	return next
+}
+
+// TookOver records a Desktop conversation's move for the dashboard.
+func (s *DesktopCredentialSource) TookOver(from, to string) {
+	if s == nil || s.manager == nil {
+		return
+	}
+	s.manager.mu.Lock()
+	defer s.manager.mu.Unlock()
+	s.manager.recordAutoSwitchLocked("claude", "desktop", from, to)
+}
 
 func (s *DesktopCredentialSource) Prepare(ctx context.Context, id string) (desktoprelay.Credential, error) {
 	return s.prepare(ctx, id, nil)

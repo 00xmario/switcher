@@ -6,8 +6,10 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -49,7 +51,7 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 	ctx := r.Context()
 	message := r.Method == http.MethodPost && r.URL.Path == "/v1/messages"
 	if !message && !(r.Method == http.MethodPost && r.URL.Path == "/v1/messages/count_tokens") {
-		m.send(w, r, r.URL.Path, body, "", run.transport, nil)
+		m.send(w, r, r.URL.Path, body, "", run.transport, nil, nil)
 		return
 	}
 	view := identity(r, body)
@@ -81,7 +83,72 @@ func (m *Manager) forward(run *runtime, scope string, w http.ResponseWriter, r *
 			return
 		}
 	}
-	m.send(w, r, r.URL.Path, body, task.AccountID, run.transport, record)
+	var limit limitFunc
+	if message {
+		limit = m.takeover(ctx, task, view.Thread)
+	}
+	m.send(w, r, r.URL.Path, body, task.AccountID, run.transport, record, limit)
+}
+
+// limitFunc decides what happens to a request Anthropic refused with 429:
+// next is the account to send it to again; handled false streams the refusal
+// to Desktop as it is. An empty next with handled true means the thread lives
+// on the old account and Desktop must resend the full conversation.
+type limitFunc func(account string, resp *http.Response, body []byte) (next string, handled bool)
+
+// takeover moves a conversation whose account ran out of usage, Desktop's
+// own login included, to the Switcher account with the most usage left. Only
+// a refusal that means the account is out counts: Anthropic's limit headers
+// say so for any login, and for a Switcher account its usage is checked too.
+// Other rate limits pass through as Anthropic sent them.
+func (m *Manager) takeover(ctx context.Context, task Session, thread string) limitFunc {
+	failover, ok := m.cfg.Source.(Failover)
+	if !ok || task.SessionID == "" {
+		return nil
+	}
+	return func(account string, resp *http.Response, body []byte) (string, bool) {
+		until, rejected := usageRejected(resp.Header, time.Now())
+		out := rejected
+		if account != "" {
+			out = failover.OutOfUsage(ctx, account, resp.StatusCode, body, until)
+		}
+		if !out {
+			return "", false
+		}
+		next := failover.Takeover(ctx, account)
+		if next == "" || next == account || m.moveTo(task, next, thread) != nil {
+			return "", false
+		}
+		failover.TookOver(account, next)
+		log.Printf("desktop relay: a conversation's account ran out of usage; it moved to the account with the most usage left")
+		if thread == "continue" {
+			return "", true
+		}
+		return next, true
+	}
+}
+
+// usageRejected reads Anthropic's unified limit headers: a five-hour or
+// weekly window marked rejected means the login is out of usage until the
+// latest of their resets.
+func usageRejected(h http.Header, now time.Time) (time.Time, bool) {
+	var latest time.Time
+	rejected := false
+	for _, window := range []string{"5h", "7d"} {
+		if !strings.EqualFold(strings.TrimSpace(h.Get("Anthropic-Ratelimit-Unified-"+window+"-Status")), "rejected") {
+			continue
+		}
+		rejected = true
+		if seconds, err := strconv.ParseInt(strings.TrimSpace(h.Get("Anthropic-Ratelimit-Unified-"+window+"-Reset")), 10, 64); err == nil {
+			if t := time.Unix(seconds, 0); t.After(now) && t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	if rejected && latest.IsZero() {
+		latest = now.Add(time.Hour)
+	}
+	return latest, rejected
 }
 
 // ServeAccount relays one Anthropic API request for a paired Switcher with
@@ -93,16 +160,43 @@ func (m *Manager) ServeAccount(w http.ResponseWriter, r *http.Request, path, acc
 		panic(http.ErrAbortHandler)
 	}
 	m.hostOnce.Do(func() { m.hostTransport = m.transport() })
-	m.send(w, r, path, body, account, m.hostTransport, nil)
+	var limit limitFunc
+	if path == "/v1/messages" && identity(r, body).Thread != "continue" {
+		limit = m.hostTakeover(r.Context())
+	}
+	m.send(w, r, path, body, account, m.hostTransport, nil, limit)
+}
+
+// hostTakeover sends a paired Mac's request again on the account with the most
+// usage left when its account ran out. The paired Mac keeps its own
+// conversation picks; ClaudeRoute steers its next requests on this host.
+func (m *Manager) hostTakeover(ctx context.Context) limitFunc {
+	failover, ok := m.cfg.Source.(Failover)
+	if !ok {
+		return nil
+	}
+	return func(account string, resp *http.Response, body []byte) (string, bool) {
+		until, rejected := usageRejected(resp.Header, time.Now())
+		if account == "" || !failover.OutOfUsage(ctx, account, resp.StatusCode, body, until) && !rejected {
+			return "", false
+		}
+		next := failover.Takeover(ctx, account)
+		if next == "" || next == account {
+			return "", false
+		}
+		failover.TookOver(account, next)
+		return next, true
+	}
 }
 
 // send forwards one request to api.anthropic.com, with account's credential or,
 // for an empty account, the caller's own.
-func (m *Manager) send(w http.ResponseWriter, r *http.Request, path string, body []byte, account string, transport http.RoundTripper, record func(Credential, int)) {
+func (m *Manager) send(w http.ResponseWriter, r *http.Request, path string, body []byte, account string, transport http.RoundTripper, record func(Credential, int), limit limitFunc) {
 	ctx := r.Context()
 	if record == nil {
 		record = func(Credential, int) {}
 	}
+	original := body
 	var credential Credential
 	if account != "" {
 		var err error
@@ -161,6 +255,29 @@ func (m *Manager) send(w http.ResponseWriter, r *http.Request, path string, body
 			return
 		}
 		credential = fresh
+	}
+	// An account that ran out of usage hands the request to another one
+	// before Desktop sees any of the refusal.
+	if limit != nil && resp.StatusCode == http.StatusTooManyRequests {
+		const most = 64 << 10
+		head, _ := io.ReadAll(io.LimitReader(resp.Body, most))
+		rest := resp.Body
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(head), rest), rest}
+		if len(head) < most {
+			if next, handled := limit(account, resp, head); handled {
+				resp.Body.Close()
+				record(credential, resp.StatusCode)
+				if next == "" {
+					relayError(w, http.StatusBadRequest, "invalid_request_error", "This conversation moved to another account; resend the full conversation.", "thread_unsupported_request")
+					return
+				}
+				m.send(w, r, path, original, next, transport, record, nil)
+				return
+			}
+		}
 	}
 	record(credential, resp.StatusCode)
 	stream(w, resp)

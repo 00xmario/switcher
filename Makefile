@@ -47,6 +47,7 @@ verify:
 	node web/phone_test.mjs
 	node --check web/phone-settings.js
 	node web/phone-settings_test.mjs
+	node web/qr_test.mjs
 	cd cmd/switcher-tailnet && test -z "$$(gofmt -l .)" && go vet . && go test . && go build -o /dev/null .
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 		swiftc -parse-as-library -D SWITCHER_LAYOUT_TEST build/macos/menubar.swift \

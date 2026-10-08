@@ -2,6 +2,7 @@ package phone
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,17 @@ const (
 	pairCookie    = "__Host-switcher_pair"
 	csrfHeader    = "X-Switcher-CSRF"
 )
+
+type approvedKey struct{}
+
+// ApprovedPhone reports the approved phone a request to Switcher's API comes
+// from. Only the phone listener sets it, once the phone's session, CSRF token
+// and origin checked out; it lets such a phone switch Claude Code's login,
+// which is otherwise kept to this Mac.
+func ApprovedPhone(ctx context.Context) (string, bool) {
+	name, ok := ctx.Value(approvedKey{}).(string)
+	return name, ok
+}
 
 // innerAddr marks requests the phone listener makes to Switcher's API: they
 // never count as coming from this Mac, so local-only routes refuse them.
@@ -156,6 +168,10 @@ func (h *Handler) authenticated(w http.ResponseWriter, r *http.Request, id Ident
 			return
 		}
 	}
+	// Requests to Switcher's API carry the approved phone in their context.
+	// Only this handler sets it, after the checks above, and a context never
+	// crosses the network.
+	r = r.WithContext(context.WithValue(r.Context(), approvedKey{}, device.Name))
 	path, method := r.URL.Path, r.Method
 	switch {
 	case path == "/api/state" && method == http.MethodGet:
@@ -299,6 +315,9 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, method, path s
 		if v, ok := parsed[key]; ok {
 			out[key] = v
 		}
+	}
+	if native, ok := parsed["native"].(map[string]any); ok {
+		out["claude_code_switched"] = native["changed"] == true
 	}
 	if status >= 400 && out["error"] == nil {
 		out["error"] = "Switcher refused that"

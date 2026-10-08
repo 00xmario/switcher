@@ -11,8 +11,10 @@ import (
 	"switcher/internal/store"
 )
 
-// ActivateForClient is the explicit UI switch path. Automatic proxy failover
-// continues to select only its route, not mutate a machine's native login.
+// ActivateForClient switches an account for the proxy and, for Claude, Claude
+// Code's own login. The user's switch and the automatic switch after an
+// account runs out of usage (AutoSwitchNative) both come here; proxy failover
+// on a refused request still selects only its route.
 func (m *Manager) ActivateForClient(ctx context.Context, id string) (*claudecode.SwitchResult, error) {
 	m.nativeActivation.Lock()
 	defer m.nativeActivation.Unlock()

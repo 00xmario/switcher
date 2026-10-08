@@ -56,13 +56,18 @@ else, including model, tools, thinking and unknown fields, is passed through.
 Other traffic keeps the caller's credentials, and other hosts are tunneled
 unchanged.
 
-Errors and rate limits are Anthropic's own, with three exceptions:
+Errors and rate limits are Anthropic's own, with four exceptions:
 
 - If the picked account's token is rejected and cannot be refreshed, the relay
   answers 503 `credential_unavailable` so Claude Code does not blame its own
   login. Re-login that account in Switcher.
-- A removed account answers 404 `account_not_found`. The relay never falls back
-  to another account.
+- A removed account answers 404 `account_not_found`. A credential failure never
+  falls back to another account.
+- When a conversation's account runs out of usage, Desktop's own login
+  included, and **Switch Claude automatically** is on, the relay moves the
+  conversation to the Switcher account with the most usage left and sends the
+  request again before Desktop sees the refusal. See
+  [Out of usage](desktop-relay-module.md#out-of-usage).
 - A message thread continued right after a switch belongs to the previous
   account. The relay answers 400 `thread_unsupported_request`, and Claude Code
   resends the full conversation without a thread.

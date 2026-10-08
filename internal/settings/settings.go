@@ -35,8 +35,11 @@ type Settings struct {
 	CompactAccounts    bool   `json:"compact_accounts,omitempty"`
 	MergeAccounts      bool   `json:"merge_accounts,omitempty"` // one card per quota window with every account's bar
 	AutoUseReset       bool   `json:"auto_use_reset,omitempty"` // spend a banked reset when an account runs out
-	CSRFToken          string `json:"csrf_token,omitempty"`
-	UpdatedAt          int64  `json:"updated_at,omitempty"`
+	// AutoSwitchClaude moves Claude Code's login and Claude Desktop
+	// conversations off an account that runs out of usage. nil means on.
+	AutoSwitchClaude *bool  `json:"auto_switch_claude,omitempty"`
+	CSRFToken        string `json:"csrf_token,omitempty"`
+	UpdatedAt        int64  `json:"updated_at,omitempty"`
 }
 
 // Store owns settings.json plus the session and device-token files.
@@ -200,5 +203,12 @@ func (s *Store) Enabled() bool {
 // Existing installs have no setting, so the bars default to on.
 func (s *Store) MenuUsageBars() bool {
 	value := s.Load().MenuUsageBars
+	return value == nil || *value
+}
+
+// AutoSwitchClaude reports whether Claude moves to another account by itself
+// when one runs out of usage. It is on unless turned off.
+func (s *Store) AutoSwitchClaude() bool {
+	value := s.Load().AutoSwitchClaude
 	return value == nil || *value
 }

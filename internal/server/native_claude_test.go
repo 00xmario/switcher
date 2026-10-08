@@ -39,7 +39,11 @@ func (p *nativeClaudeFixture) SyncNative(ctx context.Context, a *store.Account) 
 	return p.bridge.Synchronize(ctx, a)
 }
 
-func TestNativeClaudeActivationAuthLocalityAndActualCredentialWrite(t *testing.T) {
+// nativeClaudeFixtureAPI builds an API whose Claude provider switches a
+// native login in a temporary home, with accounts claude-a (active) and
+// claude-b, and a password-protected settings store.
+func nativeClaudeFixtureAPI(t *testing.T) (*API, *proxy.Manager, claudecode.Paths, *settings.Store, string, *nativeClaudeFixture) {
+	t.Helper()
 	home, data := t.TempDir(), t.TempDir()
 	t.Setenv("HOME", home)
 	codexHome := t.TempDir()
@@ -88,6 +92,11 @@ func TestNativeClaudeActivationAuthLocalityAndActualCredentialWrite(t *testing.T
 	}
 	api := &API{Store: st, Proxy: manager, Settings: prefs, Providers: map[string]provider.Provider{"claude": p},
 		CodexConfigPath: filepath.Join(t.TempDir(), "config.toml")}
+	return api, manager, paths, prefs, session, p
+}
+
+func TestNativeClaudeActivationAuthLocalityAndActualCredentialWrite(t *testing.T) {
+	api, manager, paths, prefs, session, p := nativeClaudeFixtureAPI(t)
 	mux := http.NewServeMux()
 	api.Register(mux)
 	gate := (&AuthGate{Store: prefs}).Wrap(mux)

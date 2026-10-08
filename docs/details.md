@@ -43,6 +43,15 @@ required; OpenCode Go uses its own API key.
 - **Manual switching, only from you**: switching never happens on its own
   as long as the active account works. Use the web UI or the menu bar
   dropdown.
+- **Claude switches by itself when an account runs out**: with **Switch
+  Claude automatically** on (the default; Settings → Switching or
+  `switcher settings set auto_switch_claude=false`), Claude Code's login moves
+  to the Claude account with the most usage left once a usage poll shows its
+  session or weekly window at the limit, and a Claude Desktop conversation
+  moves when Anthropic refuses one of its requests for that reason. Usage is
+  polled every few minutes, so Claude Code may meet the limit once before the
+  switch; running sessions pick up the new login within about 30 seconds.
+  Each account is switched away from at most once per ten minutes.
 - **Automatic failover on exhaustion**: when the active account reports it
   is out of usage (HTTP 429 `usage_limit_reached`), Switcher marks it with
   the upstream reset time and, if another account is usable, retries your
@@ -126,7 +135,8 @@ required; OpenCode Go uses its own API key.
   started. The Switcher mark, the default option, keeps the account Desktop is
   signed in to. A local
   relay swaps only the OAuth token (plus the matching OAuth beta and
-  `account_uuid`); errors and rate limits are Anthropic's own. **Disconnect**
+  `account_uuid`); errors and rate limits are Anthropic's own, except that a
+  conversation whose account runs out of usage moves to another account. **Disconnect**
   restores your previous settings. The relay port is `8789`, configurable with
   `--desktop-relay-port`. See [setup](desktop-relay-usage.md), the
   [module](desktop-relay-module.md) and the
@@ -261,6 +271,8 @@ environment; a terminal-only override needs the CLI command. The first
 | You click *Use in Claude Code* locally | verifies and writes the native login, then commits the matching proxy selection; failure preserves or rolls back the original login |
 | No account was ever activated | the first usable account (by email order) serves traffic |
 | Active proxy account returns 429 `usage_limit_reached` | mark it exhausted until the upstream reset time; select another usable proxy account and retry the request transparently; native Claude Code selection stays as it was |
+| Claude Code's account reaches its session or weekly limit | with Switch Claude automatically on, switch Claude Code's login to the Claude account with the most usage left, through the same verified path as *Use in Claude Code*; at most once per account per ten minutes |
+| A Claude Desktop conversation's account runs out of usage | with Switch Claude automatically on, move that conversation to the Claude account with the most usage left and resend the request before Desktop sees the refusal |
 | Every account is out of usage | no rotation; the upstream error is passed through |
 | A 429 that is *not* a usage-limit error (e.g. burst limit) | passed through, nothing marked, no switch |
 | Stored token expired | refresh before use; native Claude tokens are first synchronized with the live store |

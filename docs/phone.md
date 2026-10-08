@@ -4,7 +4,7 @@ Open Switcher on your phone wherever you are. You can:
 
 - see every account's usage;
 - refresh it;
-- switch Codex and other proxy accounts;
+- switch accounts, Claude included;
 - spend a banked Codex reset.
 
 The phone reaches your Mac over Tailscale only, at an address with a real
@@ -83,7 +83,8 @@ actions:
 
 - read accounts and usage;
 - refresh usage;
-- use an account;
+- use an account, including a Claude account, which also switches Claude
+  Code's login on the Mac;
 - spend a banked reset;
 - sign itself out.
 
@@ -93,12 +94,12 @@ Everything else stays on the Mac:
 - sign-ins and keys, including the T3 Code hub key;
 - Claude Desktop and sharing.
 
-Switching a Claude account that also switches Claude Code's login stays on
-the Mac too.
-
 The phone listener has its own router that admits only the API requests
 behind these actions. Those requests never count as coming from this Mac, so
-anything Switcher keeps local refuses them as well.
+anything Switcher keeps local refuses them as well. The one exception is
+switching Claude Code's login: Switcher allows it for a request that carries an
+approved phone. Only the phone listener can mark a request that way, after the
+session, CSRF and origin checks, and the mark never crosses the network.
 
 ## Troubleshooting
 

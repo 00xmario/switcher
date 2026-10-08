@@ -4,7 +4,8 @@
 tab use a selected Switcher account per conversation. It replaces only the
 bearer credential. Everything else is passed through unchanged, and every error
 or rate limit the client sees comes from Anthropic, except the few local cases
-listed under [Local responses](#local-responses).
+listed under [Local responses](#local-responses) and the move of a conversation
+whose account ran out of usage ([Out of usage](#out-of-usage)).
 
 ## How a request flows
 
@@ -65,6 +66,34 @@ conversation shows up as one entry. Lookup failures are ignored.
 | Relay profile revoked while a tunnel is open | 403 |
 
 A credential failure never falls back to the caller's account.
+
+## Out of usage
+
+With **Switch Claude automatically** on (the default), a conversation whose
+account runs out of usage moves to the Switcher account with the most usage
+left. `send` handles it before any byte reaches Desktop:
+
+1. Anthropic answers a Messages request with 429. The relay reads at most
+   64 KiB of the refusal; a longer body streams to Desktop unchanged.
+2. The refusal counts as out of usage when Anthropic's
+   `anthropic-ratelimit-unified-5h-status` or `-7d-status` header says
+   `rejected`. For a Switcher account, `proxy.DesktopCredentialSource.OutOfUsage`
+   also checks its usage the way the proxy does (`ParseRateLimit`) and parks
+   it until its reset. Burst limits and other 429s pass through as before.
+3. `Takeover` names the Claude account with the most session and weekly usage
+   left. With none, or with the setting off, the refusal passes through.
+4. The conversation is bound to that account (`setConversation`), or the
+   session alone when its conversation is unknown, so later requests and
+   subagents follow and the Settings list shows the new account.
+5. The request is sent again with the new account's credential from its
+   original bytes. A continued thread lives on the old account, so the relay
+   answers 400 `thread_unsupported_request` instead and Claude Code resends the
+   full conversation, which then goes to the new account.
+
+This applies to Desktop's own login too, when Anthropic's headers say it is
+out, and it never changes Desktop's own sign-in, another conversation, Claude
+Code's native login or the proxy's selection. Requests forwarded to a
+connected Switcher host keep the host's handling.
 
 ## Credentials
 

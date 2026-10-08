@@ -226,7 +226,7 @@ export function createDesktopRelay({ api, getContext, getAccounts = () => [], co
     const shown = showAll ? entries : entries.slice(0, VISIBLE);
     return `<div class="settings-card dr-conversations">
       <div class="set-card-head"><h3>Per-conversation accounts</h3>
-      <p class="settings-sub">Every conversation goes through Switcher with Desktop's own login (${switcherMark({ size: 14 })}) until you pick an account for it. A pick applies to that conversation's new messages; running replies finish where they started.</p></div>
+      <p class="settings-sub">Each conversation uses Desktop's own login (${switcherMark({ size: 14 })}) until you pick an account. A pick applies to its next messages; running replies finish where they started.</p></div>
       ${entries.length ? `<ul class="dr-list">${shown.map(rowHTML).join('')}</ul>` : '<p class="settings-sub">Conversations appear here after you send a message in Claude Desktop.</p>'}
       ${entries.length > VISIBLE ? `<button type="button" class="quiet" data-dr-action="toggle-all">${showAll ? 'Show fewer' : `Show all ${entries.length}`}</button>` : ''}
     </div>`;
@@ -264,10 +264,10 @@ export function createDesktopRelay({ api, getContext, getAccounts = () => [], co
       ? 'Desktop’s requests go through Switcher. Conversations use Desktop’s own login until you pick an account below; switching never needs a restart.'
       : configured ? 'Switcher is set up for Desktop, but its relay is stopped. Start it under Advanced to resume.'
         : 'Optional. Connect once and Desktop’s requests go through Switcher, so you can pick an account per conversation. Desktop stays signed in as it is.';
-    return `<div class="settings-card dr-hero">
+    return `<div class="settings-card set-hero dr-hero">
+        <div class="set-hero-status"><span class="dr-status ${connected() ? 'ok' : 'warn'}">${state}</span></div>
         ${flowHTML()}
-        <div class="dr-settings-head"><span class="dr-status ${connected() ? 'ok' : 'warn'}">${state}</span></div>
-        <p class="settings-sub dr-lead">${lead}</p>
+        <p class="set-hero-lead">${lead}</p>
         ${message ? `<p class="dr-message ${failed ? 'error' : ''}" role="${failed ? 'alert' : 'status'}">${escape(message)}</p>` : ''}
         <div class="dr-actions">
           ${!configured || setup.condition === 'changed' ? `<button type="button" class="primary" data-dr-action="configure" ${disabled ? 'disabled' : ''}>${doing('configure') ? 'Connecting…' : 'Connect Claude Desktop'}</button>` : ''}
@@ -280,7 +280,7 @@ export function createDesktopRelay({ api, getContext, getAccounts = () => [], co
         <summary>Advanced</summary>
         <div class="dr-advanced-body">
           <p class="settings-sub">Connecting adds a local proxy to <code>${escape(setup.settings_path || '~/.claude/settings.json')}</code> and keeps a backup. Restart Desktop once after connecting or disconnecting.</p>
-          <div class="settings-row"><div><strong>Relay</strong><span class="dim"> · ${status.listening ? escape(status.address || 'listening') : 'stopped'}${count(status.in_flight) ? ` · ${count(status.in_flight)} in flight` : ''}</span></div>
+          <div class="settings-row"><div><strong>Relay</strong><span class="dim">${status.listening ? escape(status.address || 'listening') : 'stopped'}${count(status.in_flight) ? ` · ${count(status.in_flight)} in flight` : ''}</span></div>
             ${status.listening
               ? `<button type="button" data-dr-action="stop" ${disabled || configured ? 'disabled' : ''} ${configured ? 'title="Disconnect Claude Desktop first"' : ''}>${doing('stop') ? 'Stopping…' : 'Stop'}</button>`
               : `<button type="button" data-dr-action="start" ${disabled ? 'disabled' : ''}>${doing('start') ? 'Starting…' : 'Start'}</button>`}

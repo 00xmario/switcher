@@ -595,6 +595,9 @@ func (a *API) handleState(w http.ResponseWriter, r *http.Request) {
 	if native, ok := a.Providers["claude"].(provider.NativeLoginProvider); ok {
 		state["claude_code"] = native.NativeStatus()
 	}
+	if event := a.Proxy.LastAutoSwitch(); event != nil {
+		state["auto_switch"] = event
+	}
 	for k, v := range a.LocalStateFields(r) {
 		state[k] = v
 	}
@@ -769,6 +772,7 @@ func (a *API) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		"compact_accounts":    st.CompactAccounts,
 		"merge_accounts":      st.MergeAccounts,
 		"auto_use_reset":      st.AutoUseReset,
+		"auto_switch_claude":  a.Settings.AutoSwitchClaude(),
 		"bind_lan":            st.BindLAN,
 		"lan_active":          LANListenerActive(),
 		"tls":                 st.TLS,
@@ -971,6 +975,7 @@ func (a *API) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"compact_accounts":    st.CompactAccounts,
 		"merge_accounts":      st.MergeAccounts,
 		"auto_use_reset":      st.AutoUseReset,
+		"auto_switch_claude":  a.Settings.AutoSwitchClaude(),
 	})
 }
 
@@ -986,6 +991,7 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		CompactAccounts    *bool `json:"compact_accounts"`
 		MergeAccounts      *bool `json:"merge_accounts"`
 		AutoUseReset       *bool `json:"auto_use_reset"`
+		AutoSwitchClaude   *bool `json:"auto_switch_claude"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -1025,6 +1031,9 @@ func (a *API) handleSettingsPatch(w http.ResponseWriter, r *http.Request) {
 		// so it never restarts the listeners.
 		if body.AutoUseReset != nil {
 			st.AutoUseReset = *body.AutoUseReset
+		}
+		if body.AutoSwitchClaude != nil {
+			st.AutoSwitchClaude = body.AutoSwitchClaude
 		}
 		return nil
 	})
@@ -1166,8 +1175,10 @@ func (a *API) handleActivate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "active": id})
 		return
 	}
+	// Switching Claude Code's own login stays on this Mac, or on a phone
+	// approved on it.
 	if native, ok := a.Providers[account.Provider].(provider.NativeLoginProvider); ok && native.NativeEnabled() {
-		if !loopbackOnly(w, r) {
+		if _, approved := phone.ApprovedPhone(r.Context()); !approved && !loopbackOnly(w, r) {
 			return
 		}
 	}

@@ -14,6 +14,18 @@ function remaining(value, now) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
+const HOME_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-6.5 8 6.5v8a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19z"/><path d="M10 20.5v-5h4v5"/></svg>';
+const NET_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><circle cx="6" cy="6" r="2"/><circle cx="12" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="6" cy="12" r="2" opacity=".35"/><circle cx="12" cy="12" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="6" cy="18" r="2" opacity=".35"/><circle cx="12" cy="18" r="2" opacity=".35"/><circle cx="18" cy="18" r="2" opacity=".35"/></svg>';
+const SHARE_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6"/></svg>';
+const LINK_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg>';
+
+// The pairing code's countdown as a ring around the seconds left.
+function ring(value, now, total = 600) {
+  const seconds = Math.max(0, Math.round((Date.parse(value || '') - now) / 1000));
+  const share = Math.min(1, seconds / total);
+  return `<svg class="countdown" viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="15.5" pathLength="1"/><circle class="countdown-left" cx="18" cy="18" r="15.5" pathLength="1" style="stroke-dasharray:${share.toFixed(3)} 1"/></svg>`;
+}
+
 const MAC_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="10.5" rx="1.8"/><path d="M2 18.5h20"/></svg>';
 
 export function createRemote({ api, confirm = async () => true, onConnectionChange = () => {}, now = () => Date.now() }) {
@@ -65,24 +77,27 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
   const post = (path, body) => api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
 
   function hostHTML(host) {
-    const addresses = [...(host.lan || []), ...(host.tailscale || []).map(a => `${a} (Tailscale)`)];
+    const chips = [...(host.lan || []).map(a => ({ a, icon: HOME_ICON, kind: 'Home network' })), ...(host.tailscale || []).map(a => ({ a, icon: NET_ICON, kind: 'Tailscale' }))];
     return `<div class="settings-card remote-section">
-      <div class="settings-row">
-        <div><strong>Share this Switcher</strong><span class="dim"> · let your other Macs use the accounts on ${escape(host.name)}</span></div>
+      <div class="settings-row set-row-icon">
+        <span class="set-icon">${SHARE_ICON}</span>
+        <div><strong>Share this Switcher</strong><span class="dim">Your other Macs use the accounts on ${escape(host.name)}</span></div>
         <label class="switch-wrap"><input type="checkbox" data-remote-action="share" aria-label="Share this Switcher with my other Macs" ${host.enabled ? 'checked' : ''} ${busy ? 'disabled' : ''}><span class="switch-visual"></span></label>
       </div>
       ${host.enabled ? `
         ${host.error ? `<p class="remote-error">${escape(host.error)}</p>` : ''}
-        ${addresses.length ? `<p class="settings-sub">Reachable at ${addresses.map(a => `<code>${escape(a)}</code>`).join(' · ')}</p>` : ''}
+        ${chips.length ? `<div class="set-chips" aria-label="Addresses of this Mac">${chips.map(c => `<button type="button" class="set-chip" data-remote-copy="${escape(c.a)}" title="${c.kind}: click to copy">${c.icon}<code>${escape(c.a)}</code></button>`).join('')}</div>` : ''}
         ${host.pairing ? `<div class="remote-code" role="status">
-            <span class="remote-code-label">Enter this code on the other Mac</span>
+            ${ring(host.pairing.expires_at, now())}
+            <div><span class="remote-code-label">Enter this code on the other Mac</span>
             <strong class="remote-code-value">${escape(host.pairing.code)}</strong>
-            <span class="settings-sub">Valid for ${remaining(host.pairing.expires_at, now())}</span>
-          </div>` : `<div><button type="button" data-remote-action="pair" ${busy ? 'disabled' : ''}>Pair a Mac</button></div>`}
+            <span class="remote-code-time">Valid for ${remaining(host.pairing.expires_at, now())}</span></div>
+          </div>` : `<div><button type="button" class="primary" data-remote-action="pair" ${busy ? 'disabled' : ''}>${LINK_ICON}Pair a Mac</button></div>`}
         ${host.devices.length ? `<ul class="remote-devices">${host.devices.map(d => `<li>
-            <span><strong>${escape(d.name)}</strong><span class="dim"> · last used ${escape(ago(d.last_seen, now()))}</span></span>
+            <span class="set-icon">${MAC_ICON}</span>
+            <span><strong>${escape(d.name)}</strong><span class="dim">last used ${escape(ago(d.last_seen, now()))}</span></span>
             <button type="button" class="quiet danger" data-remote-action="revoke" data-remote-id="${escape(d.id)}" ${busy ? 'disabled' : ''}>Remove</button>
-          </li>`).join('')}</ul>` : '<p class="settings-sub">No Macs paired yet.</p>'}` : ''}
+          </li>`).join('')}</ul>` : '<p class="set-foot">No Macs paired yet. Pair one with a code; it stays paired until you remove it.</p>'}` : ''}
     </div>`;
   }
 
@@ -91,7 +106,7 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
       return `<div class="settings-card remote-section">
         <div class="remote-connected">
           <span class="dr-status ${client.reachable ? 'ok' : 'warn'}">${client.reachable ? 'Connected' : 'Unreachable'}</span>
-          <div><strong>Using ${escape(client.host_name)}</strong><span class="dim"> · via ${escape(client.address)}</span></div>
+          <div><strong>Using ${escape(client.host_name)}</strong><span class="dim">via ${escape(client.address)}</span></div>
           <button type="button" data-remote-action="disconnect" ${busy ? 'disabled' : ''}>${busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect'}</button>
         </div>
         ${!client.reachable && client.error ? `<p class="remote-error">${escape(client.error)}</p>` : ''}
@@ -100,10 +115,10 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
     }
     const hosts = found || [];
     return `<div class="settings-card remote-section">
-      <div class="settings-row"><div><strong>Use another Switcher</strong><span class="dim"> · run on the accounts of another Mac</span></div>
+      <div class="settings-row set-row-icon"><span class="set-icon">${LINK_ICON}</span><div><strong>Use another Switcher</strong><span class="dim">Run on the accounts of another Mac</span></div>
         <button type="button" data-remote-action="scan" ${scanning || busy ? 'disabled' : ''}>${scanning ? 'Looking…' : 'Look again'}</button></div>
       ${hosts.length ? `<ul class="remote-found">${hosts.map(h => `<li>
-          <span><strong>${escape(h.name)}</strong><span class="dim"> · ${escape(h.address)}</span></span>
+          <span><strong>${escape(h.name)}</strong><span class="dim">${escape(h.address)}</span></span>
           <button type="button" data-remote-action="choose" data-remote-address="${escape(h.address)}" data-remote-port="${escape(h.port)}" data-remote-name="${escape(h.name)}" ${busy ? 'disabled' : ''}>Connect</button>
         </li>`).join('')}</ul>` : `<p class="settings-sub">${scanning ? 'Looking for Switchers on your network…' : found ? 'No shared Switcher found on this network. Turn on sharing on the other Mac, or enter its address (for example its Tailscale name).' : ''}</p>`}
       <form class="remote-connect" data-remote-form>
@@ -126,15 +141,16 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
         <p class="settings-sub">Sign in once to add this Mac to your Tailscale network. Use the same Tailscale account on your other Macs.</p>
         <a class="button primary" href="${escape(t.auth_url)}" target="_blank" rel="noopener noreferrer">Sign in with Tailscale</a>
       </div>`;
-    else if (t.enabled && t.state === 'Running') detail = `<p class="settings-sub">On Tailscale as <code>${escape(t.dns_name || t.name)}</code>${t.tailnet ? ` in ${escape(t.tailnet)}` : ''}. Your Macs find each other from anywhere.</p>`;
+    else if (t.enabled && t.state === 'Running') detail = `<p class="set-live"><span class="set-live-dot"></span>On Tailscale as <code>${escape(t.dns_name || t.name)}</code>${t.tailnet ? ` in ${escape(t.tailnet)}` : ''}. Your Macs find each other from anywhere.</p>`;
     else if (t.enabled) detail = '<p class="settings-sub">Connecting to Tailscale…</p>';
     return `<div class="settings-card remote-section remote-tailnet">
-      <div class="settings-row">
-        <div><strong>Away from home</strong><span class="dim"> · reach your Macs over Tailscale from anywhere${t.installed ? '' : '; downloads a 19 MB add-on'}</span></div>
+      <div class="settings-row set-row-icon">
+        <span class="set-icon">${NET_ICON}</span>
+        <div><strong>Away from home</strong><span class="dim">Reach your Macs over Tailscale from anywhere${t.installed ? '' : '; downloads a 19 MB add-on'}</span></div>
         <label class="switch-wrap"><input type="checkbox" data-remote-action="tailnet" aria-label="Use Switcher away from home with Tailscale" ${on ? 'checked' : ''} ${busy || t.downloading ? 'disabled' : ''}><span class="switch-visual"></span></label>
       </div>
       ${detail}
-      ${t.installed && !t.downloading ? `<div><button type="button" class="quiet danger" data-remote-action="tailnet-remove" ${busy ? 'disabled' : ''}>Remove add-on and sign out</button></div>` : ''}
+      ${t.installed && !t.downloading ? `<div class="set-foot-actions"><button type="button" class="quiet danger" data-remote-action="tailnet-remove" ${busy ? 'disabled' : ''}>Remove add-on and sign out</button></div>` : ''}
     </div>`;
   }
 
@@ -156,10 +172,10 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
       flow = `<div class="flow is-off" aria-hidden="true">${node(me, 'this Mac')}<div class="flow-wire"><span></span></div>${node('Your other Macs', 'not connected')}</div>`;
       pill = '<span class="dr-status warn">Off</span>';
     }
-    return `<div class="settings-card remote-hero">
+    return `<div class="settings-card set-hero remote-hero">
+      <div class="set-hero-status">${pill}</div>
       ${flow}
-      <div class="dr-settings-head">${pill}</div>
-      <p class="settings-sub dr-lead">One Mac keeps the accounts and tokens; your other Macs use them through it. Every request to Claude or Codex leaves from that Mac.</p>
+      <p class="set-hero-lead">One Mac keeps the accounts and tokens; your other Macs use them through it. Requests to Claude and Codex leave from that Mac.</p>
     </div>`;
   }
 
@@ -204,6 +220,14 @@ export function createRemote({ api, confirm = async () => true, onConnectionChan
       }
     });
     root.addEventListener('click', async event => {
+      const chip = event.target.closest('[data-remote-copy]');
+      if (chip) {
+        navigator.clipboard?.writeText(chip.dataset.remoteCopy).then(() => {
+          chip.classList.add('is-copied');
+          setTimeout(() => chip.classList.remove('is-copied'), 1200);
+        }, () => {});
+        return;
+      }
       const button = event.target.closest('button[data-remote-action]');
       if (!button || button.disabled) return;
       switch (button.dataset.remoteAction) {

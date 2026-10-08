@@ -33,6 +33,23 @@ type CredentialSource interface {
 	RefreshRejected(context.Context, string, string) (Credential, error)
 }
 
+// Failover is an optional part of a CredentialSource. When Anthropic refuses
+// a conversation's request because its account ran out of usage, the relay
+// moves that conversation to the account Failover names and sends the request
+// again before Desktop has seen any of the refusal. Failover never activates
+// native credentials or changes any other conversation.
+type Failover interface {
+	// OutOfUsage reports whether a refused request means a Switcher account
+	// ran out of usage, and parks it. rejectedUntil is the reset from
+	// Anthropic's own limit headers, zero when they did not say so.
+	OutOfUsage(ctx context.Context, account string, status int, body []byte, rejectedUntil time.Time) bool
+	// Takeover names the account with the most usage left other than
+	// exclude, or "" when automatic switching is off or none has room.
+	Takeover(ctx context.Context, exclude string) string
+	// TookOver reports a move; from is empty for Desktop's own login.
+	TookOver(from, to string)
+}
+
 // ConversationResolver maps request session UUIDs to Desktop conversation
 // UUIDs using native metadata. Missing keys are unknown sessions.
 type ConversationResolver interface {

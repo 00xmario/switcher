@@ -233,6 +233,39 @@ func (m *Manager) threadOnAccount(s Session, thread string) bool {
 	return true
 }
 
+// moveTo puts a session's conversation, or the session alone when its
+// conversation is unknown, on account, so its later requests and subagents
+// follow. A thread the request was creating now lives on account.
+func (m *Manager) moveTo(s Session, account, thread string) error {
+	if s.ConversationID != "" {
+		if _, err := m.setConversation(s.ScopeID, s.ConversationID, account); err != nil {
+			return err
+		}
+	} else {
+		m.mu.Lock()
+		key := taskKey(s.ScopeID, s.SessionID)
+		current, ok := m.state.Sessions[key]
+		if !ok {
+			m.mu.Unlock()
+			return ErrNotFound
+		}
+		current.AccountID = account
+		current.Revision++
+		m.state.Sessions[key] = current
+		m.saveSoonLocked()
+		m.mu.Unlock()
+	}
+	if thread == "create" {
+		m.mu.Lock()
+		if m.threads == nil {
+			m.threads = make(map[string]string)
+		}
+		m.threads[taskKey(s.ScopeID, s.SessionID)] = account
+		m.mu.Unlock()
+	}
+	return nil
+}
+
 func (m *Manager) finish(s Session) {
 	if s.SessionID == "" {
 		return

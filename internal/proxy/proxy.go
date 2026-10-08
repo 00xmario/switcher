@@ -5,7 +5,8 @@
 // then Switcher moves to another usable account and transparently retries
 // the in-flight request once. Paid accounts come first; when only Free ones
 // are left, an allowed banked reset on the exhausted account comes before
-// them.
+// them. Separately, Claude Code's own login and Claude Desktop conversations
+// move off a Claude account that runs out of usage (autoswitch.go).
 package proxy
 
 import (
@@ -93,6 +94,12 @@ type Manager struct {
 	syncing            atomic.Bool
 	probeBusy          atomic.Bool
 	probeBootID        string
+	// Claude's automatic switching (autoswitch.go).
+	claudeAuto         func() bool
+	autoSwitching      atomic.Bool
+	autoSwitchAt       map[string]time.Time
+	autoSwitchSerial   uint64
+	lastAutoSwitch     AutoSwitch
 	probeClient        *http.Client // optional internal test seam; production uses a fresh direct client
 	refreshing         map[string]*sync.Mutex
 	order              []string // display order of provider sections
@@ -171,6 +178,7 @@ func New(st *store.Store, providers map[string]provider.Provider, registration [
 		generation:         map[string]uint64{},
 		accountRevision:    map[string]uint64{},
 		autoResetAt:        map[string]time.Time{},
+		autoSwitchAt:       map[string]time.Time{},
 		planChecked:        map[string]time.Time{},
 		resetEvents:        map[string]ResetEvent{},
 		quotaRevision:      map[string]uint64{},
@@ -648,6 +656,9 @@ func (m *Manager) RefreshUsageAll(ctx context.Context) {
 		}(j)
 	}
 	wg.Wait()
+	// Fresh usage may show Claude Code's account at its limit. The switch
+	// runs outside the poll's locks.
+	go m.AutoSwitchNative()
 }
 
 // refreshAccount refreshes the token if needed and polls usage for one

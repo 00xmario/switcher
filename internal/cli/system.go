@@ -14,7 +14,7 @@ import (
 
 // Settings the command line may change. Network access and the dashboard
 // password stay in the app, where their prompts and warnings are.
-var settingKeys = []string{"merge_accounts", "compact_accounts", "menu_usage_bars", "reset_notifications", "auto_use_reset"}
+var settingKeys = []string{"merge_accounts", "compact_accounts", "menu_usage_bars", "reset_notifications", "auto_use_reset", "auto_switch_claude"}
 
 func runSettings(c *ctx, args []string) error {
 	pos, err := c.parse(c.flags("settings"), args, 0, -1)

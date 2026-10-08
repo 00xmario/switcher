@@ -41,7 +41,7 @@ does this for you, and a source build (`make install`) is the same binary.
 | `switcher phone [on\|off\|approve <code>\|deny <id>\|revoke <id> --yes]` | Use Switcher from your phone over Tailscale; see [phone](phone.md) |
 | `switcher desktop [connect\|disconnect\|restart --yes]` | Route Claude Desktop through Switcher |
 | `switcher setup [codex [--undo\|--test]]` | CLI setup status; point Codex at Switcher, undo it, or send one test request through Switcher's Codex route |
-| `switcher settings [set key=value ...]` | Display and banked-reset settings |
+| `switcher settings [set key=value ...]` | Display, banked-reset and automatic Claude switching (`auto_switch_claude`) settings |
 | `switcher start` | Start Switcher in the background if it is not running |
 | `switcher open` | Open the dashboard |
 | `switcher install-cli [--dir DIR]` | Put `switcher` on your PATH; another tool called `switcher` is left alone |

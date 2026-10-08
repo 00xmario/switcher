@@ -182,3 +182,35 @@ func TestGlobalAutoUseResetSettingIsAcceptedWithoutRestart(t *testing.T) {
 	}
 	t.Fatal("account missing from /api/state")
 }
+
+func TestSwitchClaudeAutomaticallyIsOnUntilTurnedOff(t *testing.T) {
+	h := newAutoResetHarness(t)
+	previous := restartForTest
+	restarted := false
+	restartForTest = func() { restarted = true }
+	defer func() { restartForTest = previous }()
+	read := func() bool {
+		get := httptest.NewRecorder()
+		h.mux.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+		var payload struct {
+			On *bool `json:"auto_switch_claude"`
+		}
+		if err := json.Unmarshal(get.Body.Bytes(), &payload); err != nil || payload.On == nil {
+			t.Fatalf("GET settings: %s", get.Body.String())
+		}
+		return *payload.On
+	}
+	if !read() || !h.global.AutoSwitchClaude() {
+		t.Fatal("Claude does not switch by itself by default")
+	}
+	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewBufferString(`{"auto_switch_claude":false}`))
+	req.RemoteAddr, req.Host = "127.0.0.1:1234", "127.0.0.1:8787"
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || restarted {
+		t.Fatalf("PATCH settings: %d restarted %v", rec.Code, restarted)
+	}
+	if read() || h.global.AutoSwitchClaude() {
+		t.Fatal("turning it off did not stick")
+	}
+}

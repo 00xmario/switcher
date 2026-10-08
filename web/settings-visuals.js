@@ -21,15 +21,16 @@ export const ICONS = {
   check: icon('<path d="M5 12.5l4.5 4.5L19 7.5"/>'),
 };
 
+// tone tints each section's header glow and hero; group heads the nav.
 export const SECTIONS = [
-  { id: 'general', title: 'General', sub: 'Appearance, how accounts are laid out, and the menu bar.', tile: 'slate', icon: 'sliders' },
-  { id: 'switching', title: 'Switching', sub: 'Claude Code’s login, and what happens when an account runs out.', tile: 'brand', icon: 'mark' },
-  { id: 'desktop', title: 'Claude Desktop', sub: 'Pick an account per Desktop conversation.', tile: 'clay', icon: 'desktop' },
-  { id: 'sharing', title: 'Share between Macs', sub: 'Use one Mac’s accounts on your other Macs, at home or anywhere.', tile: 'blue', icon: 'macs' },
-  { id: 'phone', title: 'Phone', sub: 'Usage, switching and banked resets on your phone, over Tailscale.', tile: 'teal', icon: 'phone' },
-  { id: 'tools', title: 'Command line & tools', sub: 'The switcher command, CLI setup and the T3 Code hub.', tile: 'graphite', icon: 'terminal' },
-  { id: 'security', title: 'Privacy & security', sub: 'Who can reach this Switcher, and with what.', tile: 'indigo', icon: 'lock' },
-  { id: 'about', title: 'About', sub: 'Version, updates and links.', tile: 'app', icon: 'app' },
+  { id: 'general', group: 'Accounts', title: 'General', sub: 'Appearance, account layout and the menu bar.', tile: 'slate', icon: 'sliders', tone: '#8d97a8' },
+  { id: 'switching', group: 'Accounts', title: 'Switching', sub: 'Claude Code’s login, and what happens when an account runs out.', tile: 'brand', icon: 'mark', tone: '#43dc8d' },
+  { id: 'desktop', group: 'Connect', title: 'Claude Desktop', sub: 'An account per Desktop conversation.', tile: 'clay', icon: 'desktop', tone: '#e8916f' },
+  { id: 'sharing', group: 'Connect', title: 'Share between Macs', sub: 'One Mac keeps the accounts; your other Macs use them.', tile: 'blue', icon: 'macs', tone: '#55a0ff' },
+  { id: 'phone', group: 'Connect', title: 'Phone', sub: 'Usage, switching and banked resets in your pocket.', tile: 'teal', icon: 'phone', tone: '#34c9a6' },
+  { id: 'tools', group: 'System', title: 'Command line & tools', sub: 'The switcher command, CLI setup and the T3 Code hub.', tile: 'graphite', icon: 'terminal', tone: '#7d8696' },
+  { id: 'security', group: 'System', title: 'Privacy & security', sub: 'Who can reach this Switcher, and with what.', tile: 'indigo', icon: 'lock', tone: '#8582f5' },
+  { id: 'about', group: 'System', title: 'About', sub: 'Version, updates and links.', tile: 'app', icon: 'app', tone: '#43dc8d' },
 ];
 
 export function sectionTile(section, size = 'small') {
@@ -38,15 +39,23 @@ export function sectionTile(section, size = 'small') {
   return `<span class="set-tile tile-${section.tile} is-${size}">${glyph}</span>`;
 }
 
+// navHTML lists the sections under their groups. The glider is the sliding
+// highlight behind the current item; app.js moves it.
 export function navHTML(current) {
+  let group = '';
   return `<nav class="set-nav" aria-label="Settings sections">
-    ${SECTIONS.map(s => `<button type="button" class="set-nav-item" data-section="${s.id}" ${s.id === current ? 'aria-current="page"' : ''}>
-      ${sectionTile(s)}<span>${s.title}</span></button>`).join('')}
+    <span class="set-nav-glider" aria-hidden="true"></span>
+    ${SECTIONS.map(s => {
+      const head = s.group !== group ? `<span class="set-nav-group">${s.group}</span>` : '';
+      group = s.group;
+      return `${head}<button type="button" class="set-nav-item" data-section="${s.id}" ${s.id === current ? 'aria-current="page"' : ''}>
+      ${sectionTile(s)}<span>${s.title}</span></button>`;
+    }).join('')}
   </nav>`;
 }
 
 export function sectionHeadHTML(section, extra = '') {
-  return `<header class="set-head">${sectionTile(section, 'large')}
+  return `<header class="set-head"><span class="set-head-tile">${sectionTile(section, 'large')}</span>
     <div><h2 id="set-title-${section.id}">${section.title}</h2><p>${section.sub}</p></div>${extra}</header>`;
 }
 
@@ -89,19 +98,20 @@ export function menuPreviewHTML(bars) {
   </div>`;
 }
 
-// ladderHTML shows what happens, in order, when the active account runs out.
+// ladderHTML shows what happens, in order, when the active account runs out:
+// a track with a request travelling along it, one stop per step.
 export function ladderHTML(autoReset) {
   const steps = [
-    { icon: ICONS.empty, title: 'An account runs out', sub: 'The provider reports it is out of usage.' },
-    { icon: switcherMark({ size: 19 }), title: 'Switcher moves on', sub: 'Another paid account takes the request.', key: 'move' },
-    { icon: ICONS.bolt, title: 'A banked reset', sub: 'When no paid account is left, before a Free one.', key: 'reset', off: !autoReset },
-    { icon: ICONS.pass, title: 'Free, then the limit', sub: 'A Free account if you have one, then the provider’s own message.' },
+    { icon: ICONS.empty, title: 'Runs out', sub: 'The provider says the account is out of usage.' },
+    { icon: switcherMark({ size: 20, id: 'ladder-mark' }), title: 'Next paid account', sub: 'Switcher retries the request there.', key: 'move' },
+    { icon: ICONS.bolt, title: 'Banked reset', sub: 'When no paid account is left.', key: 'reset', off: !autoReset },
+    { icon: ICONS.pass, title: 'Free, then the limit', sub: 'A Free account, then the provider’s message.' },
   ];
-  return `<ol class="ladder">${steps.map((s, i) => `<li class="ladder-step ${s.key ? `is-${s.key}` : ''} ${s.off ? 'is-off' : ''}" ${s.key === 'reset' ? 'data-ladder-reset' : ''}>
-    <span class="ladder-icon">${s.icon}</span><span class="ladder-n">${i + 1}</span>
+  return `<ol class="ladder ${autoReset ? '' : 'skips-reset'}">${steps.map((s, i) => `<li class="ladder-step ${s.key ? `is-${s.key}` : ''} ${s.off ? 'is-off' : ''}" ${s.key === 'reset' ? 'data-ladder-reset' : ''} style="--i:${i}">
+    <span class="ladder-icon">${s.icon}</span>
     <strong>${s.title}</strong><span>${s.sub}</span>
     ${s.key === 'reset' ? `<em class="ladder-state">${autoReset ? 'On' : 'Off'}</em>` : ''}
-  </li>`).join('')}</ol>`;
+  </li>`).join('')}<li class="ladder-runner" aria-hidden="true"></li></ol>`;
 }
 
 // securityHeroHTML summarizes who can reach this Switcher. Browsers on

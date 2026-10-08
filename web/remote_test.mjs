@@ -22,10 +22,11 @@ test('an idle Mac can share itself or use another Switcher', async () => {
 test('a sharing Mac shows its addresses, pairing code and paired Macs', async () => {
   const { html } = await render({ host: host({ enabled: true, listening: true, pairing: { code: 'K7QF-M2XP', expires_at: '2026-10-07T12:09:30Z' },
     devices: [{ id: 'd1', name: 'MacBook Air', created_at: '2026-10-06T10:00:00Z', last_seen: '2026-10-07T11:55:00Z' }] }), client: { connected: false } });
-  assert.match(html, /<code>studio\.local<\/code> · <code>100\.101\.2\.3 \(Tailscale\)<\/code>/);
+  assert.match(html, /data-remote-copy="studio\.local"[^>]*>[\s\S]*?<code>studio\.local<\/code>/);
+  assert.match(html, /title="Tailscale: click to copy">[\s\S]*?<code>100\.101\.2\.3<\/code>/);
   assert.match(html, /K7QF-M2XP/);
   assert.match(html, /Valid for 9:30/);
-  assert.match(html, /MacBook Air<\/strong><span class="dim"> · last used 5 min ago/);
+  assert.match(html, /MacBook Air<\/strong><span class="dim">last used 5 min ago/);
   assert.match(html, /data-remote-action="revoke" data-remote-id="d1"/);
   assert.doesNotMatch(html, /Use another Switcher/, 'a sharing Mac cannot also use another one');
 });
