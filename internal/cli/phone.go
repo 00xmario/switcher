@@ -20,6 +20,11 @@ Tailscale devices reach it, and only phones you approve here get in.
 
 It needs the Tailscale add-on (switcher away on), MagicDNS and HTTPS
 certificates in your tailnet, and the Tailscale app on your phone.
+
+Like every HTTPS certificate, the one Tailscale issues for the address is
+listed in public certificate logs: that shows the address's name, not a way
+in. Turning access off keeps approved phones, and they get back in when it is
+turned on again; revoke a phone you lost.
 `
 
 type phoneStatus struct {
@@ -131,6 +136,9 @@ func runPhone(c *ctx, args []string) error {
 	switch {
 	case !st.Enabled:
 		lines = append(lines, "Phone access: off")
+		if len(st.Devices) > 0 {
+			lines = append(lines, "Approved phones get back in when it is turned on; revoke a lost one with: switcher phone revoke <name> --yes")
+		}
 	case st.Ready:
 		lines = append(lines, "Phone access: on at "+st.URL)
 	default:
@@ -160,6 +168,9 @@ func runPhone(c *ctx, args []string) error {
 	}
 	if st.Enabled && st.Ready && len(st.Devices) == 0 && len(st.Waiting) == 0 {
 		lines = append(lines, "Open the address on your phone, then: switcher phone approve <code>")
+	}
+	if action == "on" {
+		lines = append(lines, "Note: the address's name is listed in public certificate logs, like every HTTPS certificate.")
 	}
 	fmt.Fprintln(c.out, strings.Join(lines, "\n"))
 	return nil

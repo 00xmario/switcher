@@ -87,6 +87,7 @@ type Tailnet struct {
 	phoneKey        string     // the running add-on's phone key
 	pendingPhoneKey string     // the key of the add-on being started
 	phoneSync       sync.Mutex // keeps on/off messages in order
+	phoneDirty      bool       // a phone sync was asked for
 	starting        bool
 	retrying        bool
 	restarts        int
@@ -160,10 +161,37 @@ func (t *Tailnet) ServePhone(addr string, on func() bool) {
 	t.SyncPhone()
 }
 
-// SyncPhone passes the current phone access choice to a running add-on.
+// SyncPhone passes the current phone access choice to a running add-on. One
+// call sends at a time, in order; calls that arrive meanwhile are folded into
+// one more round, so a slow add-on never piles up waiting calls.
 func (t *Tailnet) SyncPhone() {
-	t.phoneSync.Lock()
-	defer t.phoneSync.Unlock()
+	t.mu.Lock()
+	t.phoneDirty = true
+	t.mu.Unlock()
+	for t.phoneSync.TryLock() {
+		for {
+			t.mu.Lock()
+			dirty := t.phoneDirty
+			t.phoneDirty = false
+			t.mu.Unlock()
+			if !dirty {
+				break
+			}
+			t.sendPhone()
+		}
+		t.phoneSync.Unlock()
+		// A call that arrived after the last round but before the unlock
+		// found the lock taken; take one more round for it.
+		t.mu.Lock()
+		dirty := t.phoneDirty
+		t.mu.Unlock()
+		if !dirty {
+			return
+		}
+	}
+}
+
+func (t *Tailnet) sendPhone() {
 	t.mu.Lock()
 	control, token, on := t.control, t.token, t.phoneOn
 	t.mu.Unlock()
@@ -312,13 +340,23 @@ func (t *Tailnet) launch(ctx context.Context) (*exec.Cmd, io.WriteCloser, string
 	args := []string{"-dir", filepath.Join(t.dir, "state"), "-hostname", TailnetHostname(MachineName()),
 		"-forward", fmt.Sprintf("127.0.0.1:%d", t.hostPort), "-port", fmt.Sprint(t.hostPort)}
 	cmd := exec.Command(t.binary(), args...)
-	cmd.Env = append(os.Environ(), "SWITCHER_TAILNET_TOKEN="+token)
+	// The add-on's settings come only from here, never from Switcher's own
+	// environment.
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if name != "SWITCHER_TAILNET_TOKEN" && name != "SWITCHER_TAILNET_PHONE" && name != "SWITCHER_TAILNET_PHONE_KEY" {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "SWITCHER_TAILNET_TOKEN="+token)
 	// The phone dashboard gets its own key, as older add-ons ignore unknown
 	// variables but stop on unknown flags.
 	phoneKey := randomHex(24)
 	t.mu.Lock()
 	if t.phoneAddr != "" {
 		cmd.Env = append(cmd.Env, "SWITCHER_TAILNET_PHONE="+t.phoneAddr, "SWITCHER_TAILNET_PHONE_KEY="+phoneKey)
+	} else {
+		phoneKey = ""
 	}
 	t.pendingPhoneKey = phoneKey
 	t.mu.Unlock()

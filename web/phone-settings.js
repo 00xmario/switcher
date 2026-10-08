@@ -23,7 +23,7 @@ export function steps(status) {
   const signedIn = !!(t.enabled && t.running && t.state === 'Running');
   return [
     { done: signedIn, title: 'Tailscale add-on on and signed in', sub: 'Under Share between Macs, turn on Away from home.', action: signedIn ? '' : '<button type="button" class="quiet" data-phone-action="open-sharing">Open Share between Macs</button>' },
-    { done: signedIn && !!t.https, title: 'MagicDNS and HTTPS certificates on', sub: 'One switch each in your tailnet’s DNS settings. They give this Mac a real certificate; its name appears in public certificate logs.', action: signedIn && !t.https ? `<a class="quiet-link" href="${DNS_SETTINGS}" target="_blank" rel="noopener noreferrer">Open DNS settings</a>` : '' },
+    { done: signedIn && !!t.https, title: 'MagicDNS and HTTPS certificates on', sub: 'One switch each in your tailnet’s DNS settings. They give this Mac a real certificate.', action: signedIn && !t.https ? `<a class="quiet-link" href="${DNS_SETTINGS}" target="_blank" rel="noopener noreferrer">Open DNS settings</a>` : '' },
     { done: false, neutral: true, title: 'Tailscale on your phone', sub: 'Install the Tailscale app and sign in with the same account.' },
     { done: (status.devices || []).length > 0, title: 'Approve your phone', sub: 'Open the address on your phone, then enter the code it shows here.' },
   ];
@@ -51,6 +51,7 @@ export function phoneHTML(status, { busy = '', error = '', now = Date.now() } = 
     ${ready && status.url ? `<label class="field-label">Open on your phone</label>
       <div class="copy-row"><input readonly aria-label="Phone address" value="${escape(status.url)}"><button type="button" class="copy-btn" data-phone-copy="${escape(status.url)}">Copy</button></div>` : ''}
     ${enabled && status.problem ? `<p class="phone-problem">${escape(status.problem)}</p>` : ''}
+    <p class="settings-sub">Like every HTTPS certificate, the one Tailscale issues for this address is listed in public certificate logs. That shows the name above and your tailnet’s name, not a way in. Turning access off keeps approved phones; revoke a phone you lost.</p>
   </div>`;
   const setup = enabled && !ready ? `<div class="settings-card">
     <div class="set-card-head"><h3>Set up</h3><p class="settings-sub">Once per Mac. Switcher checks the first two for you.</p></div>

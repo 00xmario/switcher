@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
@@ -63,7 +67,7 @@ func gateFor(t *testing.T, who *tailcfg.Node, on bool) (*phoneGate, *http.Reques
 	self := func(context.Context) (selfInfo, error) {
 		return selfInfo{user: me, dnsName: "switcher-mac.tail1.ts.net"}, nil
 	}
-	p := newPhoneGate(strings.TrimPrefix(backend.URL, "http://"), "secret-token", whois, self)
+	p := newPhoneGate(strings.TrimPrefix(backend.URL, "http://"), "secret-token", whois, self, nil)
 	p.on.Store(on)
 	return p, got
 }
@@ -122,5 +126,53 @@ func TestGateRefusesEveryoneElse(t *testing.T) {
 				t.Fatal("a refused request reached Switcher")
 			}
 		})
+	}
+}
+
+// A quick off and on keeps one listener, and a listener that stops is opened
+// again.
+func TestPhoneListenerSurvivesTogglingAndStops(t *testing.T) {
+	var listens atomic.Int32
+	var mu sync.Mutex
+	var current net.Listener
+	listen := func() (net.Listener, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err == nil {
+			listens.Add(1)
+			mu.Lock()
+			current = ln
+			mu.Unlock()
+		}
+		return ln, err
+	}
+	p := newPhoneGate("127.0.0.1:1", "key", nil, nil, listen)
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !ok() {
+			if time.Now().After(deadline) {
+				t.Fatal(what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	serving := func() bool { on, _ := p.state(); return on }
+	p.set(true)
+	waitFor("not listening", serving)
+	for i := 0; i < 20; i++ {
+		p.set(false)
+		p.set(true)
+	}
+	waitFor("not listening after toggling", serving)
+	if n := listens.Load(); n != 1 {
+		t.Fatalf("listened %d times", n)
+	}
+	mu.Lock()
+	current.Close()
+	mu.Unlock()
+	waitFor("not listening again after the listener stopped", func() bool { return listens.Load() == 2 && serving() })
+	p.set(false)
+	if on, _ := p.state(); on {
+		t.Fatal("serving while off")
 	}
 }

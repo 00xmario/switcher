@@ -83,7 +83,7 @@ func main() {
 	// separate from the control token: it travels with every phone request.
 	var phone *phoneGate
 	if forward, key := os.Getenv("SWITCHER_TAILNET_PHONE"), os.Getenv("SWITCHER_TAILNET_PHONE_KEY"); forward != "" && len(key) >= 32 {
-		phone = newPhoneGate(forward, key, lc.WhoIs, self)
+		phone = newPhoneGate(forward, key, lc.WhoIs, self, func() (net.Listener, error) { return srv.ListenTLS("tcp", ":443") })
 	}
 
 	// Tailnet peers reach this Mac's Switcher host through the node.
@@ -197,7 +197,7 @@ func main() {
 				http.NotFound(w, r)
 				return
 			}
-			phone.set(r.URL.Query().Get("on") == "1", srv)
+			phone.set(r.URL.Query().Get("on") == "1")
 			w.WriteHeader(http.StatusNoContent)
 		case r.URL.Path == "/forwarding" && r.Method == http.MethodPost:
 			forwarding.Store(r.URL.Query().Get("on") == "1")

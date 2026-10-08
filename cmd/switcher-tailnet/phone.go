@@ -15,7 +15,6 @@ import (
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tsnet"
 )
 
 // The phone dashboard. While Switcher's phone access is on, the add-on serves
@@ -61,6 +60,7 @@ type phoneGate struct {
 	token   string
 	whois   func(ctx context.Context, addr string) (*apitype.WhoIsResponse, error)
 	self    func(ctx context.Context) (selfInfo, error)
+	listen  func() (net.Listener, error) // the tailnet's HTTPS port
 	proxy   *httputil.ReverseProxy
 
 	mu        sync.Mutex
@@ -69,8 +69,8 @@ type phoneGate struct {
 	lastErr   string
 }
 
-func newPhoneGate(forward, token string, whois func(context.Context, string) (*apitype.WhoIsResponse, error), self func(context.Context) (selfInfo, error)) *phoneGate {
-	p := &phoneGate{forward: forward, token: token, whois: whois, self: self}
+func newPhoneGate(forward, token string, whois func(context.Context, string) (*apitype.WhoIsResponse, error), self func(context.Context) (selfInfo, error), listen func() (net.Listener, error)) *phoneGate {
+	p := &phoneGate{forward: forward, token: token, whois: whois, self: self, listen: listen}
 	p.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			id, _ := pr.In.Context().Value(identityKey{}).(identity)
@@ -141,7 +141,7 @@ func (p *phoneGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // set turns phone access on or off. The first time it is on, the add-on
 // starts listening on the tailnet's port 443 and keeps doing so: off only
 // refuses requests.
-func (p *phoneGate) set(on bool, srv *tsnet.Server) {
+func (p *phoneGate) set(on bool) {
 	p.on.Store(on)
 	if !on {
 		return
@@ -152,13 +152,13 @@ func (p *phoneGate) set(on bool, srv *tsnet.Server) {
 		return
 	}
 	p.running = true
-	go p.run(srv)
+	go p.run()
 }
 
 // run listens until it succeeds and listens again if serving stops. It ends
 // only while access is off, deciding that under the lock set takes, so a
 // quick off and on never leaves nothing listening.
-func (p *phoneGate) run(srv *tsnet.Server) {
+func (p *phoneGate) run() {
 	for {
 		p.mu.Lock()
 		if !p.on.Load() {
@@ -167,8 +167,8 @@ func (p *phoneGate) run(srv *tsnet.Server) {
 			return
 		}
 		p.mu.Unlock()
-		// ListenTLS waits until this node is signed in.
-		ln, err := srv.ListenTLS("tcp", ":443")
+		// Listening waits until this node is signed in.
+		ln, err := p.listen()
 		if err != nil {
 			p.mu.Lock()
 			p.lastErr = phoneProblem(err)

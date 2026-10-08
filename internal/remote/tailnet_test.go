@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -28,10 +29,22 @@ func TestMain(m *testing.M) {
 
 func fakeAddon() {
 	token := os.Getenv("SWITCHER_TAILNET_TOKEN")
+	var phoneOn atomic.Bool
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Switcher-Tailnet") != token {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/phone":
+			phoneOn.Store(r.URL.Query().Get("on") == "1")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case "/phone-env":
+			// What the add-on was started with, for the phone tests.
+			json.NewEncoder(w).Encode(map[string]any{"forward": os.Getenv("SWITCHER_TAILNET_PHONE"),
+				"key": os.Getenv("SWITCHER_TAILNET_PHONE_KEY"), "args": os.Args[1:], "on": phoneOn.Load()})
 			return
 		}
 		if r.Method == http.MethodConnect {
@@ -210,5 +223,98 @@ func TestTailnetNamesAndAddresses(t *testing.T) {
 		if onTailnet(host) != want {
 			t.Errorf("%s: onTailnet=%v", host, !want)
 		}
+	}
+}
+
+// phoneEnv asks the fake add-on what it was started with.
+func phoneEnv(t *testing.T, tn *Tailnet) (forward, key string, args []string, on bool) {
+	t.Helper()
+	tn.mu.Lock()
+	control, token := tn.control, tn.token
+	tn.mu.Unlock()
+	req, _ := http.NewRequest(http.MethodGet, "http://"+control+"/phone-env", nil)
+	req.Header.Set("X-Switcher-Tailnet", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Forward, Key string
+		Args         []string
+		On           bool
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	return got.Forward, got.Key, got.Args, got.On
+}
+
+func TestPhoneKeyFollowsTheRunningAddon(t *testing.T) {
+	// Phone settings in Switcher's own environment never reach the add-on.
+	t.Setenv("SWITCHER_TAILNET_PHONE", "127.0.0.1:9")
+	t.Setenv("SWITCHER_TAILNET_PHONE_KEY", strings.Repeat("e", 48))
+	tn := fakeTailnet(t, t.TempDir(), 1)
+	tn.retryDelay = 10 * time.Millisecond
+	on := atomic.Bool{}
+	tn.ServePhone("127.0.0.1:4321", on.Load)
+	if tn.PhoneKey() != "" {
+		t.Fatal("a phone key before the add-on runs")
+	}
+	if err := tn.Enable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	forward, key, args, _ := phoneEnv(t, tn)
+	if forward != "127.0.0.1:4321" || len(key) != 48 || key != tn.PhoneKey() || key == tn.token {
+		t.Fatalf("add-on started with forward %q key %q; Switcher expects %q", forward, key, tn.PhoneKey())
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "phone") {
+			t.Fatalf("phone settings passed as a flag, which older add-ons reject: %v", args)
+		}
+	}
+	on.Store(true)
+	tn.SyncPhone()
+	if _, _, _, got := phoneEnv(t, tn); !got {
+		t.Fatal("phone access was not passed on")
+	}
+
+	// A restarted add-on gets a new key, and Switcher follows it.
+	tn.mu.Lock()
+	first := tn.cmd
+	tn.mu.Unlock()
+	first.Process.Kill()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		tn.mu.Lock()
+		restarted := tn.cmd != nil && tn.cmd != first
+		tn.mu.Unlock()
+		if restarted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the add-on was not restarted")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_, again, _, _ := phoneEnv(t, tn)
+	if again == key || again != tn.PhoneKey() {
+		t.Fatalf("after a restart the add-on has %q and Switcher expects %q", again, tn.PhoneKey())
+	}
+	tn.Disable()
+	if tn.PhoneKey() != "" {
+		t.Fatal("a phone key after the add-on stopped")
+	}
+}
+
+func TestNoPhoneKeyWithoutThePhoneListener(t *testing.T) {
+	t.Setenv("SWITCHER_TAILNET_PHONE", "127.0.0.1:9")
+	t.Setenv("SWITCHER_TAILNET_PHONE_KEY", strings.Repeat("e", 48))
+	tn := fakeTailnet(t, t.TempDir(), 1)
+	if err := tn.Enable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if forward, key, _, _ := phoneEnv(t, tn); forward != "" || key != "" || tn.PhoneKey() != "" {
+		t.Fatalf("phone settings without a phone listener: %q %q %q", forward, key, tn.PhoneKey())
 	}
 }
